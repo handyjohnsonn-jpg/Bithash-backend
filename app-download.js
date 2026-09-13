@@ -5,42 +5,13 @@ const FILES = Object.freeze({
   'BitHash-Capital-macos.dmg': 'application/x-apple-disk-image'
 });
 
-// The frontend CI publishes these files as public release/media assets. Set
-// PUBLIC_DOWNLOAD_BASE_URL in Render when a different public asset origin is used.
+// Desktop installers are published as public release assets by the frontend
+// repository's desktop-build workflow. Render must only redirect to the asset;
+// it must never proxy/stream a 100+ MB installer itself.
 const PUBLIC_DOWNLOAD_BASE_URL = String(
   process.env.PUBLIC_DOWNLOAD_BASE_URL ||
   'https://github.com/mekitariansalinacoria8-lgtm/Bithhash/releases/download/desktop-latest'
 ).replace(/\/+$/, '');
-
-function detectPlatform(req) {
-  const userAgent = String(req?.get?.('user-agent') || req?.headers?.['user-agent'] || '');
-  const clientPlatform = String(
-    req?.get?.('sec-ch-ua-platform') || req?.headers?.['sec-ch-ua-platform'] || ''
-  ).replace(/[\"]/g, '');
-  const value = `${userAgent} ${clientPlatform}`;
-
-  if (/Windows NT|Windows Phone/i.test(value)) return 'windows';
-  if (/iPhone|iPad|iPod/i.test(value)) return 'ios';
-  if (/Android/i.test(value)) return 'android';
-  if (/Macintosh|Mac OS X/i.test(value)) return 'macos';
-  return 'other';
-}
-
-function requiredPlatformForFile(file) {
-  if (file === 'BitHash-Capital-windows.exe') return 'windows';
-  if (file === 'BitHash-Capital-macos.dmg') return 'macos';
-  return null;
-}
-
-function platformRequirements(platform) {
-  if (platform === 'windows') {
-    return 'Windows 10 (64-bit) or Windows 11 (64-bit). Windows on ARM requires Windows 10 version 1903 or later.';
-  }
-  if (platform === 'macos') {
-    return 'macOS 13 Ventura or later. Universal Intel + Apple silicon build.';
-  }
-  return '';
-}
 
 function publicAssetUrl(file) {
   return `${PUBLIC_DOWNLOAD_BASE_URL}/${encodeURIComponent(file)}`;
@@ -55,24 +26,12 @@ function handleDownload(req, res, forcedFile = null) {
       return res.status(404).json({ error: 'Download not found' });
     }
 
-    const requiredPlatform = requiredPlatformForFile(requestedFile);
-    const clientPlatform = detectPlatform(req);
-
-    if (requiredPlatform && clientPlatform !== requiredPlatform) {
-      return res.status(403).json({
-        error: 'This native download is only available for the matching device platform.',
-        requestedFile,
-        detectedPlatform: clientPlatform,
-        requiredPlatform,
-        requirements: platformRequirements(requiredPlatform)
-      });
-    }
-
+    // Do not gate the binary by User-Agent. The URL already identifies the
+    // requested installer, and browser privacy features, proxies, Electron,
+    // Safari and CDN rewrites can legitimately omit or change platform hints.
+    // Platform-specific visibility is handled by the frontend UI instead.
     const location = publicAssetUrl(requestedFile);
 
-    // Do not fetch the installer through Render. Render only redirects the
-    // browser to the public artifact, preventing R2 credentials or large-file
-    // streaming from causing a server error.
     res.set({
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
@@ -95,8 +54,6 @@ function installAppDownloadRoute(app) {
   if (!app || typeof app.get !== 'function') return false;
   if (app.__bithashAppDownloadRouteInstalled) return true;
 
-  // Mark before registering so Express bootstrap hooks cannot register the
-  // same routes twice.
   Object.defineProperty(app, '__bithashAppDownloadRouteInstalled', {
     value: true,
     configurable: false,
@@ -125,13 +82,9 @@ function installAppDownloadRoute(app) {
   return true;
 }
 
-// server.js has historically imported this module without explicitly calling
-// installAppDownloadRoute(). Keep automatic installation for deployments that
-// create an Express app and call app.use(), while app-download-bootstrap.js can
-// still install the routes explicitly before fallback/error middleware.
+// Keep compatibility with the existing bootstrap architecture while avoiding
+// duplicate route registration.
 if (!express.application.__bithashDownloadAutoinstallPatched) {
-  const originalApplicationUse = express.application.use;
-
   Object.defineProperty(express.application, '__bithashDownloadAutoinstallPatched', {
     value: true,
     configurable: false,
@@ -139,6 +92,7 @@ if (!express.application.__bithashDownloadAutoinstallPatched) {
     writable: false
   });
 
+  const originalApplicationUse = express.application.use;
   express.application.use = function bithashPatchedUse(...args) {
     const result = originalApplicationUse.apply(this, args);
     try {
