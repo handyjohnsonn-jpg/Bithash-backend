@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const express = require('express');
 
 // server.js imports this module but does not explicitly call installAppDownloadRoute(app).
@@ -26,28 +25,13 @@ if (!express.application.__bithashDownloadAutoinstallPatched) {
 
 const FILES = Object.freeze({
   'BitHash-Capital-windows.exe': 'application/vnd.microsoft.portable-executable',
-  'BitHash-Capital-macos.dmg': 'application/x-apple-diskimage'
+  'BitHash-Capital-macos.dmg': 'application/x-apple-disk-image'
 });
 
-const DOWNLOAD_PREFIX = 'apps/latest/';
-const DOWNLOAD_TTL_SECONDS = 300;
-const PUBLIC_DOWNLOAD_BASE_URL = String(
-  process.env.PUBLIC_DOWNLOAD_BASE_URL || 'https://media.bithashcapital.live/apps/latest'
+const GITHUB_RELEASE_BASE_URL = String(
+  process.env.PUBLIC_DOWNLOAD_BASE_URL ||
+  'https://github.com/mekitariansalinacoria8-lgtm/Bithhash/releases/download/desktop-latest'
 ).replace(/\/+$/, '');
-
-function encode(value) {
-  return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
-    `%${char.charCodeAt(0).toString(16).toUpperCase()}`
-  );
-}
-
-function hmac(key, value, encoding) {
-  return crypto.createHmac('sha256', key).update(value).digest(encoding);
-}
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(value).digest('hex');
-}
 
 function detectPlatform(req) {
   const headers = req?.headers || {};
@@ -73,36 +57,6 @@ function platformRequirements(platform) {
   return '';
 }
 
-function buildPresignedUrl({ accountId, bucket, key, accessKeyId, secretAccessKey, expiresIn }) {
-  const host = `${accountId}.r2.cloudflarestorage.com`;
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.slice(0, 8);
-  const credentialScope = `${dateStamp}/auto/s3/aws4_request`;
-  const canonicalUri = `/${encode(bucket)}/${key.split('/').map(encode).join('/')}`;
-
-  const params = {
-    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
-    'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
-    'X-Amz-Date': amzDate,
-    'X-Amz-Expires': String(expiresIn),
-    'X-Amz-SignedHeaders': 'host'
-  };
-
-  const canonicalQueryString = Object.keys(params).sort()
-    .map((name) => `${encode(name)}=${encode(params[name])}`).join('&');
-  const canonicalHeaders = `host:${host}\n`;
-  const canonicalRequest = ['GET', canonicalUri, canonicalQueryString, canonicalHeaders, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
-  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, sha256(canonicalRequest)].join('\n');
-  const kDate = hmac(`AWS4${secretAccessKey}`, dateStamp);
-  const kRegion = hmac(kDate, 'auto');
-  const kService = hmac(kRegion, 's3');
-  const kSigning = hmac(kService, 'aws4_request');
-  const signature = hmac(kSigning, stringToSign, 'hex');
-
-  return `https://${host}${canonicalUri}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
-}
-
 function installAppDownloadRoute(app) {
   if (!app || app.__bithashAppDownloadRouteInstalled) return;
   app.__bithashAppDownloadRouteInstalled = true;
@@ -125,13 +79,12 @@ function installAppDownloadRoute(app) {
         });
       }
 
-      // Desktop releases are published by CI to the public media origin. Prefer
-      // that canonical URL so the download endpoint cannot fail just because a
-      // Render instance is missing optional R2 signing credentials.
-      const publicUrl = `${PUBLIC_DOWNLOAD_BASE_URL}/${encode(file)}`;
+      // Desktop installers are published as public GitHub release assets by CI.
+      // This removes the Render/R2 credential dependency from the download path.
+      const publicUrl = `${GITHUB_RELEASE_BASE_URL}/${encodeURIComponent(file)}`;
       res.setHeader('Cache-Control', 'private, no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-BitHash-Download', 'public-media');
+      res.setHeader('X-BitHash-Download', 'github-release');
       res.setHeader('Content-Type', contentType);
       res.setHeader('Location', publicUrl);
       return res.status(302).end();
