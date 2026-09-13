@@ -6806,14 +6806,14 @@ const initializePlans = async () => {
   try {
     const plans = [
       {
-        name: ' Basic Contract',
+        name: 'Basic Contract',
         description: '6.731% After 12 hours',
         percentage: 6.731,
         duration: 12,
         minAmount: 50,
         maxAmount: 499,
-          hashrate:25513,
-          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
+        hashrate: 25513,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
         referralBonus: 5
       },
       {
@@ -6823,8 +6823,8 @@ const initializePlans = async () => {
         duration: 24,
         minAmount: 500,
         maxAmount: 1999,
-           hashrate:78719,
-          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
+        hashrate: 78719,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
         referralBonus: 5
       },
       {
@@ -6834,8 +6834,8 @@ const initializePlans = async () => {
         duration: 48,
         minAmount: 2000,
         maxAmount: 9999,
-           hashrate:192191,
-          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
+        hashrate: 192191,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
         referralBonus: 5
       },
       {
@@ -6845,19 +6845,19 @@ const initializePlans = async () => {
         duration: 72,
         minAmount: 10000,
         maxAmount: 49999,
-           hashrate:416219,
-          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
+        hashrate: 416219,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
         referralBonus: 5
       },
       {
-        name: 'Ultimate Countract',
+        name: 'Ultimate Contract',
         description: '24.927% After 96 hours',
         percentage: 24.927,
         duration: 96,
         minAmount: 50000,
         maxAmount: 1000000,
-           hashrate:987592,
-          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
+        hashrate: 987592,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
         referralBonus: 5
       }
     ];
@@ -6875,7 +6875,6 @@ const initializePlans = async () => {
 
 initializeAdmin();
 initializePlans();
-
 
 
 
