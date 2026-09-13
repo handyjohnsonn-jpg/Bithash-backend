@@ -1,4 +1,28 @@
 const crypto = require('crypto');
+const express = require('express');
+
+// server.js imports this module but does not explicitly call installAppDownloadRoute(app).
+// Install the routes automatically after the first middleware is registered so the
+// endpoints work even when Render starts the service with `node server.js`.
+const originalApplicationUse = express.application.use;
+if (!express.application.__bithashDownloadAutoinstallPatched) {
+  Object.defineProperty(express.application, '__bithashDownloadAutoinstallPatched', {
+    value: true,
+    configurable: false,
+    enumerable: false,
+    writable: false
+  });
+
+  express.application.use = function bithashPatchedUse(...args) {
+    const result = originalApplicationUse.apply(this, args);
+    try {
+      installAppDownloadRoute(this);
+    } catch (error) {
+      console.error('[BitHash] Failed to install app download routes:', error);
+    }
+    return result;
+  };
+}
 
 const FILES = Object.freeze({
   'BitHash-Capital-windows.exe': 'application/vnd.microsoft.portable-executable',
@@ -46,14 +70,7 @@ function platformRequirements(platform) {
   return '';
 }
 
-function buildPresignedUrl({
-  accountId,
-  bucket,
-  key,
-  accessKeyId,
-  secretAccessKey,
-  expiresIn
-}) {
+function buildPresignedUrl({ accountId, bucket, key, accessKeyId, secretAccessKey, expiresIn }) {
   const host = `${accountId}.r2.cloudflarestorage.com`;
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
@@ -69,31 +86,11 @@ function buildPresignedUrl({
     'X-Amz-SignedHeaders': 'host'
   };
 
-  const canonicalQueryString = Object.keys(params)
-    .sort()
-    .map((name) => `${encode(name)}=${encode(params[name])}`)
-    .join('&');
-
+  const canonicalQueryString = Object.keys(params).sort()
+    .map((name) => `${encode(name)}=${encode(params[name])}`).join('&');
   const canonicalHeaders = `host:${host}\n`;
-  const signedHeaders = 'host';
-  const payloadHash = 'UNSIGNED-PAYLOAD';
-
-  const canonicalRequest = [
-    'GET',
-    canonicalUri,
-    canonicalQueryString,
-    canonicalHeaders,
-    signedHeaders,
-    payloadHash
-  ].join('\n');
-
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    sha256(canonicalRequest)
-  ].join('\n');
-
+  const canonicalRequest = ['GET', canonicalUri, canonicalQueryString, canonicalHeaders, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, sha256(canonicalRequest)].join('\n');
   const kDate = hmac(`AWS4${secretAccessKey}`, dateStamp);
   const kRegion = hmac(kDate, 'auto');
   const kService = hmac(kRegion, 's3');
@@ -105,64 +102,55 @@ function buildPresignedUrl({
 
 function installAppDownloadRoute(app) {
   if (!app || app.__bithashAppDownloadRouteInstalled) return;
-
   app.__bithashAppDownloadRouteInstalled = true;
 
   function handleDownload(req, res, forcedFile = null) {
-    const file = forcedFile || (typeof req.query?.file === 'string' ? req.query.file : '');
-    const contentType = FILES[file];
+    try {
+      const file = forcedFile || (typeof req.query?.file === 'string' ? req.query.file : '');
+      const contentType = FILES[file];
+      if (!contentType) return res.status(404).json({ error: 'Download not found' });
 
-    if (!contentType) {
-      return res.status(404).json({ error: 'Download not found' });
-    }
+      const requiredPlatform = requiredPlatformForFile(file);
+      const clientPlatform = detectPlatform(req);
+      if (requiredPlatform && clientPlatform !== requiredPlatform) {
+        return res.status(403).json({
+          error: 'This native download is only available for the matching device platform.',
+          requestedFile: file,
+          detectedPlatform: clientPlatform,
+          requiredPlatform,
+          requirements: platformRequirements(requiredPlatform)
+        });
+      }
 
-    const requiredPlatform = requiredPlatformForFile(file);
-    const clientPlatform = detectPlatform(req);
-    if (requiredPlatform && clientPlatform !== requiredPlatform) {
-      return res.status(403).json({
-        error: 'This native download is only available for the matching device platform.',
-        requestedFile: file,
-        detectedPlatform: clientPlatform,
-        requiredPlatform,
-        requirements: platformRequirements(requiredPlatform)
+      const { R2_ACCOUNT_ID, R2_BUCKET_NAME, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY } = process.env;
+      if (!R2_ACCOUNT_ID || !R2_BUCKET_NAME || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+        console.error('[BitHash] App download R2 endpoint is not configured');
+        return res.status(503).json({ error: 'Downloads are temporarily unavailable' });
+      }
+
+      const url = buildPresignedUrl({
+        accountId: R2_ACCOUNT_ID,
+        bucket: R2_BUCKET_NAME,
+        key: `${DOWNLOAD_PREFIX}${file}`,
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+        expiresIn: DOWNLOAD_TTL_SECONDS
       });
+
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-BitHash-Download', 'r2-presigned');
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Location', url);
+      return res.status(302).end();
+    } catch (error) {
+      console.error('[BitHash] App download request failed:', error);
+      return res.status(500).json({ error: 'Unable to prepare download' });
     }
-
-    const {
-      R2_ACCOUNT_ID,
-      R2_BUCKET_NAME,
-      R2_ACCESS_KEY_ID,
-      R2_SECRET_ACCESS_KEY
-    } = process.env;
-
-    if (!R2_ACCOUNT_ID || !R2_BUCKET_NAME || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-      console.error('App download R2 endpoint is not configured');
-      return res.status(503).json({ error: 'Downloads are temporarily unavailable' });
-    }
-
-    const key = `${DOWNLOAD_PREFIX}${file}`;
-    const url = buildPresignedUrl({
-      accountId: R2_ACCOUNT_ID,
-      bucket: R2_BUCKET_NAME,
-      key,
-      accessKeyId: R2_ACCESS_KEY_ID,
-      secretAccessKey: R2_SECRET_ACCESS_KEY,
-      expiresIn: DOWNLOAD_TTL_SECONDS
-    });
-
-    res.setHeader('Cache-Control', 'private, no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-BitHash-Download', 'r2-presigned');
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Location', url);
-
-    return res.status(302).end();
   }
 
   app.get('/api/app-download', (req, res) => handleDownload(req, res));
   app.head('/api/app-download', (req, res) => handleDownload(req, res));
-
-  // Backward-compatible native download endpoints used by the desktop installer UI.
   app.get('/api/apps/download/windows', (req, res) => handleDownload(req, res, 'BitHash-Capital-windows.exe'));
   app.head('/api/apps/download/windows', (req, res) => handleDownload(req, res, 'BitHash-Capital-windows.exe'));
   app.get('/api/apps/download/macos', (req, res) => handleDownload(req, res, 'BitHash-Capital-macos.dmg'));
