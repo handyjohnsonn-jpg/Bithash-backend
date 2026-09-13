@@ -6806,48 +6806,58 @@ const initializePlans = async () => {
   try {
     const plans = [
       {
-        name: 'Starter Plan',
-        description: '6.731% After 10 hours',
+        name: ' Basic Contract',
+        description: '6.731% After 12 hours',
         percentage: 6.731,
         duration: 12,
-        minAmount: 30,
+        minAmount: 50,
         maxAmount: 499,
+          hashrate:25513,
+          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
         referralBonus: 5
       },
       {
-        name: 'Standard Plan',
+        name: 'Standard Contract',
         description: '8.682% After 24 hours',
         percentage: 8.682,
         duration: 24,
         minAmount: 500,
         maxAmount: 1999,
+           hashrate:78719,
+          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
         referralBonus: 5
       },
       {
-        name: 'Gold Plan',
+        name: 'Gold Contract',
         description: '11.564% After 48 hours',
         percentage: 11.564,
         duration: 48,
         minAmount: 2000,
         maxAmount: 9999,
+           hashrate:192191,
+          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
         referralBonus: 5
       },
       {
-        name: 'Enterprise Plan',
+        name: 'Enterprise Contract',
         description: '16.711% After 72 hours',
         percentage: 16.711,
         duration: 72,
         minAmount: 10000,
         maxAmount: 49999,
+           hashrate:416219,
+          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
         referralBonus: 5
       },
       {
-        name: 'Ultimate Plan',
+        name: 'Ultimate Countract',
         description: '24.927% After 96 hours',
         percentage: 24.927,
         duration: 96,
         minAmount: 50000,
         maxAmount: 1000000,
+           hashrate:987592,
+          videoUrl:https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4,
         referralBonus: 5
       }
     ];
