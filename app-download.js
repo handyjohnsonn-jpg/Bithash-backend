@@ -31,6 +31,9 @@ const FILES = Object.freeze({
 
 const DOWNLOAD_PREFIX = 'apps/latest/';
 const DOWNLOAD_TTL_SECONDS = 300;
+const PUBLIC_DOWNLOAD_BASE_URL = String(
+  process.env.PUBLIC_DOWNLOAD_BASE_URL || 'https://media.bithashcapital.live/apps/latest'
+).replace(/\/+$/, '');
 
 function encode(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
@@ -122,26 +125,15 @@ function installAppDownloadRoute(app) {
         });
       }
 
-      const { R2_ACCOUNT_ID, R2_BUCKET_NAME, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY } = process.env;
-      if (!R2_ACCOUNT_ID || !R2_BUCKET_NAME || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-        console.error('[BitHash] App download R2 endpoint is not configured');
-        return res.status(503).json({ error: 'Downloads are temporarily unavailable' });
-      }
-
-      const url = buildPresignedUrl({
-        accountId: R2_ACCOUNT_ID,
-        bucket: R2_BUCKET_NAME,
-        key: `${DOWNLOAD_PREFIX}${file}`,
-        accessKeyId: R2_ACCESS_KEY_ID,
-        secretAccessKey: R2_SECRET_ACCESS_KEY,
-        expiresIn: DOWNLOAD_TTL_SECONDS
-      });
-
+      // Desktop releases are published by CI to the public media origin. Prefer
+      // that canonical URL so the download endpoint cannot fail just because a
+      // Render instance is missing optional R2 signing credentials.
+      const publicUrl = `${PUBLIC_DOWNLOAD_BASE_URL}/${encode(file)}`;
       res.setHeader('Cache-Control', 'private, no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-BitHash-Download', 'r2-presigned');
+      res.setHeader('X-BitHash-Download', 'public-media');
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Location', url);
+      res.setHeader('Location', publicUrl);
       return res.status(302).end();
     } catch (error) {
       console.error('[BitHash] App download request failed:', error);
