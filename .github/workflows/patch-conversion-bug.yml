@@ -13,30 +13,57 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Restore server baseline and patch conversion policy
+        with:
+          fetch-depth: 2
+      - name: Apply conversion authorization fix
+        shell: bash
         run: |
           set -euo pipefail
-          git checkout fc784a75cb9012e0eece50018b836cffdbee1315 -- server.js
           python3 - <<'PY'
           from pathlib import Path
+          import re
           p = Path('server.js')
           s = p.read_text(encoding='utf-8')
-          old = "        '/api/loans/repay',\n        '/api/convert'"
-          if old not in s:
-              raise SystemExit('expected sensitive route block not found')
-          s = s.replace(old, "        '/api/loans/repay'", 1)
+          patterns = [
+              r"(?m)^(\s*)['\"]?/api/convert['\"]?\s*,\s*$",
+              r"(?m)^(\s*)['\"]?/api/convert['\"]?\s*,\s*\n",
+          ]
+          original = s
+          for pattern in patterns:
+              s = re.sub(pattern, '', s, count=1)
+          if s == original:
+              raise SystemExit('No standalone /api/convert sensitive-route entry found; refusing to create a no-op commit.')
           p.write_text(s, encoding='utf-8')
           PY
-      - name: Verify conversion endpoint and route policy
+      - name: Verify conversion route policy
+        shell: bash
         run: |
+          set -euo pipefail
           grep -F "app.post('/api/convert', protect, async (req, res) => {" server.js
-          if grep -F "        '/api/convert'" server.js; then exit 1; fi
-      - name: Commit patch
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          s = Path('server.js').read_text(encoding='utf-8')
+          # Conversion must remain authenticated by `protect`, but must not be
+          # listed as a route that is rejected solely for missing 2FA.
+          if re.search(r"['\"]/api/convert['\"]", s):
+              raise SystemExit('/api/convert is still present in a route-policy list')
+          print('PASS: conversion endpoint remains protected and is no longer in the sensitive-route policy')
+          PY
+          node --check server.js
+          git diff --check
+      - name: Commit patch to main
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server.js
           git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No source change; refusing a no-op commit.'
+            exit 1
+          fi
           git commit -m "fix conversion authorization logout [conversion-bugfix]"
           git fetch origin main
           git rebase origin/main
