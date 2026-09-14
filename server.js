@@ -17526,7 +17526,6 @@ app.get('/api/convert/assets', protect, async (req, res) => {
 // =============================================
 // CONVERT ENDPOINT - Execute crypto conversion using Map balances
 // =============================================
-app.post('/api/convert', protect, async (req, res) => {
   try {
     console.log('=== CONVERSION REQUEST RECEIVED ===');
     console.log('Request body:', req.body);
