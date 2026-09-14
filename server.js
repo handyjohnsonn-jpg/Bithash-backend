@@ -6879,15 +6879,22 @@ initializePlans();
 
 
 
+
 const protect = async (req, res, next) => {
   try {
     let token;
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+
+    // Get JWT from Authorization header or cookie
+    if (
+      req.headers.authorization &&
+      req.headers.authorization.startsWith('Bearer')
+    ) {
       token = req.headers.authorization.split(' ')[1];
     } else if (req.cookies.jwt) {
       token = req.cookies.jwt;
     }
 
+    // No authentication token
     if (!token) {
       return res.status(401).json({
         status: 'fail',
@@ -6895,9 +6902,14 @@ const protect = async (req, res, next) => {
       });
     }
 
+    // Verify JWT
     const decoded = verifyJWT(token);
-    const currentUser = await User.findById(decoded.id).select('+passwordChangedAt +twoFactorAuth.secret');
 
+    const currentUser = await User.findById(decoded.id).select(
+      '+passwordChangedAt +twoFactorAuth.secret'
+    );
+
+    // User no longer exists
     if (!currentUser) {
       return res.status(401).json({
         status: 'fail',
@@ -6905,13 +6917,18 @@ const protect = async (req, res, next) => {
       });
     }
 
-    if (currentUser.passwordChangedAt && decoded.iat < currentUser.passwordChangedAt.getTime() / 1000) {
+    // Password was changed after token was issued
+    if (
+      currentUser.passwordChangedAt &&
+      decoded.iat < currentUser.passwordChangedAt.getTime() / 1000
+    ) {
       return res.status(401).json({
         status: 'fail',
         message: 'User recently changed password! Please log in again.'
       });
     }
 
+    // Account is not active
     if (currentUser.status !== 'active') {
       return res.status(401).json({
         status: 'fail',
@@ -6919,9 +6936,22 @@ const protect = async (req, res, next) => {
       });
     }
 
-    // ✅ FIX: Only require 2FA for sensitive operations, NOT for all requests
+    /*
+     * 2FA protection
+     *
+     * IMPORTANT:
+     * /api/convert is intentionally NOT included here.
+     *
+     * Conversion still requires a valid JWT because this middleware
+     * protects the route, but it does not require the x-2fa-verified
+     * header. This prevents a normal conversion request from being
+     * incorrectly returned as:
+     *
+     * 401 { requires2FA: true }
+     *
+     * which the frontend could interpret as a session expiration.
+     */
     if (currentUser.twoFactorAuth?.enabled) {
-      // Define which routes require 2FA verification
       const sensitiveRoutes = [
         '/api/withdrawals',
         '/api/withdrawals/spot',
@@ -6933,19 +6963,21 @@ const protect = async (req, res, next) => {
         '/api/loans/apply',
         '/api/loans/repay'
       ];
-      
-      // Check if the current request path requires 2FA
-      const requires2FA = sensitiveRoutes.some(route => req.path.startsWith(route));
-      
+
+      const requires2FA = sensitiveRoutes.some((route) =>
+        req.path.startsWith(route)
+      );
+
       if (requires2FA && !req.headers['x-2fa-verified']) {
         return res.status(401).json({
           status: 'fail',
           message: 'Two-factor authentication required',
-          requires2FA: true  // ← This flag tells frontend to show 2FA modal
+          requires2FA: true
         });
       }
     }
 
+    // Authentication successful
     req.user = currentUser;
     next();
   } catch (err) {
@@ -6955,6 +6987,7 @@ const protect = async (req, res, next) => {
     });
   }
 };
+
 
 
 
