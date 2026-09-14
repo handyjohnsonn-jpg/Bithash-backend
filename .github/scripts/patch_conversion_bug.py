@@ -1,16 +1,18 @@
 from pathlib import Path
-import re
 
 path = Path("server.js")
 source = path.read_text(encoding="utf-8")
-
-match = re.search(r"const\s+sensitiveRoutes\s*=\s*\[(.*?)\];", source, flags=re.S)
-if not match:
-    raise SystemExit("sensitiveRoutes array not found")
-block = match.group(1)
-updated, count = re.subn(r"\n\s*['\"]\/api\/convert['\"],?", "", block, count=1)
-if count != 1:
-    raise SystemExit("conversion sensitive-route entry not found")
-source = source[:match.start(1)] + updated + source[match.end(1):]
+target = "'/api/convert'"
+pos = source.find(target)
+if pos < 0:
+    raise SystemExit("conversion route entry not found")
+line_start = source.rfind("\n", 0, pos) + 1
+line_end = source.find("\n", pos)
+if line_end < 0:
+    line_end = len(source)
+line = source[line_start:line_end]
+if "sensitive" not in source[max(0, line_start - 1200):line_start].lower():
+    raise SystemExit("first conversion occurrence was not in the sensitive route section")
+source = source[:line_start] + source[line_end + (1 if line_end < len(source) else 0):]
 path.write_text(source, encoding="utf-8")
-print("server.js patched")
+print(f"removed sensitive route line: {line.strip()}")
