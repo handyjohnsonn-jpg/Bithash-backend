@@ -5,8 +5,8 @@
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node -r ./tracking-body-safety.js -r ./app-download-bootstrap.js server.js",
-    "dev": "node -r ./tracking-body-safety.js -r ./app-download-bootstrap.js ./node_modules/nodemon/bin/nodemon.js server.js",
+    "start": "node -r ./conversion-route-bootstrap.js -r ./tracking-body-safety.js -r ./app-download-bootstrap.js server.js",
+    "dev": "node -r ./conversion-route-bootstrap.js -r ./tracking-body-safety.js -r ./app-download-bootstrap.js ./node_modules/nodemon/bin/nodemon.js server.js",
     "worker": "node price-aggregator-worker.js",
     "worker:dev": "nodemon price-aggregator-worker.js",
     "test": "jest --watchAll --detectOpenHandles",
@@ -46,7 +46,7 @@
     "ioredis": "^5.3.2",
     "bullmq": "^5.58.0",
     "@solana/web3.js": "^1.87.0",
-    "bip32": "^2.0.6",
+    "bip32": "^2.0.0",
     "bip39": "^3.0.4",
     "xrpl": "^2.7.0",
     "@cardano-sdk/core": "^0.15.0",
@@ -57,7 +57,7 @@
     "multer": "^1.4.5-lts.1",
     "node-binance-api": "^0.13.1",
     "node-cron": "^3.0.3",
-    "node-device-detector": "^2.0.3",
+    "node-device-detector": "^2.0.0",
     "nodemailer": "^6.9.5",
     "openai": "^5.11.0",
     "pdfkit": "^0.15.0",
@@ -87,6 +87,6 @@
     "jest": "^29.7.0",
     "nodemon": "^3.0.1",
     "prettier": "^3.0.3",
-    "supertest": "^6.3.3"
+    "supertest": "^6.3.0"
   }
 }
