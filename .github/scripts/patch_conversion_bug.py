@@ -14,15 +14,16 @@ if endpoint not in source:
     source = source[:try_pos] + endpoint + "\n" + source[try_pos:]
     print("restored convert endpoint declaration")
 
-sensitive_pos = source.find("sensitiveRoutes")
-if sensitive_pos < 0:
-    raise SystemExit("sensitiveRoutes section not found")
+anchor = "'/api/loans/repay'"
+anchor_pos = source.find(anchor)
+if anchor_pos < 0:
+    raise SystemExit("loans/repay sensitive route anchor not found")
 target = "'/api/convert'"
-pos = source.rfind(target, 0, sensitive_pos)
-if pos < 0:
-    raise SystemExit("conversion sensitive-route entry not found before sensitiveRoutes")
-line_start = source.rfind("\n", 0, pos) + 1
-line_end = source.find("\n", pos)
+target_pos = source.find(target, anchor_pos, anchor_pos + 400)
+if target_pos < 0:
+    raise SystemExit("conversion sensitive-route entry not found near loans/repay")
+line_start = source.rfind("\n", 0, target_pos) + 1
+line_end = source.find("\n", target_pos)
 if line_end < 0:
     line_end = len(source)
 line = source[line_start:line_end]
