@@ -6931,8 +6931,7 @@ const protect = async (req, res, next) => {
         '/api/admin',
         '/api/payments',
         '/api/loans/apply',
-        '/api/loans/repay',
-        '/api/convert'
+        '/api/loans/repay'
       ];
       
       // Check if the current request path requires 2FA
