@@ -1,0 +1,31 @@
+name: Patch conversion authorization bug
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[conversion-bugfix]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch server.js
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text(encoding='utf-8')
+          old = "        '/api/loans/repay',\n        '/api/convert'"
+          if old not in s: raise SystemExit('conversion sensitive-route entry not found')
+          s = s.replace(old, "        '/api/loans/repay'", 2)
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --quiet || git commit -m "fix conversion session logout [conversion-bugfix]"
+          git push
