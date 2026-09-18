@@ -4700,11 +4700,11 @@ const OTPSchema = new mongoose.Schema({
     type: String,
     required: [true, 'OTP is required']
   },
-  type: {
-    type: String,
-    enum: ['signup', 'login', 'password_reset', 'withdrawal'],
-    default: 'signup'
-  },
+type: {
+  type: String,
+  enum: ['signup', 'login', 'password_reset', 'withdrawal', 'kyc_verification'],
+  default: 'signup'
+},
   attempts: {
     type: Number,
     default: 0
@@ -49712,87 +49712,6 @@ app.post('/api/promos/redeem', protect, async (req, res) => {
 
 
 
-// =============================================
-// ADD THESE ENDPOINTS TO YOUR server.js
-// =============================================
-
-// 1. Send KYC OTP
-app.post('/api/users/kyc/send-otp', protect, async (req, res) => {
-    try {
-        const { email } = req.body;
-        const userId = req.user._id;
-        
-        if (!email) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Email is required'
-            });
-        }
-        
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'User not found'
-            });
-        }
-        
-        // Check for recent OTP
-        const recentOtp = await OTP.findOne({
-            email: email,
-            type: 'kyc_verification',
-            used: false,
-            createdAt: { $gte: new Date(Date.now() - 60 * 1000) }
-        });
-        
-        if (recentOtp) {
-            return res.status(429).json({
-                status: 'fail',
-                message: 'Please wait 60 seconds before requesting a new OTP'
-            });
-        }
-        
-        // Generate OTP
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-        
-        // Delete existing OTPs
-        await OTP.deleteMany({ email: email, type: 'kyc_verification', used: false });
-        
-        // Create new OTP
-        await OTP.create({
-            email: email,
-            otp: otp,
-            type: 'kyc_verification',
-            expiresAt: expiresAt,
-            ipAddress: getRealClientIP(req),
-            userAgent: req.headers['user-agent'] || 'Unknown'
-        });
-        
-        // Send email
-        await sendProfessionalEmail({
-            email: email,
-            template: 'otp',
-            data: {
-                name: user.firstName || 'User',
-                otp: otp,
-                action: 'KYC verification'
-            }
-        });
-        
-        res.status(200).json({
-            status: 'success',
-            message: 'OTP sent successfully'
-        });
-        
-    } catch (err) {
-        console.error('Send KYC OTP error:', err);
-        res.status(500).json({
-            status: 'error',
-            message: 'Failed to send OTP'
-        });
-    }
-});
 
 // 2. Verify KYC OTP
 app.post('/api/users/kyc/verify', protect, async (req, res) => {
@@ -51153,7 +51072,581 @@ app.get('/api/admin/promos/export', adminProtect, restrictTo('super', 'finance')
 
 
 
+// =============================================
+// KYC MISSING ENDPOINTS - SETTINGS PAGE INTEGRATION
+// These 5 endpoints are required by settings.html
+// - GET  /api/users/kyc/status          → loadKYCStatus()
+// - POST /api/users/kyc/send-otp        → Resend OTP button
+// - POST /api/users/kyc/facial/session  → startFacialVerification()
+// - POST /api/users/kyc/facial/submit   → submitFacialVerification()
+// - GET  /api/users/kyc/facial/status   → facial polling loop
+// =============================================
 
+// =============================================
+// FACIAL SESSION SCHEMA (in-memory + Mongo fallback)
+// Uses existing KYC record; stores transient session state in Redis
+// =============================================
+const FACIAL_SESSION_TTL = 15 * 60; // 15 minutes
+const FACIAL_SESSION_PREFIX = 'kyc:facial:session:';
+
+const createFacialSession = async (userId) => {
+    const sessionId = crypto.randomBytes(24).toString('hex');
+    const sessionData = {
+        sessionId,
+        userId: userId.toString(),
+        status: 'pending',        // pending | processing | verified | rejected | failed
+        reason: null,
+        imageKey: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+    };
+    await redis.setex(
+        `${FACIAL_SESSION_PREFIX}${sessionId}`,
+        FACIAL_SESSION_TTL,
+        JSON.stringify(sessionData)
+    );
+    return sessionData;
+};
+
+const getFacialSession = async (sessionId) => {
+    if (!sessionId) return null;
+    const raw = await redis.get(`${FACIAL_SESSION_PREFIX}${sessionId}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+};
+
+const updateFacialSession = async (sessionId, updates) => {
+    const existing = await getFacialSession(sessionId);
+    if (!existing) return null;
+    const merged = {
+        ...existing,
+        ...updates,
+        updatedAt: new Date().toISOString()
+    };
+    await redis.setex(
+        `${FACIAL_SESSION_PREFIX}${sessionId}`,
+        FACIAL_SESSION_TTL,
+        JSON.stringify(merged)
+    );
+    return merged;
+};
+
+// =============================================
+// 1. GET /api/users/kyc/status
+// Returns per-component status + application-level status
+// Matches settings.html loadKYCStatus() expectations exactly
+// =============================================
+app.get('/api/users/kyc/status', protect, async (req, res) => {
+    try {
+        const userId = req.user._id;
+
+        const kycRecord = await KYC.findOne({ user: userId }).lean();
+
+        // Map internal statuses to the shape the frontend expects.
+        // Frontend accepts: incomplete | saved | complete | verified | approved | pending | rejected | failed
+        const mapComponentStatus = (status) => {
+            if (!status) return 'incomplete';
+            const s = String(status).toLowerCase();
+            if (s === 'not-submitted') return 'incomplete';
+            return s;
+        };
+
+        if (!kycRecord) {
+            return res.status(200).json({
+                status: 'success',
+                data: {
+                    application: { status: 'draft' },
+                    applicationStatus: 'draft',
+                    identity: { status: 'incomplete' },
+                    address: { status: 'incomplete' },
+                    facial: { status: 'incomplete' },
+                    identityStatus: 'incomplete',
+                    addressStatus: 'incomplete',
+                    facialStatus: 'incomplete',
+                    identityComplete: false,
+                    addressComplete: false,
+                    facialComplete: false,
+                    message: 'Your KYC verification has not been started yet.',
+                    rejectionReason: null
+                }
+            });
+        }
+
+        const identityStatus = mapComponentStatus(kycRecord.identity?.status);
+        const addressStatus = mapComponentStatus(kycRecord.address?.status);
+        const facialStatus = mapComponentStatus(kycRecord.facial?.status);
+
+        // Application-level status (separate from per-component status)
+        let applicationStatus = 'draft';
+        const overall = (kycRecord.overallStatus || 'not-started').toLowerCase();
+        if (overall === 'pending') applicationStatus = 'pending';
+        else if (overall === 'verified') applicationStatus = 'verified';
+        else if (overall === 'rejected') applicationStatus = 'rejected';
+        else if (overall === 'in-progress') applicationStatus = 'draft';
+        else applicationStatus = 'draft';
+
+        // Extract rejection reason from any rejected component
+        let rejectionReason = null;
+        if (identityStatus === 'rejected') rejectionReason = kycRecord.identity?.rejectionReason || null;
+        else if (addressStatus === 'rejected') rejectionReason = kycRecord.address?.rejectionReason || null;
+        else if (facialStatus === 'rejected') rejectionReason = kycRecord.facial?.rejectionReason || null;
+        if (!rejectionReason) rejectionReason = kycRecord.adminNotes || null;
+
+        // Human-readable message
+        let message = 'Your KYC verification is in progress.';
+        if (applicationStatus === 'pending') message = 'Your KYC application is under review.';
+        else if (applicationStatus === 'verified') message = 'Your identity has been verified.';
+        else if (applicationStatus === 'rejected') message = 'Your KYC application was rejected. Please review the feedback and resubmit.';
+        else if (identityStatus === 'incomplete' && addressStatus === 'incomplete' && facialStatus === 'incomplete') {
+            message = 'Your KYC verification has not been started yet.';
+        }
+
+        const identityComplete = ['verified', 'approved'].includes(identityStatus);
+        const addressComplete = ['verified', 'approved'].includes(addressStatus);
+        const facialComplete = ['verified', 'approved'].includes(facialStatus);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                application: { status: applicationStatus },
+                applicationStatus,
+                identity: { status: identityStatus },
+                address: { status: addressStatus },
+                facial: { status: facialStatus },
+                identityStatus,
+                addressStatus,
+                facialStatus,
+                identityComplete,
+                addressComplete,
+                facialComplete,
+                message,
+                rejectionReason,
+                submittedAt: kycRecord.submittedAt || null,
+                reviewedAt: kycRecord.reviewedAt || null,
+                updatedAt: kycRecord.updatedAt || null
+            }
+        });
+
+    } catch (err) {
+        console.error('Error fetching KYC status:', err);
+        res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch KYC status'
+        });
+    }
+});
+
+// =============================================
+// 2. POST /api/users/kyc/send-otp
+// Sends KYC-specific OTP to the user's registered email
+// Matches settings.html resend-otp-btn handler
+// =============================================
+app.post('/api/users/kyc/send-otp', protect, async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const { email } = req.body || {};
+
+        if (!email || typeof email !== 'string' || !validator.isEmail(email)) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A valid email address is required'
+            });
+        }
+
+        // Ensure user exists and email matches the authenticated user
+        const user = await User.findById(userId).select('firstName lastName email');
+        if (!user) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'User not found'
+            });
+        }
+
+        if (String(user.email).toLowerCase() !== String(email).toLowerCase()) {
+            return res.status(403).json({
+                status: 'fail',
+                message: 'Email does not match the authenticated user'
+            });
+        }
+
+        // Rate limit: 60 seconds between KYC OTP requests
+        const recentOtp = await OTP.findOne({
+            email: user.email,
+            type: 'kyc_verification',
+            used: false,
+            createdAt: { $gte: new Date(Date.now() - 60 * 1000) }
+        });
+
+        if (recentOtp) {
+            return res.status(429).json({
+                status: 'fail',
+                message: 'Please wait 60 seconds before requesting a new OTP'
+            });
+        }
+
+        // Invalidate previous unused KYC OTPs
+        await OTP.deleteMany({
+            email: user.email,
+            type: 'kyc_verification',
+            used: false
+        });
+
+        // Generate OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+        await OTP.create({
+            email: user.email,
+            otp,
+            type: 'kyc_verification',
+            expiresAt,
+            ipAddress: getRealClientIP(req),
+            userAgent: req.headers['user-agent'] || 'Unknown'
+        });
+
+        // Send email using existing professional email helper
+        await sendProfessionalEmail({
+            email: user.email,
+            template: 'otp',
+            data: {
+                name: user.firstName || 'User',
+                otp,
+                action: 'KYC verification'
+            }
+        });
+
+        // Log activity
+        await logActivity(
+            'kyc_otp_sent',
+            'kyc',
+            userId,
+            userId,
+            'User',
+            req,
+            { email: user.email, type: 'kyc_verification' }
+        );
+
+        return res.status(200).json({
+            status: 'success',
+            message: 'OTP sent successfully'
+        });
+
+    } catch (err) {
+        console.error('Send KYC OTP error:', err);
+        res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to send OTP'
+        });
+    }
+});
+
+// =============================================
+// 3. POST /api/users/kyc/facial/session
+// Creates a facial verification session and returns sessionId
+// Matches settings.html startFacialVerification()
+// =============================================
+app.post('/api/users/kyc/facial/session', protect, async (req, res) => {
+    try {
+        const userId = req.user._id;
+
+        // Prevent creating a session if KYC is already submitted/verified
+        const existingKYC = await KYC.findOne({ user: userId }).lean();
+        if (existingKYC) {
+            const overall = (existingKYC.overallStatus || '').toLowerCase();
+            if (overall === 'pending' || overall === 'verified') {
+                return res.status(409).json({
+                    status: 'fail',
+                    message: 'KYC is already submitted or verified. Cannot start a new facial session.'
+                });
+            }
+            if (existingKYC.facial && ['pending', 'verified'].includes(String(existingKYC.facial.status).toLowerCase())) {
+                return res.status(409).json({
+                    status: 'fail',
+                    message: 'Facial verification is already submitted or verified.'
+                });
+            }
+        }
+
+        const session = await createFacialSession(userId);
+
+        await logActivity(
+            'kyc_facial_session_created',
+            'kyc',
+            userId,
+            userId,
+            'User',
+            req,
+            { sessionId: session.sessionId }
+        );
+
+        return res.status(200).json({
+            status: 'success',
+            sessionId: session.sessionId,
+            data: {
+                sessionId: session.sessionId,
+                status: 'pending',
+                expiresIn: FACIAL_SESSION_TTL
+            }
+        });
+
+    } catch (err) {
+        console.error('Error creating facial session:', err);
+        res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to create facial verification session'
+        });
+    }
+});
+
+// =============================================
+// 4. POST /api/users/kyc/facial/submit
+// Accepts sessionId + single image blob, uploads to R2, updates KYC record
+// Matches settings.html submitFacialVerification()
+// =============================================
+app.post(
+    '/api/users/kyc/facial/submit',
+    protect,
+    upload.single('image'),
+    async (req, res) => {
+        let tempFilePath = null;
+        try {
+            const userId = req.user._id;
+            const { sessionId } = req.body || {};
+
+            if (!sessionId) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'sessionId is required'
+                });
+            }
+
+            if (!req.file) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'Image file is required'
+                });
+            }
+
+            tempFilePath = req.file.path;
+
+            // Validate session
+            const session = await getFacialSession(sessionId);
+            if (!session) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'Invalid or expired facial session. Please start over.'
+                });
+            }
+
+            if (session.userId !== userId.toString()) {
+                return res.status(403).json({
+                    status: 'fail',
+                    message: 'Facial session does not belong to this user'
+                });
+            }
+
+            // Validate image type
+            const allowedImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+            if (!allowedImageTypes.includes(req.file.mimetype)) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'Invalid image type. Only JPG, PNG, and WEBP are allowed.'
+                });
+            }
+
+            // Prevent duplicate submission
+            const existingKYC = await KYC.findOne({ user: userId }).lean();
+            if (existingKYC) {
+                const facialStatus = String(existingKYC.facial?.status || '').toLowerCase();
+                if (['pending', 'verified'].includes(facialStatus)) {
+                    return res.status(409).json({
+                        status: 'fail',
+                        message: 'Facial verification is already submitted or verified.'
+                    });
+                }
+            }
+
+            // Upload to R2 (existing helper)
+            const imageKey = `kyc/facial/${userId}_${Date.now()}_facial_${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+            const fileContent = await fs.promises.readFile(req.file.path);
+            await uploadToR2(fileContent, imageKey, req.file.mimetype);
+
+            // Clean up temp file
+            await fs.promises.unlink(req.file.path).catch(() => {});
+            tempFilePath = null;
+
+            // Find or create KYC record
+            let kycRecord = await KYC.findOne({ user: userId });
+            if (!kycRecord) {
+                kycRecord = new KYC({ user: userId });
+            }
+
+            // Update facial section
+            kycRecord.facial = kycRecord.facial || {};
+            kycRecord.facial.verificationPhoto = {
+                filename: path.basename(imageKey),
+                originalName: req.file.originalname,
+                mimeType: req.file.mimetype,
+                size: req.file.size,
+                path: imageKey,
+                uploadedAt: new Date()
+            };
+            kycRecord.facial.status = 'pending';
+            kycRecord.facial.submittedAt = new Date();
+            kycRecord.facial.rejectionReason = null;
+
+            // Update overall status if still in-progress
+            if (!kycRecord.overallStatus || kycRecord.overallStatus === 'not-started') {
+                kycRecord.overallStatus = 'in-progress';
+            }
+            kycRecord.updatedAt = new Date();
+
+            await kycRecord.save();
+
+            // Update user's KYC status
+            await User.findByIdAndUpdate(userId, {
+                'kycStatus.facial': 'pending',
+                kycUpdatedAt: new Date()
+            });
+
+            // Mark session as processing
+            await updateFacialSession(sessionId, {
+                status: 'processing',
+                imageKey,
+                reason: null
+            });
+
+            // Broadcast real-time update
+            const io = req.app.get('io');
+            if (io) {
+                io.to(`user_${userId}`).emit('kyc_update', {
+                    type: 'facial',
+                    status: 'pending',
+                    overallStatus: kycRecord.overallStatus,
+                    timestamp: Date.now()
+                });
+            }
+
+            await logActivity(
+                'kyc_facial_submitted',
+                'kyc',
+                kycRecord._id,
+                userId,
+                'User',
+                req,
+                { sessionId, imageKey }
+            );
+
+            return res.status(200).json({
+                status: 'success',
+                message: 'Facial verification submitted successfully',
+                data: {
+                    sessionId,
+                    status: 'processing',
+                    submittedAt: kycRecord.facial.submittedAt
+                }
+            });
+
+        } catch (err) {
+            console.error('Error submitting facial verification:', err);
+
+            // Clean up temp file on error
+            if (tempFilePath) {
+                await fs.promises.unlink(tempFilePath).catch(() => {});
+            }
+
+            res.status(500).json({
+                status: 'error',
+                message: err.message || 'Failed to submit facial verification'
+            });
+        }
+    }
+);
+
+// =============================================
+// 5. GET /api/users/kyc/facial/status
+// Returns current facial verification status for polling
+// Matches settings.html polling loop (every 2 seconds)
+// =============================================
+app.get('/api/users/kyc/facial/status', protect, async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const { sessionId } = req.query || {};
+
+        let status = 'pending';
+        let reason = null;
+
+        // If sessionId provided, prefer session state (authoritative during processing)
+        if (sessionId) {
+            const session = await getFacialSession(sessionId);
+            if (session && session.userId === userId.toString()) {
+                status = session.status;
+                reason = session.reason;
+            }
+        }
+
+        // Reconcile with the persisted KYC record
+        const kycRecord = await KYC.findOne({ user: userId }).lean();
+        if (kycRecord && kycRecord.facial) {
+            const facialStatus = String(kycRecord.facial.status || '').toLowerCase();
+            if (facialStatus === 'verified') {
+                status = 'verified';
+            } else if (facialStatus === 'rejected') {
+                status = 'rejected';
+                reason = kycRecord.facial.rejectionReason || reason;
+            } else if (facialStatus === 'pending') {
+                // Keep session status if it is more specific
+                if (status !== 'processing' && status !== 'verified' && status !== 'rejected' && status !== 'failed') {
+                    status = 'pending';
+                }
+            }
+        }
+
+        // If session says verified/rejected, persist it to KYC record (sync)
+        if (sessionId && (status === 'verified' || status === 'rejected' || status === 'failed')) {
+            const session = await getFacialSession(sessionId);
+            if (session && session.userId === userId.toString()) {
+                let kycRecordMutable = await KYC.findOne({ user: userId });
+                if (kycRecordMutable) {
+                    if (status === 'verified') {
+                        kycRecordMutable.facial.status = 'verified';
+                        kycRecordMutable.facial.verifiedAt = kycRecordMutable.facial.verifiedAt || new Date();
+                    } else {
+                        kycRecordMutable.facial.status = 'rejected';
+                        kycRecordMutable.facial.rejectionReason = session.reason || 'Facial verification failed';
+                        kycRecordMutable.facial.verifiedAt = kycRecordMutable.facial.verifiedAt || new Date();
+                    }
+                    await kycRecordMutable.save();
+                }
+            }
+        }
+
+        return res.status(200).json({
+            status,
+            reason,
+            data: {
+                status,
+                reason,
+                sessionId: sessionId || null,
+                timestamp: Date.now()
+            }
+        });
+
+    } catch (err) {
+        console.error('Error fetching facial status:', err);
+        res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch facial verification status'
+        });
+    }
+});
+
+console.log('✅ KYC Missing Endpoints loaded:');
+console.log('   - GET  /api/users/kyc/status');
+console.log('   - POST /api/users/kyc/send-otp');
+console.log('   - POST /api/users/kyc/facial/session');
+console.log('   - POST /api/users/kyc/facial/submit');
+console.log('   - GET  /api/users/kyc/facial/status');
 
 
 
