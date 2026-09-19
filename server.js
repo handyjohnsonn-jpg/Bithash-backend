@@ -41414,201 +41414,352 @@ app.post('/api/admin/wallet/transfer', adminProtect, restrictTo('super', 'financ
 });
 
 // =============================================
-// 4. GET /api/admin/wallet-management/dashboard - Wallet Dashboard
+// ON-CHAIN WALLET MANAGEMENT DATA
+// Database is used only for wallet/address -> user relationships.
+// Balances and transaction activity are sourced from live chain RPC/indexer APIs.
 // =============================================
+const walletChainCache = new Map();
+
+function walletCacheKey(asset, address) {
+    return `${asset.toUpperCase()}:${String(address).toLowerCase()}`;
+}
+
+async function fetchEvmAddressTransactions(asset, address, config, limit = 100) {
+    const chainId = config.chainId;
+    const apiKeyMap = {
+        1: process.env.ETHERSCAN_API_KEY,
+        56: process.env.BSCSCAN_API_KEY,
+        137: process.env.POLYGONSCAN_API_KEY,
+        42161: process.env.ARBISCAN_API_KEY,
+        10: process.env.ETHERSCAN_API_KEY,
+        8453: process.env.ETHERSCAN_API_KEY,
+        43114: process.env.SNOWTRACE_API_KEY
+    };
+    const apiKey = apiKeyMap[chainId];
+    if (!apiKey) throw new Error(`No explorer API key configured for chain ${chainId}`);
+
+    const endpoint = chainId === 43114
+        ? 'https://api.snowtrace.io/api'
+        : 'https://api.etherscan.io/v2/api';
+
+    const base = {
+        chainid: chainId,
+        module: 'account',
+        address,
+        startblock: 0,
+        endblock: 99999999,
+        page: 1,
+        offset: Math.min(limit, 100),
+        sort: 'desc',
+        apikey: apiKey
+    };
+
+    const [normal, tokens] = await Promise.all([
+        axios.get(endpoint, { params: { ...base, action: 'txlist' }, timeout: 15000 }),
+        axios.get(endpoint, { params: { ...base, action: 'tokentx' }, timeout: 15000 })
+    ]);
+
+    const rows = [];
+    for (const tx of (normal.data?.result || [])) {
+        if (!tx.hash) continue;
+        const value = Number(ethers.formatEther(tx.value || '0'));
+        rows.push({
+            hash: tx.hash,
+            timestamp: Number(tx.timeStamp || 0) * 1000,
+            from: tx.from,
+            to: tx.to,
+            amount: value,
+            asset,
+            tokenSymbol: asset,
+            blockNumber: Number(tx.blockNumber || 0),
+            confirmations: Number(tx.confirmations || 0),
+            status: tx.isError === '1' ? 'failed' : (Number(tx.confirmations || 0) > 0 ? 'confirmed' : 'pending'),
+            gasFee: tx.gasUsed && tx.gasPrice ? Number(ethers.formatEther(BigInt(tx.gasUsed) * BigInt(tx.gasPrice))) : 0,
+            method: tx.functionName || 'native-transfer',
+            directionAddress: address
+        });
+    }
+    for (const tx of (tokens.data?.result || [])) {
+        if (!tx.hash) continue;
+        const decimals = Number(tx.tokenDecimal || 18);
+        const amount = Number(tx.value || 0) / (10 ** decimals);
+        rows.push({
+            hash: tx.hash,
+            timestamp: Number(tx.timeStamp || 0) * 1000,
+            from: tx.from,
+            to: tx.to,
+            amount,
+            asset: tx.tokenSymbol || asset,
+            tokenSymbol: tx.tokenSymbol || asset,
+            blockNumber: Number(tx.blockNumber || 0),
+            confirmations: Number(tx.confirmations || 0),
+            status: Number(tx.confirmations || 0) > 0 ? 'confirmed' : 'pending',
+            gasFee: 0,
+            method: 'erc20-transfer',
+            directionAddress: address,
+            contract: tx.contractAddress
+        });
+    }
+
+    const seen = new Set();
+    return rows.filter(tx => {
+        const key = `${tx.hash}:${tx.tokenSymbol || tx.asset}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    }).sort((a,b) => b.timestamp - a.timestamp).slice(0, limit);
+}
+
+async function fetchOnChainTransactions(asset, address, config, limit = 100) {
+    const key = walletCacheKey(asset, address);
+    const cached = walletChainCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.rows.slice(0, limit);
+
+    let rows = [];
+    const type = config.type;
+
+    if (type === 'evm') {
+        rows = await fetchEvmAddressTransactions(asset, address, config, limit);
+    } else if (type === 'solana') {
+        const connection = new Connection(config.rpc, 'confirmed');
+        const pubkey = new PublicKey(address);
+        const signatures = await connection.getSignaturesForAddress(pubkey, { limit: Math.min(limit, 1000) });
+        rows = signatures.map(s => ({
+            hash: s.signature,
+            timestamp: s.blockTime ? s.blockTime * 1000 : Date.now(),
+            from: address,
+            to: address,
+            amount: 0,
+            asset,
+            tokenSymbol: asset,
+            blockNumber: s.slot || 0,
+            confirmations: s.confirmationStatus === 'finalized' ? getRequiredConfirmations(asset) : 0,
+            status: s.err ? 'failed' : (s.confirmationStatus === 'finalized' ? 'confirmed' : 'pending'),
+            gasFee: 0,
+            method: 'solana-transaction',
+            directionAddress: address
+        }));
+    } else if (type === 'tron') {
+        const tronWeb = new TronWeb({ fullHost: config.rpc });
+        const result = await tronWeb.trx.getTransactionsFromAddress(address, 100);
+        rows = (result?.data || []).map(tx => ({
+            hash: tx.txID,
+            timestamp: tx.raw_data?.timestamp || Date.now(),
+            from: tx.raw_data?.contract?.[0]?.parameter?.value?.owner_address || address,
+            to: address,
+            amount: 0,
+            asset,
+            tokenSymbol: asset,
+            blockNumber: 0,
+            confirmations: 0,
+            status: 'confirmed',
+            gasFee: 0,
+            method: tx.raw_data?.contract?.[0]?.type || 'tron-transaction',
+            directionAddress: address
+        }));
+    } else if (type === 'xrp') {
+        const client = new xrpl.Client(config.rpc);
+        await client.connect();
+        try {
+            const result = await client.request({
+                command: 'account_tx',
+                account: address,
+                ledger_index_min: -1,
+                ledger_index_max: -1,
+                binary: false,
+                forward: false,
+                limit: Math.min(limit, 200)
+            });
+            rows = (result.result?.transactions || []).map(item => {
+                const tx = item.tx || item;
+                return {
+                    hash: tx.hash,
+                    timestamp: tx.date ? (tx.date + 946684800) * 1000 : Date.now(),
+                    from: tx.Account || address,
+                    to: tx.Destination || address,
+                    amount: typeof tx.Amount === 'string' ? Number(tx.Amount) / 1e6 : 0,
+                    asset,
+                    tokenSymbol: asset,
+                    blockNumber: tx.ledger_index || item.ledger_index || 0,
+                    confirmations: item.validated ? getRequiredConfirmations(asset) : 0,
+                    status: item.validated ? 'confirmed' : 'pending',
+                    gasFee: tx.Fee ? Number(tx.Fee) / 1e6 : 0,
+                    method: tx.TransactionType || 'xrp-transaction',
+                    directionAddress: address
+                };
+            });
+        } finally {
+            await client.disconnect();
+        }
+    } else if (type === 'utxo') {
+        const baseMap = {
+            BTC: 'https://api.blockchair.com/bitcoin',
+            DOGE: 'https://api.blockchair.com/dogecoin',
+            LTC: 'https://api.blockchair.com/litecoin'
+        };
+        const base = baseMap[asset.toUpperCase()];
+        if (base) {
+            const response = await axios.get(`${base}/dashboards/address/${address}`, { timeout: 15000 });
+            const data = response.data?.data?.[address];
+            const txs = data?.transactions || [];
+            rows = txs.slice(0, limit).map(hash => ({
+                hash,
+                timestamp: Date.now(),
+                from: address,
+                to: address,
+                amount: 0,
+                asset,
+                tokenSymbol: asset,
+                blockNumber: 0,
+                confirmations: 0,
+                status: 'confirmed',
+                gasFee: 0,
+                method: 'utxo-transaction',
+                directionAddress: address
+            }));
+        }
+    } else if (type === 'cardano') {
+        const key = process.env.BLOCKFROST_API_KEY;
+        if (!key) throw new Error('BLOCKFROST_API_KEY is not configured');
+        const response = await axios.get(`https://cardano-mainnet.blockfrost.io/api/v0/addresses/${address}/transactions`, {
+            headers: { project_id: key },
+            params: { count: Math.min(limit, 100), order: 'desc' },
+            timeout: 15000
+        });
+        rows = (response.data || []).map(tx => ({
+            hash: tx.tx_hash,
+            timestamp: tx.block_time ? tx.block_time * 1000 : Date.now(),
+            from: address,
+            to: address,
+            amount: 0,
+            asset,
+            tokenSymbol: asset,
+            blockNumber: tx.block_height || 0,
+            confirmations: 0,
+            status: 'confirmed',
+            gasFee: 0,
+            method: 'cardano-transaction',
+            directionAddress: address
+        }));
+    }
+
+    walletChainCache.set(key, { expiresAt: Date.now() + 15000, rows });
+    return rows.slice(0, limit);
+}
+
+async function getWalletRelationshipMap() {
+    const records = await DepositAddress.find({ isActive: true })
+        .select('address asset userId')
+        .lean();
+    const map = new Map();
+    for (const row of records) {
+        map.set(`${row.asset.toUpperCase()}:${row.address.toLowerCase()}`, row.userId || null);
+    }
+    return { records, map };
+}
+
+async function getOnChainWalletActivity({ assetFilter = null, limitPerWallet = 100 } = {}) {
+    const { records, map } = await getWalletRelationshipMap();
+    const grouped = new Map();
+    for (const row of records) {
+        const asset = row.asset.toUpperCase();
+        if (assetFilter && asset !== assetFilter.toUpperCase()) continue;
+        const config = ASSET_NETWORK_MAP[asset];
+        if (!config) continue;
+        const key = `${asset}:${row.address.toLowerCase()}`;
+        if (!grouped.has(key)) grouped.set(key, { asset, address: row.address, config });
+    }
+
+    const results = [];
+    for (const wallet of grouped.values()) {
+        try {
+            const txs = await fetchOnChainTransactions(wallet.asset, wallet.address, wallet.config, limitPerWallet);
+            for (const tx of txs) {
+                const incoming = String(tx.to || '').toLowerCase() === wallet.address.toLowerCase();
+                const outgoing = String(tx.from || '').toLowerCase() === wallet.address.toLowerCase();
+                tx.direction = incoming && !outgoing ? 'incoming' : outgoing && !incoming ? 'outgoing' : 'internal';
+                tx.userId = map.get(`${wallet.asset}:${wallet.address.toLowerCase()}`) || null;
+                tx.walletAddress = wallet.address;
+                results.push(tx);
+            }
+        } catch (err) {
+            console.warn(`[ON-CHAIN ACTIVITY] ${wallet.asset} ${wallet.address}: ${err.message}`);
+        }
+    }
+    return results.sort((a,b) => b.timestamp - a.timestamp);
+}
+
+// =============================================
+// 4. GET /api/admin/wallet-management/dashboard - Wallet Dashboard
 app.get('/api/admin/wallet-management/dashboard', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
     const startTime = Date.now();
-    let responseSent = false;
-
     try {
-        console.log(`\n[WALLET DASHBOARD] Request received at ${new Date().toISOString()}`);
-        console.log(`[WALLET DASHBOARD] Admin: ${req.admin.name} (${req.admin.email})`);
+        const { records, map } = await getWalletRelationshipMap();
+        const uniqueUsers = new Set([...map.values()].filter(Boolean));
+        const assets = [...new Set(records.map(r => r.asset.toUpperCase()))];
+        const activity = await getOnChainWalletActivity({ limitPerWallet: 50 });
 
-        // Get all deposit addresses
-        const totalAddresses = await DepositAddress.countDocuments({ isActive: true });
-        const activeAddresses = await DepositAddress.countDocuments({
-            isActive: true,
-            lastUsedAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
-        });
+        const prices = {};
+        for (const asset of assets) prices[asset] = await getCryptoPrice(asset);
 
-        const usersWithWallets = await DepositAddress.distinct('userId');
-        console.log(`[WALLET DASHBOARD] Wallet stats: totalAddresses=${totalAddresses}, activeAddresses=${activeAddresses}, usersWithWallets=${usersWithWallets.length}`);
+        const now = Date.now();
+        const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+        const receivedToday = activity.filter(t => t.direction === 'incoming' && t.timestamp >= todayStart.getTime());
+        const sentToday = activity.filter(t => t.direction === 'outgoing' && t.timestamp >= todayStart.getTime());
 
-        // Get recent transactions
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const cryptoReceived = activity.filter(t => t.direction === 'incoming').reduce((s,t)=>s+Number(t.amount||0),0);
+        const cryptoSent = activity.filter(t => t.direction === 'outgoing').reduce((s,t)=>s+Number(t.amount||0),0);
+        const incomingVolume = activity.filter(t=>t.direction==='incoming').reduce((s,t)=>s+Number(t.amount||0)*(prices[t.asset]||0),0);
+        const outgoingVolume = activity.filter(t=>t.direction==='outgoing').reduce((s,t)=>s+Number(t.amount||0)*(prices[t.asset]||0),0);
 
-        const depositsToday = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: today } } },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        console.log(`[WALLET DASHBOARD] Deposits today: ${depositsToday[0]?.total || 0}`);
-
-        const withdrawalsToday = await Transaction.aggregate([
-            { $match: { type: 'withdrawal', status: 'completed', createdAt: { $gte: today } } },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        console.log(`[WALLET DASHBOARD] Withdrawals today: ${withdrawalsToday[0]?.total || 0}`);
-
-        // Get total crypto received/sent (all time)
-        const cryptoReceived = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'completed' } },
-            { $group: { _id: null, total: { $sum: '$assetAmount' } } }
-        ]);
-
-        const cryptoSent = await Transaction.aggregate([
-            { $match: { type: 'withdrawal', status: 'completed' } },
-            { $group: { _id: null, total: { $sum: '$assetAmount' } } }
-        ]);
-        console.log(`[WALLET DASHBOARD] All-time crypto received: ${cryptoReceived[0]?.total || 0}, sent: ${cryptoSent[0]?.total || 0}`);
-
-        // =============================================
-        // ✅ CRITICAL: Get assets under management from ON-CHAIN balances
-        // =============================================
-        const assetBalances = await getRealTimeAssetBalances();
-        const assetsUnderManagement = assetBalances.reduce((sum, a) => sum + a.usdValue, 0);
-        console.log(`[WALLET DASHBOARD] Assets under management: $${assetsUnderManagement.toFixed(2)}`);
-
-        // Get pending transactions
-        const pendingTx = await Transaction.countDocuments({ status: 'pending' });
-        const failedTx = await Transaction.countDocuments({ status: 'failed' });
-        console.log(`[WALLET DASHBOARD] Pending transactions: ${pendingTx}, Failed: ${failedTx}`);
-
-        // Get active networks
-        const activeNetworks = Object.keys(ASSET_NETWORK_MAP).length;
-        console.log(`[WALLET DASHBOARD] Active networks: ${activeNetworks}`);
-
-        // Get last sync time
-        const lastSync = await redis.get('wallet:last_sync') || new Date().toISOString();
-        console.log(`[WALLET DASHBOARD] Last sync time: ${lastSync}`);
-
-        // =============================================
-        // ✅ CRITICAL: Build network distribution from ON-CHAIN balances
-        // =============================================
-        console.log(`[WALLET DASHBOARD] Fetching network distribution`);
+        const balances = await getRealTimeAssetBalances();
         const networkDistribution = await getNetworkDistribution();
-        console.log(`[WALLET DASHBOARD] Network distribution: ${JSON.stringify(networkDistribution)}`);
-
-        // =============================================
-        // ✅ CRITICAL: Build asset distribution from ON-CHAIN balances
-        // =============================================
-        console.log(`[WALLET DASHBOARD] Fetching asset distribution`);
         const assetDistribution = await getAssetDistribution();
-        console.log(`[WALLET DASHBOARD] Asset distribution: ${JSON.stringify(assetDistribution)}`);
 
-        // Get largest deposits (last 7 days)
-        const largestDeposits = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } } },
-            { $sort: { amount: -1 } },
-            { $limit: 5 },
-            {
-                $lookup: {
-                    from: 'users',
-                    localField: 'user',
-                    foreignField: '_id',
-                    as: 'userInfo'
-                }
-            },
-            {
-                $project: {
-                    amount: 1,
-                    asset: 1,
-                    createdAt: 1,
-                    user: { $arrayElemAt: ['$userInfo', 0] }
-                }
-            }
-        ]);
-        console.log(`[WALLET DASHBOARD] Largest deposits: ${largestDeposits.length}`);
-
-        // Get deposits per hour (last 24 hours)
-        const depositsPerHour = await getDepositsPerHour(24);
-        console.log(`[WALLET DASHBOARD] Deposits per hour: ${depositsPerHour.labels?.length || 0} hours`);
-
-        // Get deposits per day (last 7 days)
-        const depositsPerDay = await getDepositsPerDay(7);
-        console.log(`[WALLET DASHBOARD] Deposits per day: ${depositsPerDay.labels?.length || 0} days`);
-
-        // Get recent activity
-        const recentActivity = await Transaction.find({
-            status: { $in: ['completed', 'pending'] }
-        })
-        .sort({ createdAt: -1 })
-        .limit(10)
-        .populate('user', 'firstName lastName email')
-        .lean();
-
-        const formattedActivity = recentActivity.map(tx => ({
-            time: tx.createdAt,
-            event: tx.type === 'deposit' ? 'Deposit' : tx.type === 'withdrawal' ? 'Withdrawal' : 'Transfer',
-            network: tx.network || platformWallet.getNetworkName(tx.asset || 'BTC'),
-            asset: tx.asset || 'BTC',
-            amount: tx.amount || 0,
-            wallet: tx.details?.platformWallet || 'Platform Wallet',
-            user: tx.user ? `${tx.user.firstName} ${tx.user.lastName}` : 'System',
-            status: tx.status
-        }));
-        console.log(`[WALLET DASHBOARD] Recent activity: ${formattedActivity.length}`);
-
-        const responseData = {
-            status: 'success',
-            data: {
-                totalWalletAddresses: totalAddresses,
-                activeWalletAddresses: activeAddresses,
-                totalUsersWithWallets: usersWithWallets.length,
-                totalDepositsToday: depositsToday[0]?.total || 0,
-                totalWithdrawalsToday: withdrawalsToday[0]?.total || 0,
-                totalCryptoReceived: cryptoReceived[0]?.total || 0,
-                totalCryptoSent: cryptoSent[0]?.total || 0,
-                assetsUnderManagement: assetsUnderManagement,
-                pendingTransactions: pendingTx,
-                failedTransactions: failedTx,
-                activeNetworks: activeNetworks,
-                lastBlockchainSyncTime: lastSync,
-                networkDistribution: networkDistribution,
-                assetDistribution: assetDistribution,
-                depositsPerHour: depositsPerHour,
-                depositsPerDay: depositsPerDay,
-                largestDeposits: largestDeposits.map(d => ({
-                    amount: d.amount,
-                    asset: d.asset,
-                    user: d.user ? `${d.user.firstName} ${d.user.lastName}` : 'Unknown',
-                    date: d.createdAt
-                })),
-                activity: formattedActivity
-            }
-        };
-
-        res.status(200).json(responseData);
-        responseSent = true;
-
-        console.log(`[WALLET DASHBOARD] Successfully returned dashboard data`);
-
-    } catch (err) {
-        console.error('[WALLET DASHBOARD] Error:', err);
-        if (!responseSent) {
-            res.status(500).json({
-                status: 'error',
-                message: err.message || 'Failed to get wallet dashboard'
-            });
+        const depositsPerHour = { labels: [], values: [] };
+        const depositsPerDay = { labels: [], values: [] };
+        for (let h=23; h>=0; h--) {
+            const start = now - (h+1)*3600000, end = now - h*3600000;
+            const val = receivedToday.filter(t=>t.timestamp>=start&&t.timestamp<end).reduce((s,t)=>s+Number(t.amount||0)*(prices[t.asset]||0),0);
+            depositsPerHour.labels.push(new Date(end).toISOString().slice(11,16));
+            depositsPerHour.values.push(val);
         }
-    } finally {
-        const duration = Date.now() - startTime;
-        console.log(`[WALLET DASHBOARD] Completed in ${duration}ms`);
+
+        return res.status(200).json({
+            status:'success',
+            data:{
+                totalWalletAddresses: records.length,
+                activeWalletAddresses: records.length,
+                totalUsersWithWallets: uniqueUsers.size,
+                totalDepositsToday: receivedToday.reduce((s,t)=>s+Number(t.amount||0)*(prices[t.asset]||0),0),
+                totalWithdrawalsToday: sentToday.reduce((s,t)=>s+Number(t.amount||0)*(prices[t.asset]||0),0),
+                totalCryptoReceived: cryptoReceived,
+                totalCryptoSent: cryptoSent,
+                assetsUnderManagement: balances.reduce((s,a)=>s+Number(a.usdValue||0),0),
+                pendingTransactions: activity.filter(t=>t.status==='pending').length,
+                failedTransactions: activity.filter(t=>t.status==='failed').length,
+                activeNetworks: new Set(assets.map(a=>ASSET_NETWORK_MAP[a]?.network)).size,
+                lastBlockchainSyncTime: new Date().toISOString(),
+                networkDistribution,
+                assetDistribution,
+                depositsPerHour,
+                depositsPerDay,
+                incomingVolume,
+                outgoingVolume,
+                activity: activity.slice(0,10).map(t=>({
+                    time:t.timestamp,event:t.direction==='incoming'?'Deposit':'Withdrawal',
+                    network:ASSET_NETWORK_MAP[t.asset]?.network||t.asset,asset:t.asset,
+                    amount:t.amount||0,wallet:t.walletAddress,user:t.userId?String(t.userId):'Unassigned',
+                    status:t.status,txHash:t.hash
+                })),
+                largestDeposits: activity.filter(t=>t.direction==='incoming').slice(0,5).map(t=>({amount:t.amount||0,asset:t.asset,user:t.userId?String(t.userId):'Unknown',date:t.timestamp}))
+            }
+        });
+    } catch (err) {
+        console.error('[WALLET DASHBOARD] Error:',err);
+        return res.status(503).json({status:'error',message:'Live blockchain wallet data is temporarily unavailable'});
     }
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================
 // WITHDRAWAL SEND OTP ENDPOINT - DEDICATED
 // POST /api/auth/withdrawal/send-otp
@@ -42036,38 +42187,23 @@ app.get('/api/admin/wallet-management/wallets', adminProtect, restrictTo('super'
                 console.warn(`[WALLET ADDRESSES] Failed to get balance for ${wallet.address}:`, err.message);
             }
 
-            // Get deposit count and last deposit
-            const depositCount = await Transaction.countDocuments({
-                'details.toAddress': wallet.address,
-                type: 'deposit',
-                status: 'completed'
-            });
+            // Transaction counts/activity are derived from live chain data; DB is used only for user relationship.
+            let depositCount = 0;
+            let withdrawalCount = 0;
+            let lastDeposit = null;
+            let lastActivity = null;
+            try {
+                const chainTxs = await fetchOnChainTransactions(wallet.asset.toUpperCase(), wallet.address, config, 100);
+                const incoming = chainTxs.filter(t => String(t.to || '').toLowerCase() === wallet.address.toLowerCase());
+                const outgoing = chainTxs.filter(t => String(t.from || '').toLowerCase() === wallet.address.toLowerCase());
+                depositCount = incoming.length;
+                withdrawalCount = outgoing.length;
+                lastDeposit = incoming[0]?.timestamp ? new Date(incoming[0].timestamp) : null;
+                lastActivity = chainTxs[0]?.timestamp ? new Date(chainTxs[0].timestamp) : null;
+            } catch (err) {
+                console.warn(`[WALLET ADDRESSES] On-chain history unavailable for ${wallet.address}: ${err.message}`);
+            }
 
-            const lastDeposit = await Transaction.findOne({
-                'details.toAddress': wallet.address,
-                type: 'deposit',
-                status: 'completed'
-            }).sort({ createdAt: -1 });
-
-            // Get withdrawal count and last activity
-            const withdrawalCount = await Transaction.countDocuments({
-                'details.fromAddress': wallet.address,
-                type: 'withdrawal',
-                status: 'completed'
-            });
-
-            const lastActivity = await Transaction.findOne({
-                $or: [
-                    { 'details.toAddress': wallet.address },
-                    { 'details.fromAddress': wallet.address }
-                ],
-                status: 'completed'
-            }).sort({ createdAt: -1 });
-
-            // =============================================
-            // ✅ CRITICAL: Format response EXACTLY as frontend expects
-            // The frontend expects 'user' field with populated data, not 'userId'
-            // =============================================
             const userData = wallet.userId ? {
                 _id: wallet.userId._id,
                 firstName: wallet.userId.firstName || '',
@@ -42142,291 +42278,113 @@ app.get('/api/admin/wallet-management/wallets', adminProtect, restrictTo('super'
 
 
 // =============================================
-// 6. GET /api/admin/wallet-management/transactions - Detailed Transactions
-// =============================================
+// 6. GET /api/admin/wallet-management/transactions - Detailed On-Chain Transactions
 app.get('/api/admin/wallet-management/transactions', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    const startTime = Date.now();
-    let responseSent = false;
-
     try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 50;
-        const skip = (page - 1) * limit;
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+        const { network, asset, direction, status, search } = req.query;
+        let rows = await getOnChainWalletActivity({ assetFilter: asset && asset !== 'all' ? asset : null, limitPerWallet: 100 });
 
-        const { network, asset, direction, status, search, quick } = req.query;
-
-        console.log(`\n[WALLET DETAILED TX] Request received at ${new Date().toISOString()}`);
-        console.log(`[WALLET DETAILED TX] Admin: ${req.admin.name} (${req.admin.email})`);
-        console.log(`[WALLET DETAILED TX] Filters - page: ${page}, limit: ${limit}, asset: ${asset || 'all'}, status: ${status || 'all'}`);
-
-        // Build query
-        let query = {};
-
-        if (asset && asset !== 'all') {
-            query.asset = asset.toLowerCase();
-            console.log(`[WALLET DETAILED TX] Filtering by asset: ${asset}`);
-        }
-
-        if (network && network !== 'all') {
-            query.network = network;
-            console.log(`[WALLET DETAILED TX] Filtering by network: ${network}`);
-        }
-
-        if (status && status !== 'all') {
-            query.status = status;
-            console.log(`[WALLET DETAILED TX] Filtering by status: ${status}`);
-        }
-
-        if (direction && direction !== 'all') {
-            if (direction === 'incoming') {
-                query['details.direction'] = 'incoming';
-            } else if (direction === 'outgoing') {
-                query['details.direction'] = 'outgoing';
-            }
-            console.log(`[WALLET DETAILED TX] Filtering by direction: ${direction}`);
-        }
-
+        if (network && network !== 'all') rows = rows.filter(t => (ASSET_NETWORK_MAP[t.asset]?.network || '').toLowerCase() === network.toLowerCase());
+        if (direction && direction !== 'all') rows = rows.filter(t => t.direction === direction);
+        if (status && status !== 'all') rows = rows.filter(t => t.status === status);
         if (search) {
-            query.$or = [
-                { reference: { $regex: search, $options: 'i' } },
-                { 'details.txHash': { $regex: search, $options: 'i' } },
-                { btcAddress: { $regex: search, $options: 'i' } }
-            ];
-            console.log(`[WALLET DETAILED TX] Filtering by search term: ${search}`);
+            const q = search.toLowerCase();
+            rows = rows.filter(t => [t.hash,t.from,t.to,t.walletAddress,t.tokenSymbol].some(v => String(v||'').toLowerCase().includes(q)));
         }
 
-        // Quick filters
-        if (quick && quick !== 'all') {
-            const now = new Date();
-            switch (quick) {
-                case 'today':
-                    now.setHours(0, 0, 0, 0);
-                    query.createdAt = { $gte: now };
-                    break;
-                case 'yesterday':
-                    const yesterday = new Date(now);
-                    yesterday.setDate(yesterday.getDate() - 1);
-                    yesterday.setHours(0, 0, 0, 0);
-                    const endOfYesterday = new Date(now);
-                    endOfYesterday.setDate(endOfYesterday.getDate() - 1);
-                    endOfYesterday.setHours(23, 59, 59, 999);
-                    query.createdAt = { $gte: yesterday, $lte: endOfYesterday };
-                    break;
-                case '7d':
-                    const sevenDaysAgo = new Date(now);
-                    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-                    query.createdAt = { $gte: sevenDaysAgo };
-                    break;
-                case '30d':
-                    const thirtyDaysAgo = new Date(now);
-                    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-                    query.createdAt = { $gte: thirtyDaysAgo };
-                    break;
-            }
-            console.log(`[WALLET DETAILED TX] Quick filter: ${quick}`);
-        }
+        const total = rows.length;
+        const pageRows = rows.slice((page-1)*limit, page*limit);
+        const users = await User.find({ _id: { $in: [...new Set(pageRows.map(t=>t.userId).filter(Boolean))] } })
+            .select('firstName lastName email').lean();
+        const userMap = new Map(users.map(u=>[String(u._id),u]));
 
-        console.log(`[WALLET DETAILED TX] Query: ${JSON.stringify(query)}`);
-
-        // =============================================
-        // ✅ CRITICAL: Transactions fetched from database,
-        // but enhanced with ON-CHAIN data
-        // =============================================
-        const transactions = await Transaction.find(query)
-            .populate('user', 'firstName lastName email')
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
-            .lean();
-
-        const total = await Transaction.countDocuments(query);
-        const totalPages = Math.ceil(total / limit);
-        console.log(`[WALLET DETAILED TX] Found ${transactions.length} transactions (total: ${total})`);
-
-        // Get unique networks and assets for filters
-        const networks = await Transaction.distinct('network');
-        const assets = await Transaction.distinct('asset');
-        console.log(`[WALLET DETAILED TX] Filters: networks=${networks.length}, assets=${assets.length}`);
-
-        // =============================================
-        // ✅ CRITICAL: Enhance with REAL blockchain data
-        // =============================================
-        const enhancedTransactions = await Promise.all(transactions.map(async (tx, index) => {
-            const txHash = tx.details?.txHash || tx.reference;
-            let blockchainData = null;
-
-            if (txHash && tx.asset) {
-                try {
-                    const config = ASSET_NETWORK_MAP[tx.asset.toUpperCase()];
-                    if (config) {
-                        console.log(`[WALLET DETAILED TX] Fetching blockchain data for tx ${index + 1}/${transactions.length}: ${txHash}`);
-                        blockchainData = await checkTransactionOnBlockchain(
-                            txHash,
-                            tx.asset.toUpperCase(),
-                            config.chainId
-                        );
-                    }
-                } catch (err) {
-                    // Silent fail
-                }
-            }
-
-            const user = tx.user || {};
-
+        const transactions = pageRows.map(tx => {
+            const user = tx.userId ? userMap.get(String(tx.userId)) : null;
+            const price = 0;
             return {
-                _id: tx._id,
-                txHash: txHash,
-                timestamp: tx.createdAt,
-                age: Math.floor((Date.now() - new Date(tx.createdAt).getTime()) / 1000 / 60),
-                network: tx.network || platformWallet.getNetworkName(tx.asset || 'BTC'),
-                asset: tx.asset || 'BTC',
-                tokenSymbol: tx.asset || 'BTC',
-                direction: tx.type === 'deposit' ? 'incoming' : 'outgoing',
+                _id: tx.hash,
+                txHash: tx.hash,
+                timestamp: tx.timestamp,
+                age: Math.floor((Date.now()-tx.timestamp)/60000),
+                network: ASSET_NETWORK_MAP[tx.asset]?.network || tx.asset,
+                asset: tx.asset,
+                tokenSymbol: tx.tokenSymbol || tx.asset,
+                direction: tx.direction,
                 amount: tx.amount || 0,
-                assetAmount: tx.assetAmount || tx.amount || 0,
-                fiatValue: tx.amount || 0,
-                fromAddress: tx.details?.fromAddress || tx.details?.walletAddress || 'Unknown',
-                toAddress: tx.details?.toAddress || tx.details?.destinationAddress || tx.btcAddress || 'Unknown',
-                platformWallet: tx.details?.platformWallet || 'Platform Wallet',
-                assignedUser: user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Unassigned' : 'Unassigned',
-                gasFee: tx.fee || 0,
-                feeAsset: tx.asset || 'BTC',
-                blockNumber: blockchainData?.blockNumber || null,
-                confirmations: blockchainData?.confirmations || tx.details?.confirmations || 0,
-                status: tx.status || 'pending',
-                transactionType: tx.type || 'unknown',
-                method: tx.method || 'crypto',
-                memoTag: tx.details?.memo || tx.details?.notes || '',
-                // Full blockchain data
-                rawTransaction: blockchainData || null,
-                decodedLogs: tx.details?.decodedLogs || [],
-                internalTransfers: tx.details?.internalTransfers || []
+                assetAmount: tx.amount || 0,
+                fiatValue: price,
+                fromAddress: tx.from || 'Unknown',
+                toAddress: tx.to || 'Unknown',
+                platformWallet: tx.walletAddress || 'N/A',
+                assignedUser: user ? `${user.firstName||''} ${user.lastName||''}`.trim() : 'Unassigned',
+                gasFee: tx.gasFee || 0,
+                feeAsset: tx.asset,
+                blockNumber: tx.blockNumber || null,
+                confirmations: tx.confirmations || 0,
+                status: tx.status,
+                transactionType: tx.direction === 'incoming' ? 'deposit' : 'withdrawal',
+                method: tx.method || 'blockchain',
+                memoTag: '',
+                rawTransaction: tx
             };
-        }));
+        });
 
-        const responseData = {
-            status: 'success',
-            data: {
-                transactions: enhancedTransactions,
-                filters: {
-                    networks: networks.filter(Boolean),
-                    assets: assets.filter(Boolean)
+        return res.status(200).json({
+            status:'success',
+            data:{
+                transactions,
+                filters:{
+                    networks:[...new Set(rows.map(t=>ASSET_NETWORK_MAP[t.asset]?.network).filter(Boolean))],
+                    assets:[...new Set(rows.map(t=>t.asset).filter(Boolean))]
                 },
-                pagination: {
-                    currentPage: page,
-                    totalPages: totalPages,
-                    totalItems: total,
-                    itemsPerPage: limit
+                pagination:{
+                    currentPage:page,totalPages:Math.max(1,Math.ceil(total/limit)),
+                    totalItems:total,itemsPerPage:limit
                 }
             }
-        };
-
-        res.status(200).json(responseData);
-        responseSent = true;
-
-        console.log(`[WALLET DETAILED TX] Successfully returned ${enhancedTransactions.length} transactions`);
-
+        });
     } catch (err) {
-        console.error('[WALLET DETAILED TX] Error:', err);
-        if (!responseSent) {
-            res.status(500).json({
-                status: 'error',
-                message: err.message || 'Failed to get wallet transactions'
-            });
-        }
-    } finally {
-        const duration = Date.now() - startTime;
-        console.log(`[WALLET DETAILED TX] Completed in ${duration}ms`);
+        console.error('[WALLET DETAILED TX] Error:',err);
+        return res.status(503).json({status:'error',message:'Live blockchain transaction data is temporarily unavailable'});
     }
 });
 
-// =============================================
-// 7. GET /api/admin/wallet-management/reports-alerts - Alerts
-// =============================================
+// 7. GET /api/admin/wallet-management/reports-alerts - On-Chain Alerts
 app.get('/api/admin/wallet-management/reports-alerts', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    const startTime = Date.now();
-    let responseSent = false;
-
     try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const skip = (page - 1) * limit;
-
-        console.log(`\n[WALLET ALERTS] Request received at ${new Date().toISOString()}`);
-        console.log(`[WALLET ALERTS] Admin: ${req.admin.name} (${req.admin.email})`);
-
-        // Get pending deposits that need admin attention
-        const pendingDeposits = await Transaction.find({
-            type: 'deposit',
-            status: 'pending',
-            'details.readyForAdminApproval': true
-        })
-        .populate('user', 'firstName lastName email')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean();
-
-        const total = await Transaction.countDocuments({
-            type: 'deposit',
-            status: 'pending',
-            'details.readyForAdminApproval': true
-        });
-
-        const totalPages = Math.ceil(total / limit);
-        console.log(`[WALLET ALERTS] Found ${pendingDeposits.length} pending deposits (total: ${total})`);
-
-        const formattedAlerts = pendingDeposits.map(deposit => {
-            const user = deposit.user || {};
-            return {
-                _id: deposit._id,
-                time: deposit.createdAt,
-                network: deposit.network || platformWallet.getNetworkName(deposit.asset || 'BTC'),
-                coin: deposit.asset || 'BTC',
-                amount: deposit.amount || 0,
-                walletAddress: deposit.details?.toAddress || deposit.btcAddress || 'Unknown',
-                assignedUser: user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Unassigned' : 'Unassigned',
-                txHash: deposit.details?.txHash || deposit.reference,
-                status: deposit.status,
-                confirmations: deposit.details?.confirmations || 0,
-                requiredConfirmations: deposit.details?.requiredConfirmations || 12,
-                readyForAdminApproval: deposit.details?.readyForAdminApproval || false
-            };
-        });
-
-        const responseData = {
-            status: 'success',
-            data: {
-                alerts: formattedAlerts,
-                pagination: {
-                    currentPage: page,
-                    totalPages: totalPages,
-                    totalItems: total,
-                    itemsPerPage: limit
-                }
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+        const rows = await getOnChainWalletActivity({ limitPerWallet: 100 });
+        const alerts = rows.filter(t => t.status === 'pending' || t.status === 'failed');
+        const pageRows = alerts.slice((page-1)*limit,page*limit);
+        const users = await User.find({ _id: { $in: [...new Set(pageRows.map(t=>t.userId).filter(Boolean))] } })
+            .select('firstName lastName email').lean();
+        const userMap = new Map(users.map(u=>[String(u._id),u]));
+        return res.status(200).json({
+            status:'success',
+            data:{
+                alerts: pageRows.map(t=>{
+                    const u=t.userId?userMap.get(String(t.userId)):null;
+                    return {
+                        _id:t.hash,time:t.timestamp,
+                        network:ASSET_NETWORK_MAP[t.asset]?.network||t.asset,
+                        coin:t.asset,amount:t.amount||0,walletAddress:t.walletAddress,
+                        assignedUser:u?`${u.firstName||''} ${u.lastName||''}`.trim():'Unassigned',
+                        txHash:t.hash,status:t.status,confirmations:t.confirmations||0,
+                        requiredConfirmations:getRequiredConfirmations(t.asset)
+                    };
+                }),
+                pagination:{currentPage:page,totalPages:Math.max(1,Math.ceil(alerts.length/limit)),totalItems:alerts.length,itemsPerPage:limit}
             }
-        };
-
-        res.status(200).json(responseData);
-        responseSent = true;
-
-        console.log(`[WALLET ALERTS] Successfully returned ${formattedAlerts.length} alerts`);
-
-    } catch (err) {
-        console.error('[WALLET ALERTS] Error:', err);
-        if (!responseSent) {
-            res.status(500).json({
-                status: 'error',
-                message: err.message || 'Failed to get alerts'
-            });
-        }
-    } finally {
-        const duration = Date.now() - startTime;
-        console.log(`[WALLET ALERTS] Completed in ${duration}ms`);
+        });
+    } catch(err) {
+        console.error('[WALLET ALERTS] Error:',err);
+        return res.status(503).json({status:'error',message:'Live blockchain alert data is temporarily unavailable'});
     }
 });
 
-// =============================================
 // 8. GET /api/admin/wallet-management/treasury - Treasury Summary
 // =============================================
 app.get('/api/admin/wallet-management/treasury', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
