@@ -39792,7 +39792,7 @@ function calculateTransactionSize(inputCount, outputCount) {
 // 6. estimateGasForAsset - COMPLETE REWRITE
 // =============================================
 
-async function estimateGasForAsset(asset, toAddress, amount, config) {
+async function estimateGasForAsset(asset, toAddress, amount, config, fromAddress = null) {
     try {
         const assetUpper = asset.toUpperCase();
         let gasEstimate = {
@@ -39834,19 +39834,19 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         );
                         const decimals = await getTokenDecimals(config.contract, provider);
                         const amountWei = ethers.parseUnits(amount.toString(), decimals);
-                        gasLimit = await contract.transfer.estimateGas(toAddress, amountWei);
+                        gasLimit = await contract.transfer.estimateGas(toAddress, amountWei, fromAddress ? { from: fromAddress } : {});
                         gasLimit = (gasLimit * 115n) / 100n;
                     } else {
                         const decimals = config.decimals || 18;
                         gasLimit = await provider.estimateGas({
+                            from: fromAddress || undefined,
                             to: toAddress,
                             value: ethers.parseUnits(amount.toString(), decimals)
                         });
                         gasLimit = (gasLimit * 115n) / 100n;
                     }
                 } catch (estimateError) {
-                    console.warn(`[GAS ESTIMATE] Estimate failed, using fallback:`, estimateError.message);
-                    gasLimit = config.contract ? 65000n : 21000n;
+                    throw new Error(`On-chain gas estimation failed: ${estimateError.message}`);
                 }
 
                 let gasCost;
@@ -39879,16 +39879,7 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         maxPriorityFeePerGas: bufferedGasPrice
                     };
                 } else {
-                    const fallbackGasPrice = ethers.parseUnits('20', 'gwei');
-                    gasCost = ethers.formatEther(fallbackGasPrice * gasLimit);
-
-                    gasEstimate = {
-                        fee: parseFloat(gasCost),
-                        gasUsed: Number(gasLimit),
-                        gasPrice: 20,
-                        maxFeePerGas: fallbackGasPrice,
-                        maxPriorityFeePerGas: fallbackGasPrice
-                    };
+                    throw new Error('RPC did not return usable fee data');
                 }
 
                 console.log(`[GAS ESTIMATE] ${assetUpper} gas estimate: ${gasEstimate.fee} native (Gas Used: ${gasLimit}, Price: ${gasPriceInGwei || 'N/A'} Gwei)`);
@@ -39903,8 +39894,9 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         1000
                     );
                     
-                    const testFrom = new PublicKey('11111111111111111111111111111111');
-                    const testTo = new PublicKey('11111111111111111111111111111111');
+                    if (!fromAddress) throw new Error('Source wallet address is required for Solana fee estimation');
+                    const testFrom = new PublicKey(fromAddress);
+                    const testTo = new PublicKey(toAddress);
                     
                     const testTx = new Transaction({
                         feePayer: testFrom,
@@ -39933,14 +39925,7 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         maxPriorityFeePerGas: null
                     };
                 } catch (err) {
-                    console.warn('[GAS ESTIMATE] Solana fee estimate failed, using default:', err.message);
-                    gasEstimate = {
-                        fee: 0.000005,
-                        gasPrice: 0,
-                        gasUsed: 5000,
-                        maxFeePerGas: null,
-                        maxPriorityFeePerGas: null
-                    };
+                    throw new Error(`Solana fee estimation failed: ${err.message}`);
                 }
                 break;
             }
@@ -40005,17 +39990,7 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         maxPriorityFeePerGas: null
                     };
                 } catch (err) {
-                    console.warn('[GAS ESTIMATE] UTXO fee estimate failed, using default:', err.message);
-                    const estimatedSize = calculateTransactionSize(1, 2);
-                    const feeRate = 5;
-                    const feeInAsset = parseFloat(((estimatedSize * feeRate) / 1e8).toFixed(8));
-                    gasEstimate = {
-                        fee: feeInAsset,
-                        gasPrice: feeRate,
-                        gasUsed: estimatedSize,
-                        maxFeePerGas: null,
-                        maxPriorityFeePerGas: null
-                    };
+                    throw new Error(`UTXO fee estimation failed: ${err.message}`);
                 }
                 break;
             }
@@ -40040,25 +40015,12 @@ async function estimateGasForAsset(asset, toAddress, amount, config) {
                         maxPriorityFeePerGas: null
                     };
                 } catch (err) {
-                    console.warn('[GAS ESTIMATE] TRON fee estimate failed, using default:', err.message);
-                    gasEstimate = {
-                        fee: 1,
-                        gasPrice: 0,
-                        gasUsed: 1,
-                        maxFeePerGas: null,
-                        maxPriorityFeePerGas: null
-                    };
+                    throw new Error(`TRON fee estimation failed: ${err.message}`);
                 }
                 break;
             }
             default: {
-                gasEstimate = {
-                    fee: 0.0001,
-                    gasPrice: 0,
-                    gasUsed: 21000,
-                    maxFeePerGas: null,
-                    maxPriorityFeePerGas: null
-                };
+                throw new Error(`Unsupported transaction type for ${assetUpper}`);
             }
         }
 
@@ -41295,7 +41257,17 @@ app.post('/api/admin/wallet/transfer', adminProtect, restrictTo('super', 'financ
 
         // Sign transaction
         console.log(`${logPrefix} Signing transaction for ${assetUpper} to ${destinationAddress}`);
-        const signedTx = await signTransaction(assetUpper, destinationAddress, amount, gasEstimate, nonce, config);
+        const signedResult = await buildAndSignTransaction(
+            assetUpper,
+            platformAddress,
+            destinationAddress,
+            amount,
+            privateKey,
+            gasEstimate,
+            nonce,
+            config
+        );
+        const signedTx = signedResult?.signedTx;
         if (!signedTx) {
             console.log(`${logPrefix} Failed to sign transaction`);
             return res.status(500).json({
@@ -41308,7 +41280,7 @@ app.post('/api/admin/wallet/transfer', adminProtect, restrictTo('super', 'financ
         // ✅ CRITICAL: Broadcast transaction to blockchain
         // =============================================
         console.log(`${logPrefix} Broadcasting transaction for ${assetUpper}`);
-        const broadcastResult = await broadcastTransaction(assetUpper, signedTx, config);
+        const broadcastResult = await broadcastTransactionToChain(assetUpper, signedTx, config);
         if (!broadcastResult || !broadcastResult.txHash) {
             console.log(`${logPrefix} Failed to broadcast transaction: ${broadcastResult?.error || 'unknown error'}`);
             return res.status(500).json({
@@ -42694,6 +42666,107 @@ app.get('/api/admin/wallet-management/treasury/assets', adminProtect, restrictTo
 });
 
 // =============================================
+// 10.5 POST /api/admin/wallet-management/treasury/estimate-gas - Real On-Chain Gas Estimate
+// =============================================
+app.post('/api/admin/wallet-management/treasury/estimate-gas', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    const startTime = Date.now();
+
+    try {
+        const { networkId, asset, amount, destinationAddress } = req.body || {};
+        const assetUpper = String(asset || '').trim().toUpperCase();
+        const network = String(networkId || '').trim().toUpperCase();
+        const numericAmount = Number(amount);
+
+        if (!assetUpper || !network || !Number.isFinite(numericAmount) || numericAmount <= 0 || !destinationAddress) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'networkId, asset, amount and destinationAddress are required'
+            });
+        }
+
+        const config = ASSET_NETWORK_MAP[assetUpper];
+        if (!config) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Unsupported asset: ${assetUpper}`
+            });
+        }
+
+        if (String(config.network || '').toUpperCase() !== network) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Asset ${assetUpper} is not available on network ${network}`
+            });
+        }
+
+        if (!validateAddress(assetUpper, destinationAddress, config)) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Invalid ${assetUpper} destination address`
+            });
+        }
+
+        const sourceAddress = await getPlatformWalletAddress(assetUpper);
+        if (!sourceAddress) {
+            return res.status(404).json({
+                status: 'error',
+                message: `No active platform wallet found for ${assetUpper}`
+            });
+        }
+
+        const estimate = await estimateGasForAsset(
+            assetUpper,
+            destinationAddress,
+            numericAmount,
+            config,
+            sourceAddress
+        );
+
+        if (!estimate) {
+            return res.status(503).json({
+                status: 'error',
+                message: 'Unable to obtain a live network fee estimate',
+                retryAfter: 15
+            });
+        }
+
+        const price = await getCryptoPrice(assetUpper);
+        const gasFeeUsd = Number.isFinite(Number(price))
+            ? estimate.fee * Number(price)
+            : 0;
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                network: config.network || network,
+                chainId: config.chainId || 0,
+                asset: assetUpper,
+                sourceAddress,
+                gasFee: estimate.fee,
+                gasFeeUsd,
+                gasPrice: estimate.gasPrice,
+                gasUsed: estimate.gasUsed,
+                maxFeePerGas: estimate.maxFeePerGas || null,
+                maxPriorityFeePerGas: estimate.maxPriorityFeePerGas || null,
+                estimated: true,
+                timestamp: new Date().toISOString()
+            },
+            meta: {
+                durationMs: Date.now() - startTime,
+                source: 'on-chain-rpc'
+            }
+        });
+    } catch (err) {
+        console.error('[TREASURY ESTIMATE GAS] Error:', err);
+        return res.status(503).json({
+            status: 'error',
+            message: 'Live network fee estimation failed',
+            errorCode: 'GAS_ESTIMATION_FAILED',
+            retryAfter: 15
+        });
+    }
+});
+
 // 11. GET /api/admin/wallet-management/treasury/wallet-info - Get Wallet Info
 // =============================================
 app.get('/api/admin/wallet-management/treasury/wallet-info', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
@@ -44764,84 +44837,6 @@ async function getNonce(asset, address, config) {
 }
 
 // Sign transaction
-async function signTransaction(asset, toAddress, amount, gasEstimate, nonce, config) {
-    try {
-        const assetUpper = asset.toUpperCase();
-        let signedTx = null;
-
-        switch (config.type) {
-            case 'evm':
-                const provider = new ethers.JsonRpcProvider(config.rpc);
-
-                // Get private key for this address
-                const privateKey = await getPrivateKeyForAddress(assetUpper, toAddress);
-                if (!privateKey) {
-                    throw new Error(`No private key found for ${toAddress}`);
-                }
-
-                const wallet = new ethers.Wallet(privateKey, provider);
-
-                // Build transaction
-                const txData = {
-                    to: toAddress,
-                    value: ethers.parseEther(amount.toString()),
-                    gasLimit: gasEstimate.gasUsed || 21000,
-                    gasPrice: gasEstimate.gasPrice ? ethers.parseUnits(gasEstimate.gasPrice.toString(), 'gwei') : undefined,
-                    nonce: nonce,
-                    chainId: config.chainId
-                };
-
-                // For ERC-20 tokens
-                if (config.contract) {
-                    const contract = new ethers.Contract(
-                        config.contract,
-                        ['function transfer(address to, uint256 amount) returns (bool)'],
-                        wallet
-                    );
-                    const decimals = await getTokenDecimals(config.contract, provider);
-                    const amountWei = ethers.parseUnits(amount.toString(), decimals);
-                    const tx = await contract.transfer.populateTransaction(toAddress, amountWei);
-                    signedTx = await wallet.signTransaction({
-                        ...tx,
-                        gasLimit: gasEstimate.gasUsed || 65000,
-                        gasPrice: gasEstimate.gasPrice ? ethers.parseUnits(gasEstimate.gasPrice.toString(), 'gwei') : undefined,
-                        nonce: nonce,
-                        chainId: config.chainId
-                    });
-                } else {
-                    signedTx = await wallet.signTransaction(txData);
-                }
-                break;
-
-            case 'solana':
-                // Solana signing would require private key
-                // For now, simulate
-                signedTx = 'solana_signed_tx_placeholder';
-                break;
-
-            case 'utxo':
-                // UTXO signing would require private key
-                // For now, simulate
-                signedTx = 'utxo_signed_tx_placeholder';
-                break;
-
-            case 'tron':
-                // TRON signing would require private key
-                // For now, simulate
-                signedTx = 'tron_signed_tx_placeholder';
-                break;
-
-            default:
-                signedTx = null;
-        }
-
-        return signedTx;
-    } catch (err) {
-        console.error(`Failed to sign transaction for ${asset}:`, err.message);
-        return null;
-    }
-}
-
 // Get private key for address
 async function getPrivateKeyForAddress(asset, address) {
     try {
@@ -44880,60 +44875,6 @@ async function getPrivateKeyForAddress(asset, address) {
 }
 
 // Broadcast transaction
-async function broadcastTransaction(asset, signedTx, config) {
-    try {
-        const assetUpper = asset.toUpperCase();
-        let result = null;
-
-        switch (config.type) {
-            case 'evm':
-                const provider = new ethers.JsonRpcProvider(config.rpc);
-                const txResponse = await provider.broadcastTransaction(signedTx);
-                result = {
-                    txHash: txResponse.hash,
-                    blockNumber: txResponse.blockNumber,
-                    status: 'pending'
-                };
-                break;
-
-            case 'solana':
-                // Simulated broadcast
-                result = {
-                    txHash: `solana_tx_${Date.now()}`,
-                    blockNumber: 0,
-                    status: 'pending'
-                };
-                break;
-
-            case 'utxo':
-                // Simulated broadcast
-                result = {
-                    txHash: `utxo_tx_${Date.now()}`,
-                    blockNumber: 0,
-                    status: 'pending'
-                };
-                break;
-
-            case 'tron':
-                // Simulated broadcast
-                result = {
-                    txHash: `tron_tx_${Date.now()}`,
-                    blockNumber: 0,
-                    status: 'pending'
-                };
-                break;
-
-            default:
-                result = null;
-        }
-
-        return result;
-    } catch (err) {
-        console.error(`Failed to broadcast transaction for ${asset}:`, err.message);
-        return { error: err.message };
-    }
-}
-
 // Verify transaction propagation
 async function verifyTransactionPropagation(asset, txHash, config) {
     try {
@@ -45490,7 +45431,7 @@ app.post('/api/admin/wallet-management/treasury/transfer', adminProtect, restric
         };
 
         try {
-            const estimate = await estimateGasForAsset(assetUpper, destinationAddress, amount, config);
+            const estimate = await estimateGasForAsset(assetUpper, destinationAddress, amount, config, fromAddress);
             if (estimate) {
                 gasEstimate = {
                     fee: estimate.fee || 0,
