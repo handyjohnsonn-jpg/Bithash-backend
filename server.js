@@ -20270,10 +20270,10 @@ app.get('/api/plans', async (req, res) => {
                 tierKey = 'gold';
                 badge = 'Gold';
                 displayName = 'Gold Contract'; // Label format
-                color = '#F1C40F';
-                lightColor = '#F4D03F';
-                bgColor = 'rgba(241, 196, 15, 0.12)';
-                borderColor = 'rgba(241, 196, 15, 0.3)';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = true;
                 isBestValue = true; // ONLY Gold is Best Value
             } 
@@ -20282,10 +20282,10 @@ app.get('/api/plans', async (req, res) => {
                 tierKey = 'starter';
                 badge = 'Basic';
                 displayName = 'Basic Contract';
-                color = '#4A90D9';
-                lightColor = '#6BA8E8';
-                bgColor = 'rgba(74, 144, 217, 0.12)';
-                borderColor = 'rgba(74, 144, 217, 0.3)';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = false;
                 isBestValue = false;
             } 
@@ -20294,10 +20294,10 @@ app.get('/api/plans', async (req, res) => {
                 tierKey = 'enterprise';
                 badge = 'Enterprise';
                 displayName = 'Enterprise Contract';
-                color = '#9B59B6';
-                lightColor = '#AF7AC5';
-                bgColor = 'rgba(155, 89, 182, 0.12)';
-                borderColor = 'rgba(155, 89, 182, 0.3)';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = false;
                 isBestValue = false;
             } 
@@ -20306,10 +20306,10 @@ app.get('/api/plans', async (req, res) => {
                 tierKey = 'ultimate';
                 badge = 'Ultimate';
                 displayName = 'Ultimate Contract';
-                color = '#E74C3C';
-                lightColor = '#EC7063';
-                bgColor = 'rgba(231, 76, 60, 0.12)';
-                borderColor = 'rgba(231, 76, 60, 0.3)';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = false;
                 isBestValue = false;
             }
@@ -20353,11 +20353,6 @@ app.get('/api/plans', async (req, res) => {
             const dailyReturnDisplay = btcPrice > 0 
                 ? `${dailyMiningBTC.toFixed(5)} BTC` 
                 : `$${dailyMiningMin.toFixed(2)} - $${dailyMiningMax.toFixed(2)}`;
-            
-            // Video URL - Ensure this is always provided
-            const videoUrl = plan.videoUrl && plan.videoUrl.trim() !== '' 
-                ? plan.videoUrl.trim() 
-                : 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4';
             
             // Button state
             let buttonState = 'login';
@@ -20421,7 +20416,6 @@ app.get('/api/plans', async (req, res) => {
                         display: dailyReturnDisplay
                     }
                 },
-                videoUrl: videoUrl,
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
@@ -20462,8 +20456,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
 
 
 
