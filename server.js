@@ -4157,7 +4157,29 @@ const FinancialStatementSchema = new mongoose.Schema({
     transactions: {
         list: [{
             transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
-            type: { type: String, enum: ['deposit', 'withdrawal', 'transfer', 'investment', 'interest', 'referral', 'loan', 'buy', 'sell'] },
+            // =====================================================
+            // FIXED: Added 'refund' and 'Promo' to match TransactionSchema.
+            // Previously only: deposit, withdrawal, transfer, investment,
+            // interest, referral, loan, buy, sell.
+            // TransactionSchema also allows 'refund' and 'Promo',
+            // which caused validation failures when embedding them here.
+            // =====================================================
+            type: {
+                type: String,
+                enum: [
+                    'deposit',
+                    'withdrawal',
+                    'transfer',
+                    'investment',
+                    'interest',
+                    'referral',
+                    'loan',
+                    'buy',
+                    'sell',
+                    'refund',
+                    'Promo'
+                ]
+            },
             amountUSD: { type: Number, required: true },
             asset: { type: String },
             assetAmount: { type: Number },
@@ -4176,10 +4198,16 @@ const FinancialStatementSchema = new mongoose.Schema({
             totalWithdrawalsUSD: { type: Number, default: 0 },
             totalFeesPaidUSD: { type: Number, default: 0 },
             totalTransfersUSD: { type: Number, default: 0 },
+            // =====================================================
+            // FIXED: Added refunds and promos counters so statement
+            // generation code can populate them without schema errors.
+            // =====================================================
             count: {
                 deposits: { type: Number, default: 0 },
                 withdrawals: { type: Number, default: 0 },
-                transfers: { type: Number, default: 0 }
+                transfers: { type: Number, default: 0 },
+                refunds: { type: Number, default: 0 },
+                promos: { type: Number, default: 0 }
             }
         }
     },
@@ -4335,7 +4363,21 @@ const FinancialStatementSchema = new mongoose.Schema({
         totalProfitUSD: { type: Number, default: 0 },
         totalLossUSD: { type: Number, default: 0 },
         netProfitUSD: { type: Number, default: 0 },
-        roiPercentage: { type: Number, default: 0 }
+        roiPercentage: { type: Number, default: 0 },
+        // =====================================================
+        // FIXED: Added PnL fields that the statement generator
+        // in /api/admin/statements/generate already sets but were
+        // not declared in the schema (they were silently dropped
+        // on strict mode; adding them makes them persist).
+        // =====================================================
+        realizedPnL: { type: Number, default: 0 },
+        unrealizedPnL: { type: Number, default: 0 },
+        assetPnLDetails: [{
+            asset: { type: String },
+            realizedPnL: { type: Number, default: 0 },
+            unrealizedPnL: { type: Number, default: 0 },
+            totalPnL: { type: Number, default: 0 }
+        }]
     },
     ipAddress: { type: String },
     userAgent: { type: String },
@@ -4343,7 +4385,11 @@ const FinancialStatementSchema = new mongoose.Schema({
     isDelivered: { type: Boolean, default: false },
     deliveredAt: { type: Date },
     downloadUrl: { type: String }
-}, { timestamps: true });
+}, {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true }
+});
 
 FinancialStatementSchema.index({ user: 1, 'period.endDate': -1 });
 FinancialStatementSchema.index({ reference: 1 }, { unique: true });
@@ -7599,10 +7645,12 @@ const generateFinancialStatementsForAllUsers = async () => {
               totalFeesPaidUSD: totalFees,
               totalTransfersUSD: 0,
               count: {
-                deposits: transactions.filter(t => t.type === 'deposit').length,
-                withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
-                transfers: 0
-              }
+    deposits: transactions.filter(t => t.type === 'deposit').length,
+    withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
+    transfers: transactions.filter(t => t.type === 'transfer').length,
+    refunds: transactions.filter(t => t.type === 'refund').length,
+    promos: transactions.filter(t => t.type === 'Promo').length
+}
             }
           },
           investments: {
@@ -34827,11 +34875,13 @@ app.post('/api/admin/statements/generate', adminProtect, async (req, res) => {
               totalWithdrawalsUSD: totalWithdrawals,
               totalFeesPaidUSD: totalFees,
               totalTransfersUSD: 0,
-              count: {
-                deposits: transactions.filter(t => t.type === 'deposit').length,
-                withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
-                transfers: 0
-              }
+             count: {
+    deposits: transactions.filter(t => t.type === 'deposit').length,
+    withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
+    transfers: transactions.filter(t => t.type === 'transfer').length,
+    refunds: transactions.filter(t => t.type === 'refund').length,
+    promos: transactions.filter(t => t.type === 'Promo').length
+}
             }
           },
           investments: {
@@ -35485,11 +35535,13 @@ app.post('/api/statements/generate', protect, async (req, res) => {
           totalWithdrawalsUSD: totalWithdrawals,
           totalFeesPaidUSD: totalFees,
           totalTransfersUSD: 0,
-          count: {
-            deposits: transactions.filter(t => t.type === 'deposit').length,
-            withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
-            transfers: 0
-          }
+         count: {
+    deposits: transactions.filter(t => t.type === 'deposit').length,
+    withdrawals: transactions.filter(t => t.type === 'withdrawal').length,
+    transfers: transactions.filter(t => t.type === 'transfer').length,
+    refunds: transactions.filter(t => t.type === 'refund').length,
+    promos: transactions.filter(t => t.type === 'Promo').length
+}
         }
       },
       investments: {
