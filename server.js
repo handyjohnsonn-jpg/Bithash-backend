@@ -20640,12 +20640,9 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
-
 // =============================================
 // CLOUD MINING HASHRATE PLANS ENDPOINT
-// Returns only user-facing data. Internal formulas (BTC_PER_TH_PER_HOUR,
-// multiplier caps, cycle math) stay in the background.
+// User-facing only. Internal economics (BTC/TH, caps, cycles, fees) stay in the background.
 // =============================================
 
 app.get('/api/plans', async (req, res) => {
@@ -20667,18 +20664,12 @@ app.get('/api/plans', async (req, res) => {
                         maturedBalance: { usd: 0 },
                         totalPortfolio: { usd: 0 }
                     },
-                    autoCompoundOptions: [
-                        { months: 1, label: '1 Month' },
-                        { months: 3, label: '3 Months' },
-                        { months: 6, label: '6 Months' },
-                        { months: 9, label: '9 Months' },
-                        { months: 12, label: '12 Months' }
-                    ]
+                    estimatedReturns: {}
                 }
             });
         }
 
-        // ---- Internal: fetch live BTC price ----
+        // Get BTC price (internal only — never sent to user)
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -20687,7 +20678,9 @@ app.get('/api/plans', async (req, res) => {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
 
-        // ---- User context ----
+        // =============================================
+        // USER CONTEXT
+        // =============================================
         let userContext = {
             isLoggedIn: false,
             canRent: false,
@@ -20708,8 +20701,8 @@ app.get('/api/plans', async (req, res) => {
 
                 if (user) {
                     const kycVerified = user.kycStatus?.identity === 'verified' &&
-                                        user.kycStatus?.address === 'verified' &&
-                                        user.kycStatus?.facial === 'verified';
+                                     user.kycStatus?.address === 'verified' &&
+                                     user.kycStatus?.facial === 'verified';
 
                     const balances = await calculateRealWalletBalances(user);
                     const mainBalanceUSD = balances.mainUSD || 0;
@@ -20744,10 +20737,10 @@ app.get('/api/plans', async (req, res) => {
             }
         }
 
-        // ---- Enhanced plans ----
-        // Each plan exposes only user-facing numbers. Hashpower and returns
-        // are shown per-minimum-investment so the user sees a concrete example,
-        // but the formula itself stays behind the API.
+        // =============================================
+        // BUILD USER-FACING PLAN LIST
+        // (Colors, badges, tiering — all preserved from original design.)
+        // =============================================
         const enhancedPlans = plans.map((plan) => {
             const minAmountUSD = plan.minAmount || 0;
             const maxAmountUSD = plan.maxAmount || 0;
@@ -20756,31 +20749,8 @@ app.get('/api/plans', async (req, res) => {
             const planName = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
 
-            // Internal: compute per-minimum example hashpower and return
-            // so the plan card shows concrete numbers without exposing the formula.
-            let exampleHashpower = 0;
-            let exampleReturnUSD = 0;
-            let exampleReturnBTC = 0;
-
-            if (btcPrice > 0 && durationHours > 0 && percentage > 0 && minAmountUSD > 0) {
-                // Same formula used inside calculateHashpower() — not exposed.
-                exampleHashpower = calculateHashpower(
-                    minAmountUSD,
-                    percentage,
-                    durationHours,
-                    btcPrice
-                );
-                const feeUSD = minAmountUSD * (CYCLE_FEE_PERCENT / 100);
-                exampleReturnUSD = (minAmountUSD - feeUSD) * (1 + percentage / 100);
-                exampleReturnBTC = exampleReturnUSD / btcPrice;
-            }
-
-            // BTC range for the plan card
-            const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
-            const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
-
             // =============================================
-            // PLAN TIER DETECTION
+            // PLAN TIER DETECTION — PRESERVED
             // =============================================
             const planNameLower = planName.toLowerCase();
             let tierKey = 'standard';
@@ -20797,32 +20767,62 @@ app.get('/api/plans', async (req, res) => {
                 tierKey = 'gold';
                 badge = 'Gold';
                 displayName = 'Gold Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = true;
                 isBestValue = true;
             } else if (planNameLower.includes('starter') || planNameLower.includes('basic')) {
                 tierKey = 'starter';
                 badge = 'Basic';
                 displayName = 'Basic Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
                 tierKey = 'enterprise';
                 badge = 'Enterprise';
                 displayName = 'Enterprise Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
                 tierKey = 'ultimate';
                 badge = 'Ultimate';
                 displayName = 'Ultimate Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else {
                 tierKey = 'standard';
                 badge = 'Standard';
                 displayName = 'Standard Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             }
 
-            // Features — no hashpower hardcoded, no formula hints
+            // =============================================
+            // FEATURES — user-facing only
+            // =============================================
             const features = [
                 'SHA-256 ASIC mining',
                 '24/7 performance monitoring',
                 'Automatic mining rewards',
-                `${exampleHashpower > 0 ? exampleHashpower.toLocaleString() + ' TH/s (at min. amount)' : 'Premium mining capacity'}`
+                'Flexible rental durations'
             ];
 
             if (tierKey === 'gold' || tierKey === 'enterprise' || tierKey === 'ultimate') {
@@ -20835,18 +20835,20 @@ app.get('/api/plans', async (req, res) => {
                 features.push('Exclusive bonuses');
             }
 
-            // BTC range display
-            const btcRange = btcPrice > 0
-                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
-                : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
-
-            // Per-cycle expected return display (user-facing only)
-            const cycleReturnDisplay = exampleReturnBTC > 0
-                ? `${exampleReturnBTC.toFixed(8)} BTC / cycle`
-                : `+${percentage}% / cycle`;
+            // =============================================
+            // USER-FACING AMOUNT RANGE (USD only)
+            // =============================================
+            const amountRange = `$${minAmountUSD.toLocaleString()} - $${maxAmountUSD.toLocaleString()}`;
 
             // =============================================
-            // BUTTON STATE
+            // USER-FACING RETURN PER CYCLE
+            // Only show the return percentage — the actual BTC figure is
+            // calculated silently by the backend when the user rents.
+            // =============================================
+            const returnPerCycle = `+${percentage}%`;
+
+            // =============================================
+            // BUTTON STATE (unchanged logic)
             // =============================================
             let buttonState = 'login';
             let buttonText = 'Login to Rent Hashrate';
@@ -20868,17 +20870,17 @@ app.get('/api/plans', async (req, res) => {
                         canRent = true;
                         buttonState = 'rent';
                         buttonText = 'Rent Hashrate';
-                        buttonTooltip = `Rent mining capacity starting at $${minAmountUSD.toLocaleString()}`;
+                        buttonTooltip = `Rent hashpower for the ${displayName}`;
                     } else {
                         buttonState = 'insufficient';
                         buttonText = `Need $${minAmountUSD.toLocaleString()}`;
-                        buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}`;
+                        buttonTooltip = `Required balance for this contract: $${minAmountUSD.toLocaleString()}`;
                     }
                 }
             }
 
             // =============================================
-            // USER-FACING PAYLOAD ONLY
+            // USER-FACING RESPONSE — no internal mechanics exposed
             // =============================================
             return {
                 id: plan._id.toString(),
@@ -20893,59 +20895,48 @@ app.get('/api/plans', async (req, res) => {
                 borderColor: borderColor,
                 lightColor: lightColor,
 
-                // Rates — user-facing
+                // User-facing contract terms
                 percentage: percentage,
-                duration: { hours: durationHours },
+                returnPerCycle: returnPerCycle,
+                duration: {
+                    hours: durationHours
+                },
 
-                // Amounts
+                // User-facing amount range (USD only)
                 minAmount: { usd: minAmountUSD },
                 maxAmount: { usd: maxAmountUSD },
-                minAmountBTC: minAmountBTC,
-                maxAmountBTC: maxAmountBTC,
-                btcRange: btcRange,
-
-                // Example at min. amount (does not reveal the internal formula)
-                exampleHashpower: exampleHashpower,
-                exampleReturn: {
-                    perCycleUSD: parseFloat(exampleReturnUSD.toFixed(2)),
-                    perCycleBTC: parseFloat(exampleReturnBTC.toFixed(8)),
-                    display: cycleReturnDisplay
-                },
+                amountRange: amountRange,
 
                 // Features
                 features: features,
 
-                // Button
+                // Button state
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
-                canRent: canRent
+                canRent: canRent,
+
+                // Rental options the user can choose
+                autoCompoundOptions: [
+                    { months: 0, label: 'Single Cycle' },
+                    { months: 1, label: '1 Month' },
+                    { months: 3, label: '3 Months' },
+                    { months: 6, label: '6 Months' },
+                    { months: 9, label: '9 Months' },
+                    { months: 12, label: '12 Months' }
+                ],
+                videoUrl: plan.videoUrl || ''
             };
         });
 
         // =============================================
-        // AUTO-COMPOUND OPTIONS (user-facing only)
-        // The frontend presents these as duration choices at investment time.
-        // No mention of "auto-reinvest" or compounding formulas.
+        // RESPONSE — no BTC price, no internal formulas
         // =============================================
-        const autoCompoundOptions = [
-            { months: 1,  label: '1 Month',  description: 'Rent for 1 month' },
-            { months: 3,  label: '3 Months', description: 'Rent for 3 months' },
-            { months: 6,  label: '6 Months', description: 'Rent for 6 months' },
-            { months: 9,  label: '9 Months', description: 'Rent for 9 months' },
-            { months: 12, label: '12 Months', description: 'Rent for 12 months' }
-        ];
-
         const response = {
             status: 'success',
             data: {
                 plans: enhancedPlans,
-                marketContext: {
-                    btcPrice: btcPrice,
-                    timestamp: new Date().toISOString()
-                },
-                userContext: userContext,
-                autoCompoundOptions: autoCompoundOptions
+                userContext: userContext
             }
         };
 
@@ -20961,7 +20952,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
 
 
 
