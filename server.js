@@ -20639,10 +20639,10 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 // =============================================
 // CLOUD MINING HASHRATE PLANS ENDPOINT
-// User-facing only. Internal economics (BTC/TH, caps, cycles, fees) stay in the background.
+// User-facing only. Internal mining economics
+// (hashpower formula, per-cycle fees, multiplier caps) are NOT exposed.
 // =============================================
 
 app.get('/api/plans', async (req, res) => {
@@ -20669,7 +20669,7 @@ app.get('/api/plans', async (req, res) => {
             });
         }
 
-        // Get BTC price (internal only — never sent to user)
+        // Get BTC price (used only for USD/BTC display, not exposed as a formula)
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -20678,9 +20678,7 @@ app.get('/api/plans', async (req, res) => {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
 
-        // =============================================
-        // USER CONTEXT
-        // =============================================
+        // ---- User context ----
         let userContext = {
             isLoggedIn: false,
             canRent: false,
@@ -20738,8 +20736,9 @@ app.get('/api/plans', async (req, res) => {
         }
 
         // =============================================
-        // BUILD USER-FACING PLAN LIST
-        // (Colors, badges, tiering — all preserved from original design.)
+        // BUILD USER-FACING PLAN CARDS
+        // All colors, badges, tier logic preserved.
+        // No hashpower formula, no fee breakdown, no multiplier cap exposed.
         // =============================================
         const enhancedPlans = plans.map((plan) => {
             const minAmountUSD = plan.minAmount || 0;
@@ -20749,9 +20748,14 @@ app.get('/api/plans', async (req, res) => {
             const planName = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
 
-            // =============================================
-            // PLAN TIER DETECTION — PRESERVED
-            // =============================================
+            // BTC range for display
+            const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
+            const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
+
+            // Duration in a user-friendly form
+            const durationDays = durationHours / 24;
+
+            // ---- Tier detection (preserved exactly) ----
             const planNameLower = planName.toLowerCase();
             let tierKey = 'standard';
             let badge = 'Standard';
@@ -20815,14 +20819,12 @@ app.get('/api/plans', async (req, res) => {
                 isBestValue = false;
             }
 
-            // =============================================
-            // FEATURES — user-facing only
-            // =============================================
+            // ---- Features (user-facing, no internal numbers) ----
             const features = [
                 'SHA-256 ASIC mining',
                 '24/7 performance monitoring',
-                'Automatic mining rewards',
-                'Flexible rental durations'
+                'Automatic cycle payouts',
+                'Auto-compound eligible'
             ];
 
             if (tierKey === 'gold' || tierKey === 'enterprise' || tierKey === 'ultimate') {
@@ -20835,31 +20837,25 @@ app.get('/api/plans', async (req, res) => {
                 features.push('Exclusive bonuses');
             }
 
-            // =============================================
-            // USER-FACING AMOUNT RANGE (USD only)
-            // =============================================
-            const amountRange = `$${minAmountUSD.toLocaleString()} - $${maxAmountUSD.toLocaleString()}`;
+            // BTC range display
+            const btcRange = btcPrice > 0
+                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
+                : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
-            // =============================================
-            // USER-FACING RETURN PER CYCLE
-            // Only show the return percentage — the actual BTC figure is
-            // calculated silently by the backend when the user rents.
-            // =============================================
-            const returnPerCycle = `+${percentage}%`;
+            // Return display — just the plan percentage and cycle length
+            const returnDisplay = `+${percentage}% per ${durationHours}-hour cycle`;
 
-            // =============================================
-            // BUTTON STATE (unchanged logic)
-            // =============================================
+            // ---- Button state (preserved) ----
             let buttonState = 'login';
-            let buttonText = 'Login to Rent Hashrate';
-            let buttonTooltip = 'Please login to rent hashrate';
+            let buttonText = 'Login to Rent Hashpower';
+            let buttonTooltip = 'Please login to rent hashpower';
             let canRent = false;
 
             if (userContext.isLoggedIn) {
                 if (!userContext.kycVerified) {
                     buttonState = 'kyc_required';
                     buttonText = 'Complete KYC';
-                    buttonTooltip = 'KYC verification required to rent hashrate';
+                    buttonTooltip = 'KYC verification required to rent hashpower';
                 } else if (!userContext.hasRecentTransaction) {
                     buttonState = 'transaction_required';
                     buttonText = 'Make a Deposit';
@@ -20869,18 +20865,18 @@ app.get('/api/plans', async (req, res) => {
                     if (totalUserBalance >= minAmountUSD) {
                         canRent = true;
                         buttonState = 'rent';
-                        buttonText = 'Rent Hashrate';
-                        buttonTooltip = `Rent hashpower for the ${displayName}`;
+                        buttonText = 'Rent Hashpower';
+                        buttonTooltip = `Rent ${displayName} mining capacity`;
                     } else {
                         buttonState = 'insufficient';
                         buttonText = `Need $${minAmountUSD.toLocaleString()}`;
-                        buttonTooltip = `Required balance for this contract: $${minAmountUSD.toLocaleString()}`;
+                        buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}`;
                     }
                 }
             }
 
             // =============================================
-            // USER-FACING RESPONSE — no internal mechanics exposed
+            // USER-FACING RESPONSE (internal economics removed)
             // =============================================
             return {
                 id: plan._id.toString(),
@@ -20894,48 +20890,38 @@ app.get('/api/plans', async (req, res) => {
                 color: color,
                 borderColor: borderColor,
                 lightColor: lightColor,
-
-                // User-facing contract terms
                 percentage: percentage,
-                returnPerCycle: returnPerCycle,
                 duration: {
-                    hours: durationHours
+                    hours: durationHours,
+                    days: durationDays
                 },
-
-                // User-facing amount range (USD only)
-                minAmount: { usd: minAmountUSD },
-                maxAmount: { usd: maxAmountUSD },
-                amountRange: amountRange,
-
-                // Features
+                minAmount: {
+                    usd: minAmountUSD
+                },
+                maxAmount: {
+                    usd: maxAmountUSD
+                },
+                minAmountBTC: minAmountBTC,
+                maxAmountBTC: maxAmountBTC,
+                btcRange: btcRange,
                 features: features,
-
-                // Button state
+                returnDisplay: returnDisplay,
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
-                canRent: canRent,
-
-                // Rental options the user can choose
-                autoCompoundOptions: [
-                    { months: 0, label: 'Single Cycle' },
-                    { months: 1, label: '1 Month' },
-                    { months: 3, label: '3 Months' },
-                    { months: 6, label: '6 Months' },
-                    { months: 9, label: '9 Months' },
-                    { months: 12, label: '12 Months' }
-                ],
-                videoUrl: plan.videoUrl || ''
+                canRent: canRent
+                // REMOVED: hashrate, dailyMining, estimatedReturns, exact formulas
             };
         });
 
-        // =============================================
-        // RESPONSE — no BTC price, no internal formulas
-        // =============================================
         const response = {
             status: 'success',
             data: {
                 plans: enhancedPlans,
+                marketContext: {
+                    btcPrice: btcPrice,
+                    timestamp: new Date().toISOString()
+                },
                 userContext: userContext
             }
         };
@@ -20952,8 +20938,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
 
 
 
