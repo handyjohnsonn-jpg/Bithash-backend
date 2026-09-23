@@ -406,6 +406,79 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 
+
+
+
+
+
+
+
+
+
+// =============================================
+// MINING ECONOMICS CONSTANTS
+// These define the physical output of our data centers.
+// NOT displayed to users — internal logic only.
+// =============================================
+const BTC_PER_TH_PER_HOUR = 0.000025 / 12; // = 0.00000208333 BTC per TH/s per hour
+const HOURS_PER_MONTH = 30 * 24;            // 720 hours
+const HOURS_PER_YEAR = 365 * 24;            // 8760 hours
+const CYCLE_FEE_PERCENT = 3;                // 3% initiation fee per cycle
+
+// Multiplier caps (sliding scale) by auto-compound months
+// Shorter terms get higher caps because fewer compounding cycles means lower explosion risk.
+const COMPOUND_MULTIPLIER_CAPS = {
+    0:  10,   // No auto-compound (single cycle) — cap is irrelevant but set high
+    1:  5,    // 1 month  → 5x max
+    3:  4,    // 3 months → 4x max
+    6:  3,    // 6 months → 3x max
+    9:  2.5,  // 9 months → 2.5x max
+    12: 2     // 12 months → 2x max
+};
+
+
+
+
+// =============================================
+// HELPER: Calculate Hashpower for a given principal
+// Internal function — output NEVER exposed as a formula to users.
+// =============================================
+const calculateHashpower = (principalUSD, planReturnPercent, durationHours, btcPrice) => {
+    if (!btcPrice || btcPrice <= 0) return 0;
+    if (!durationHours || durationHours <= 0) return 0;
+    if (!planReturnPercent || planReturnPercent <= 0) return 0;
+
+    const returnDecimal = planReturnPercent / 100;
+    const btcGeneratedNeeded = (principalUSD * returnDecimal) / btcPrice;
+    const hashpower = btcGeneratedNeeded / (BTC_PER_TH_PER_HOUR * durationHours);
+
+    return parseFloat(hashpower.toFixed(4));
+};
+
+// =============================================
+// HELPER: Calculate number of cycles for auto-compound
+// =============================================
+const calculateTotalCycles = (autoCompoundMonths, durationHours) => {
+    if (!autoCompoundMonths) return 1;
+    const totalHours = autoCompoundMonths * HOURS_PER_MONTH;
+    return Math.max(1, Math.floor(totalHours / durationHours));
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const UserSchema = new mongoose.Schema({
   firstName: { 
     type: String, 
@@ -3395,9 +3468,10 @@ const PlanSchema = new mongoose.Schema({
   duration: { type: Number, required: [true, 'Duration is required'], min: [1, 'Duration must be at least 1 hour'] },
   minAmount: { type: Number, required: [true, 'Minimum amount is required'], min: [0, 'Minimum amount cannot be negative'] },
   maxAmount: { type: Number, required: [true, 'Maximum amount is required'] },
-    hashrate: { type: Number, default: 0, min: [0, 'Hashrate cannot be negative'] },
+  // REMOVED: hashrate — now calculated dynamically per investment
+  // Formula (internal only): (principalUSD * return%) / (BTC_price * BTC_PER_TH_PER_HOUR * durationHours)
   isActive: { type: Boolean, default: true },
-      videoUrl: { type: String, default: '' },
+  videoUrl: { type: String, default: '' },
   referralBonus: { type: Number, default: 5, min: [0, 'Bonus cannot be negative'] }
 }, { timestamps: true });
 
@@ -3606,6 +3680,13 @@ const DepositAsset = mongoose.model('DepositAsset', DepositAssetSchema);
 const Buy = mongoose.model('Buy', BuySchema);
 const Sell = mongoose.model('Sell', SellSchema);
 
+
+
+
+
+
+
+
 const InvestmentSchema = new mongoose.Schema({
   user: { 
     type: mongoose.Schema.Types.ObjectId, 
@@ -3790,6 +3871,73 @@ const InvestmentSchema = new mongoose.Schema({
   complianceFlags: [{
     type: String,
     enum: ['aml_check', 'sanctions_check', 'pep_check', 'unusual_activity']
+  }],
+
+  // =============================================
+  // AUTO-COMPOUNDING FIELDS (NEW SYSTEM)
+  // =============================================
+  autoCompoundMonths: {
+    type: Number,
+    enum: [1, 3, 6, 9, 12],
+    default: null,
+    description: 'Selected auto-compound duration in months. Null = single cycle.'
+  },
+  totalCycles: {
+    type: Number,
+    default: 1,
+    min: 1,
+    description: 'Total number of cycles to run (1 for single, >1 for auto-compound).'
+  },
+  currentCycle: {
+    type: Number,
+    default: 1,
+    min: 1,
+    description: 'The current active cycle number.'
+  },
+  isAutoCompoundActive: {
+    type: Boolean,
+    default: false,
+    description: 'True while the contract is compounding and has more cycles to run.'
+  },
+  compoundMultiplierCap: {
+    type: Number,
+    default: 10,
+    description: 'Maximum total-return multiplier before auto-compound stops early (sliding scale by term length).'
+  },
+  cumulativeReturnUSD: {
+    type: Number,
+    default: 0,
+    description: 'Sum of all completed cycles\u2019 returns in USD.'
+  },
+  cumulativeReturnBTC: {
+    type: Number,
+    default: 0,
+    description: 'Sum of all completed cycles\u2019 returns in BTC.'
+  },
+  currentHashrate: {
+    type: Number,
+    default: 0,
+    description: 'Dynamically calculated hashpower (TH/s) for the current cycle. Never derived from a static plan field.'
+  },
+  hashrateHistory: [{
+    cycleNumber: { type: Number, required: true },
+    hashrate: { type: Number, required: true },
+    btcPriceAtCalculation: { type: Number },
+    calculatedAt: { type: Date, default: Date.now }
+  }],
+  cycleHistory: [{
+    cycleNumber: { type: Number, required: true },
+    principalUSD: { type: Number, required: true },
+    principalBTC: { type: Number, required: true },
+    startDate: { type: Date, required: true },
+    endDate: { type: Date, required: true },
+    returnUSD: { type: Number, default: 0 },
+    returnBTC: { type: Number, default: 0 },
+    feeUSD: { type: Number, default: 0 },
+    feeBTC: { type: Number, default: 0 },
+    btcPriceAtStart: { type: Number },
+    btcPriceAtEnd: { type: Number },
+    status: { type: String, enum: ['active', 'completed'], default: 'active' }
   }]
 }, { 
   timestamps: true,
@@ -3818,6 +3966,13 @@ InvestmentSchema.index({ referredBy: 1, status: 1 });
 InvestmentSchema.index({ dailyEarnings: 1 });
 InvestmentSchema.index({ createdAt: -1 });
 
+// Auto-compound aware index: fast lookup for the maturity cron
+InvestmentSchema.index({ status: 1, endDate: 1, isAutoCompoundActive: 1 });
+
+// Lock-in index: efficiently detect an existing active investment
+// in the same plan for the same user (blocks re-investment until the contract ends).
+InvestmentSchema.index({ user: 1, plan: 1, status: 1 });
+
 InvestmentSchema.virtual('daysRemaining').get(function() {
   return this.status === 'active' 
     ? Math.max(0, Math.ceil((this.endDate - Date.now()) / (1000 * 60 * 60 * 24)))
@@ -3830,6 +3985,18 @@ InvestmentSchema.virtual('totalValue').get(function() {
 
 InvestmentSchema.virtual('isActive').get(function() {
   return this.status === 'active';
+});
+
+// Virtual: how many cycles remain (including the current one)
+InvestmentSchema.virtual('cyclesRemaining').get(function() {
+  if (this.status !== 'active') return 0;
+  return Math.max(0, (this.totalCycles || 1) - (this.currentCycle || 1) + 1);
+});
+
+// Virtual: current multiplier vs original principal
+InvestmentSchema.virtual('currentMultiplier').get(function() {
+  if (!this.originalAmount || this.originalAmount <= 0) return 1;
+  return ((this.cumulativeReturnUSD || 0) + this.amount) / this.originalAmount;
 });
 
 InvestmentSchema.pre('save', function(next) {
@@ -3866,6 +4033,12 @@ InvestmentSchema.statics.calculateUserTotalInvested = async function(userId) {
   return result.length ? result[0].total : 0;
 };
 
+// Check whether a user already has an active investment in a given plan.
+// Used by POST /api/investments to enforce the lock-in rule.
+InvestmentSchema.statics.hasActiveInPlan = function(userId, planId) {
+  return this.findOne({ user: userId, plan: planId, status: 'active' });
+};
+
 InvestmentSchema.methods.addDailyEarning = function(amount, btcValue) {
   this.dailyEarnings.push({
     date: new Date(),
@@ -3890,6 +4063,7 @@ InvestmentSchema.methods.cancel = function(reason, changedBy, changedByModel = '
 InvestmentSchema.methods.complete = function() {
   this.status = 'completed';
   this.completionDate = new Date();
+  this.isAutoCompoundActive = false;
   return this.save();
 };
 
@@ -3905,7 +4079,21 @@ InvestmentSchema.query.completed = function() {
   return this.where({ status: 'completed' });
 };
 
+InvestmentSchema.query.autoCompounding = function() {
+  return this.where({ status: 'active', isAutoCompoundActive: true });
+};
+
 const Investment = mongoose.model('Investment', InvestmentSchema);
+
+
+
+
+
+
+
+
+
+
 
 const CardPaymentSchema = new mongoose.Schema({
   user: { 
@@ -15895,10 +16083,15 @@ app.post('/api/auth/reset-password', [
 
 
 
+// =============================================
+// CREATE INVESTMENT (with optional auto-compounding)
+// POST /api/investments
+// =============================================
 app.post('/api/investments', protect, [
   body('planId').notEmpty().withMessage('Plan ID is required').isMongoId().withMessage('Invalid Plan ID'),
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be a positive number'),
-  body('balanceType').isIn(['main', 'matured']).withMessage('Balance type must be either "main" or "matured"')
+  body('balanceType').isIn(['main', 'matured']).withMessage('Balance type must be either "main" or "matured"'),
+  body('autoCompoundMonths').optional({ nullable: true }).isIn([1, 3, 6, 9, 12]).withMessage('Auto-compound months must be 1, 3, 6, 9, or 12')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -15909,16 +16102,18 @@ app.post('/api/investments', protect, [
   }
 
   try {
-    const { planId, amount, balanceType } = req.body;
+    const { planId, amount, balanceType, autoCompoundMonths = null } = req.body;
     const userId = req.user._id;
 
-    // ✅ CHECK RESTRICTIONS BEFORE ALLOWING INVESTMENT
+    // =============================================
+    // RESTRICTION CHECKS
+    // =============================================
     const restrictions = await AccountRestrictions.getInstance();
     const userRestrictionStatus = await UserRestrictionStatus.findOne({ user: userId });
-    
+
     const kycStatus = await KYC.findOne({ user: userId });
     const hasKYC = kycStatus && kycStatus.overallStatus === 'verified';
-    
+
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - (restrictions.inactivity_days || 30));
     const hasRecentTx = await Transaction.findOne({
@@ -15927,21 +16122,21 @@ app.post('/api/investments', protect, [
       status: 'completed',
       createdAt: { $gte: cutoff }
     });
-    
+
     if (!hasKYC && restrictions.invest_limit_no_kyc !== null && amount > restrictions.invest_limit_no_kyc) {
       return res.status(403).json({
         status: 'fail',
         message: restrictions.kyc_restriction_reason || `Please complete KYC. Limit: $${restrictions.invest_limit_no_kyc.toLocaleString()}`
       });
     }
-    
+
     if (!hasRecentTx && restrictions.invest_limit_no_txn !== null && amount > restrictions.invest_limit_no_txn) {
       return res.status(403).json({
         status: 'fail',
         message: restrictions.txn_restriction_reason || `Complete a transaction first. Limit: $${restrictions.invest_limit_no_txn.toLocaleString()}`
       });
     }
-    
+
     if (userRestrictionStatus) {
       if (userRestrictionStatus.kyc_restricted && restrictions.invest_limit_no_kyc !== null && amount > restrictions.invest_limit_no_kyc) {
         return res.status(403).json({
@@ -15957,6 +16152,9 @@ app.post('/api/investments', protect, [
       }
     }
 
+    // =============================================
+    // PLAN VALIDATION
+    // =============================================
     const plan = await Plan.findById(planId);
     if (!plan || !plan.isActive) {
       return res.status(400).json({
@@ -15972,30 +16170,60 @@ app.post('/api/investments', protect, [
       });
     }
 
-    // ✅ CHECK FOR EXISTING ACTIVE INVESTMENT IN THE SAME PLAN
-    const existingActiveInvestment = await Investment.findOne({
-      user: userId,
-      plan: planId,
-      status: 'active'
-    });
+    // =============================================
+    // LOCK-IN CHECK: no active investment in the same plan
+    // (auto-compound means the contract stays active across all cycles)
+    // =============================================
+    const existingActiveInvestment = await Investment.hasActiveInPlan(userId, planId);
 
     if (existingActiveInvestment) {
+      const remainingCycles = (existingActiveInvestment.totalCycles || 1) - (existingActiveInvestment.currentCycle || 1) + 1;
+      const isAutoCompound = existingActiveInvestment.isAutoCompoundActive && existingActiveInvestment.totalCycles > 1;
+      const autoCompoundMsg = isAutoCompound
+        ? ` It is currently on cycle ${existingActiveInvestment.currentCycle} of ${existingActiveInvestment.totalCycles} (${remainingCycles} cycle(s) remaining).`
+        : ` It has ${remainingCycles} cycle(s) remaining.`;
+
       return res.status(400).json({
         status: 'fail',
-        message: `You already have an active investment in the ${plan.name} plan. Please wait until it matures (${plan.duration} hours) before investing again.`
+        message: `You already have an active investment in the ${plan.name} plan.${autoCompoundMsg} Please wait until it completes before investing again.`
       });
     }
 
     // =============================================
-    // REAL-TIME BTC PRICE WITH MULTIPLE API FALLBACKS
+    // FETCH REAL-TIME BTC PRICE (INTERNAL ONLY)
     // =============================================
-    const btcPrice = await getRealTimeBitcoinPrice();
+    let btcPrice;
+    try {
+      btcPrice = await getRealTimeBitcoinPrice();
+    } catch (priceError) {
+      console.error('Failed to fetch BTC price:', priceError.message);
+      return res.status(503).json({
+        status: 'error',
+        message: 'Unable to fetch current BTC price. Please try again later.'
+      });
+    }
+
+    if (!btcPrice || btcPrice <= 0) {
+      return res.status(503).json({
+        status: 'error',
+        message: 'Unable to fetch current BTC price. Please try again later.'
+      });
+    }
+
+    // =============================================
+    // CALCULATE CYCLES & DYNAMIC HASHPOWER (INTERNAL)
+    // =============================================
+    const totalCycles = calculateTotalCycles(autoCompoundMonths, plan.duration);
+    const initialHashpower = calculateHashpower(amount, plan.percentage, plan.duration, btcPrice);
+    const multiplierCap = COMPOUND_MULTIPLIER_CAPS[autoCompoundMonths || 0] || 10;
+
     const amountInBTC = amount / btcPrice;
-    
-    // Get user with balances
+
+    // =============================================
+    // BALANCE CHECK & DEDUCTION
+    // =============================================
     const user = await User.findById(userId);
-    
-    // Initialize balances Maps if they don't exist
+
     if (!user.balances) {
       user.balances = {
         main: new Map(),
@@ -16003,23 +16231,25 @@ app.post('/api/investments', protect, [
         matured: new Map()
       };
     }
-    
-    // ✅ CORRECT: Get Bitcoin balance from main wallet using .get('btc')
-    const mainBitcoinBalance = user.balances.main?.get('btc') || 0;
-    
-    // ✅ CORRECT: Get Bitcoin balance from matured wallet using .get('btc')
-    const maturedBitcoinBalance = user.balances.matured?.get('btc') || 0;
-    
+    if (!user.balances.main) user.balances.main = new Map();
+    if (!user.balances.active) user.balances.active = new Map();
+    if (!user.balances.matured) user.balances.matured = new Map();
+
+    const mainBitcoinBalance = user.balances.main.get('btc') || 0;
+    const maturedBitcoinBalance = user.balances.matured.get('btc') || 0;
+
     console.log(`📊 BTC Balance Check for ${user.email}:`);
-    console.log(`   Main Wallet BTC: ${mainBitcoinBalance} BTC`);
-    console.log(`   Matured Wallet BTC: ${maturedBitcoinBalance} BTC`);
+    console.log(`   Main Wallet BTC: ${mainBitcoinBalance}`);
+    console.log(`   Matured Wallet BTC: ${maturedBitcoinBalance}`);
     console.log(`   Investment: $${amount} USD = ${amountInBTC.toFixed(8)} BTC`);
     console.log(`   BTC Price from API: $${btcPrice}`);
-    
-    // Check balance based on selected wallet type
+    console.log(`   Auto-compound: ${autoCompoundMonths ? autoCompoundMonths + ' month(s)' : 'single cycle'}`);
+    console.log(`   Total Cycles: ${totalCycles}`);
+    console.log(`   Assigned Hashpower: ${initialHashpower} TH/s`);
+
     let selectedBitcoinBalance = 0;
     let walletName = '';
-    
+
     if (balanceType === 'main') {
       selectedBitcoinBalance = mainBitcoinBalance;
       walletName = 'Main';
@@ -16027,7 +16257,7 @@ app.post('/api/investments', protect, [
       selectedBitcoinBalance = maturedBitcoinBalance;
       walletName = 'Matured';
     }
-    
+
     if (selectedBitcoinBalance < amountInBTC) {
       return res.status(400).json({
         status: 'fail',
@@ -16045,67 +16275,114 @@ app.post('/api/investments', protect, [
         }
       });
     }
-    
-    // Store investment amounts
-    const investmentBTCAmount = amountInBTC;
-    const investmentFeeUSD = amount * 0.03;
-    const investmentAmountAfterFeeUSD = amount - investmentFeeUSD;
-    const investmentFeeBTC = investmentBTCAmount * 0.03;
-    const investmentAmountAfterFeeBTC = investmentBTCAmount - investmentFeeBTC;
-    const expectedReturnUSD = investmentAmountAfterFeeUSD + (investmentAmountAfterFeeUSD * plan.percentage / 100);
-    const expectedReturnBTC = investmentAmountAfterFeeBTC + (investmentAmountAfterFeeBTC * plan.percentage / 100);
-    const netProfitUSD = expectedReturnUSD - investmentAmountAfterFeeUSD;
-    const netProfitBTC = expectedReturnBTC - investmentAmountAfterFeeBTC;
-    const endDate = new Date(Date.now() + plan.duration * 60 * 60 * 1000);
 
-    // ✅ CORRECT: Deduct Bitcoin from the selected wallet using Map.set()
+    // =============================================
+    // COMPUTE FIRST-CYCLE NUMBERS
+    // =============================================
+    const investmentBTCAmount = amountInBTC;
+
+    // Cycle 1: 3% initiation fee, then return % applied to the fee-adjusted principal
+    const firstCycleFeeUSD = amount * (CYCLE_FEE_PERCENT / 100);
+    const firstCycleFeeBTC = investmentBTCAmount * (CYCLE_FEE_PERCENT / 100);
+    const firstCyclePrincipalAfterFeeUSD = amount - firstCycleFeeUSD;
+    const firstCyclePrincipalAfterFeeBTC = investmentBTCAmount - firstCycleFeeBTC;
+    const firstCycleReturnUSD = firstCyclePrincipalAfterFeeUSD * (1 + plan.percentage / 100);
+    const firstCycleReturnBTC = firstCyclePrincipalAfterFeeBTC * (1 + plan.percentage / 100);
+
+    const firstCycleEndDate = new Date(Date.now() + plan.duration * 60 * 60 * 1000);
+    const firstCycleStartDate = new Date();
+
+    // =============================================
+    // DEDUCT FROM SELECTED WALLET
+    // =============================================
     if (balanceType === 'main') {
       const newMainBTCBalance = mainBitcoinBalance - investmentBTCAmount;
-      user.balances.main.set('btc', newMainBTCBalance);
+      if (newMainBTCBalance <= 0.00000001) {
+        user.balances.main.delete('btc');
+      } else {
+        user.balances.main.set('btc', newMainBTCBalance);
+      }
       console.log(`   Deducted ${investmentBTCAmount.toFixed(8)} BTC from Main wallet. New balance: ${newMainBTCBalance.toFixed(8)} BTC`);
     } else if (balanceType === 'matured') {
       const newMaturedBTCBalance = maturedBitcoinBalance - investmentBTCAmount;
-      user.balances.matured.set('btc', newMaturedBTCBalance);
+      if (newMaturedBTCBalance <= 0.00000001) {
+        user.balances.matured.delete('btc');
+      } else {
+        user.balances.matured.set('btc', newMaturedBTCBalance);
+      }
       console.log(`   Deducted ${investmentBTCAmount.toFixed(8)} BTC from Matured wallet. New balance: ${newMaturedBTCBalance.toFixed(8)} BTC`);
     }
-    
-    // ✅ CORRECT: Add to active Bitcoin balance using Map.set()
-    const currentActiveBTC = user.balances.active?.get('btc') || 0;
-    user.balances.active.set('btc', currentActiveBTC + investmentAmountAfterFeeBTC);
-    console.log(`   Added ${investmentAmountAfterFeeBTC.toFixed(8)} BTC to Active wallet. New active balance: ${(currentActiveBTC + investmentAmountAfterFeeBTC).toFixed(8)} BTC`);
-    
-    // Track USD equivalents for reporting
-    const currentActiveUSD = user.balances.active?.get('usd') || 0;
-    user.balances.active.set('usd', currentActiveUSD + investmentAmountAfterFeeUSD);
-    
+
+    // Add to active wallet (fee-adjusted principal enters the mining contract)
+    const currentActiveBTC = user.balances.active.get('btc') || 0;
+    user.balances.active.set('btc', currentActiveBTC + firstCyclePrincipalAfterFeeBTC);
+    const currentActiveUSD = user.balances.active.get('usd') || 0;
+    user.balances.active.set('usd', currentActiveUSD + firstCyclePrincipalAfterFeeUSD);
+
     await user.save();
 
-    // At the investment creation section (around line 11500 in your file)
-const investment = await Investment.create({
-  user: userId,
-  plan: planId,
-  amount: investmentAmountAfterFeeUSD,
-  amountBTC: investmentAmountAfterFeeBTC,
-  originalAmount: amount,
-  originalAmountBTC: investmentBTCAmount,
-  originalCurrency: 'USD',
-  currency: 'BTC',
-  expectedReturn: expectedReturnUSD,
-  expectedReturnBTC: expectedReturnBTC,
-  returnPercentage: plan.percentage,
-  endDate,
-  payoutSchedule: 'end_term',
-  status: 'active',
-  ipAddress: req.ip,
-  userAgent: req.headers['user-agent'],
-  deviceInfo: getDeviceType(req),
-  termsAccepted: true,
-  investmentFee: investmentFeeUSD,
-  investmentFeeBTC: investmentFeeBTC,
-  balanceType: balanceType,
-  btcPriceAtInvestment: btcPrice
-});
-    // ✅ FIXED: Create transaction record with BTC AMOUNT IN DESCRIPTION so user can see it
+    // =============================================
+    // CREATE INVESTMENT RECORD (with auto-compound fields)
+    // =============================================
+    const investment = await Investment.create({
+      user: userId,
+      plan: planId,
+      amount: firstCyclePrincipalAfterFeeUSD,
+      amountBTC: firstCyclePrincipalAfterFeeBTC,
+      originalAmount: amount,
+      originalAmountBTC: investmentBTCAmount,
+      originalCurrency: 'USD',
+      currency: 'BTC',
+      expectedReturn: firstCycleReturnUSD,
+      expectedReturnBTC: firstCycleReturnBTC,
+      returnPercentage: plan.percentage,
+      endDate: firstCycleEndDate,
+      payoutSchedule: 'end_term',
+      status: 'active',
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      deviceInfo: getDeviceType(req),
+      termsAccepted: true,
+      investmentFee: firstCycleFeeUSD,
+      investmentFeeBTC: firstCycleFeeBTC,
+      balanceType: balanceType,
+      btcPriceAtInvestment: btcPrice,
+
+      // =============================================
+      // AUTO-COMPOUND FIELDS (NEW SYSTEM)
+      // =============================================
+      autoCompoundMonths: autoCompoundMonths || null,
+      totalCycles: totalCycles,
+      currentCycle: 1,
+      isAutoCompoundActive: !!autoCompoundMonths && totalCycles > 1,
+      compoundMultiplierCap: multiplierCap,
+      cumulativeReturnUSD: 0,
+      cumulativeReturnBTC: 0,
+      currentHashrate: initialHashpower,
+      hashrateHistory: [{
+        cycleNumber: 1,
+        hashrate: initialHashpower,
+        btcPriceAtCalculation: btcPrice,
+        calculatedAt: firstCycleStartDate
+      }],
+      cycleHistory: [{
+        cycleNumber: 1,
+        principalUSD: firstCyclePrincipalAfterFeeUSD,
+        principalBTC: firstCyclePrincipalAfterFeeBTC,
+        startDate: firstCycleStartDate,
+        endDate: firstCycleEndDate,
+        returnUSD: 0,
+        returnBTC: 0,
+        feeUSD: firstCycleFeeUSD,
+        feeBTC: firstCycleFeeBTC,
+        btcPriceAtStart: btcPrice,
+        status: 'active'
+      }]
+    });
+
+    // =============================================
+    // TRANSACTION RECORD
+    // =============================================
     const transaction = await Transaction.create({
       user: userId,
       type: 'investment',
@@ -16118,43 +16395,55 @@ const investment = await Investment.create({
       details: {
         investmentId: investment._id,
         planName: plan.name,
+        cycle: 1,
+        totalCycles: totalCycles,
         balanceType: balanceType,
-        investmentFeeUSD: investmentFeeUSD,
-        investmentFeeBTC: investmentFeeBTC,
-        amountAfterFeeUSD: investmentAmountAfterFeeUSD,
-        amountAfterFeeBTC: investmentAmountAfterFeeBTC,
+        autoCompoundMonths: autoCompoundMonths || null,
+        investmentFeeUSD: firstCycleFeeUSD,
+        investmentFeeBTC: firstCycleFeeBTC,
+        amountAfterFeeUSD: firstCyclePrincipalAfterFeeUSD,
+        amountAfterFeeBTC: firstCyclePrincipalAfterFeeBTC,
         btcPrice: btcPrice,
-        expectedReturnBTC: expectedReturnBTC,
-        expectedReturnUSD: expectedReturnUSD,
+        expectedReturnBTC: firstCycleReturnBTC,
+        expectedReturnUSD: firstCycleReturnUSD,
+        assignedHashrate: initialHashpower,
         transactionType: 'debit',
-        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan. 3% fee: ${investmentFeeBTC.toFixed(8)} BTC. Net: ${investmentAmountAfterFeeBTC.toFixed(8)} BTC. Expected return at maturity: ${expectedReturnBTC.toFixed(8)} BTC (≈ $${expectedReturnUSD.toLocaleString()} USD).`
+        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${autoCompoundMonths ? ` with ${autoCompoundMonths}-month auto-compounding (${totalCycles} cycles)` : ''}. 3% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net: ${firstCyclePrincipalAfterFeeBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
       },
-      fee: investmentFeeUSD,
-      netAmount: investmentAmountAfterFeeUSD
+      fee: firstCycleFeeUSD,
+      netAmount: firstCyclePrincipalAfterFeeUSD
     });
 
-    // Record platform revenue
+    // =============================================
+    // PLATFORM REVENUE (cycle 1 fee)
+    // =============================================
     await PlatformRevenue.create({
       source: 'investment_fee',
-      amount: investmentFeeUSD,
-      amountBTC: investmentFeeBTC,
+      amount: firstCycleFeeUSD,
+      amountBTC: firstCycleFeeBTC,
       currency: 'BTC',
       transactionId: transaction._id,
       investmentId: investment._id,
       userId: userId,
-      description: `3% investment fee for ${plan.name} investment`,
+      description: `3% initiation fee for cycle 1 of ${plan.name} investment`,
       metadata: {
         planName: plan.name,
+        cycle: 1,
+        totalCycles: totalCycles,
+        autoCompoundMonths: autoCompoundMonths || null,
         originalAmountUSD: amount,
         originalAmountBTC: investmentBTCAmount,
-        amountAfterFeeUSD: investmentAmountAfterFeeUSD,
-        amountAfterFeeBTC: investmentAmountAfterFeeBTC,
-        feePercentage: 3,
-        btcPrice: btcPrice
+        amountAfterFeeUSD: firstCyclePrincipalAfterFeeUSD,
+        amountAfterFeeBTC: firstCyclePrincipalAfterFeeBTC,
+        feePercentage: CYCLE_FEE_PERCENT,
+        btcPrice: btcPrice,
+        assignedHashrate: initialHashpower
       }
     });
 
-    // ✅ FIXED: Create user log with correct location object structure
+    // =============================================
+    // USER LOG
+    // =============================================
     const deviceInfo = await getUserDeviceInfo(req);
     await UserLog.create({
       user: userId,
@@ -16167,13 +16456,13 @@ const investment = await Investment.create({
       userAgent: req.headers['user-agent'] || 'Unknown',
       deviceInfo: {
         type: getDeviceType(req),
-        os: { 
-          name: getOSFromUserAgent(req.headers['user-agent']), 
-          version: 'Unknown' 
+        os: {
+          name: getOSFromUserAgent(req.headers['user-agent']),
+          version: 'Unknown'
         },
-        browser: { 
-          name: getBrowserFromUserAgent(req.headers['user-agent']), 
-          version: 'Unknown' 
+        browser: {
+          name: getBrowserFromUserAgent(req.headers['user-agent']),
+          version: 'Unknown'
         },
         platform: req.headers['user-agent'] || 'Unknown',
         language: req.headers['accept-language'] || 'Unknown',
@@ -16202,46 +16491,54 @@ const investment = await Investment.create({
         planName: plan.name,
         investmentAmountUSD: amount,
         investmentAmountBTC: investmentBTCAmount,
-        amountAfterFeeUSD: investmentAmountAfterFeeUSD,
-        amountAfterFeeBTC: investmentAmountAfterFeeBTC,
-        investmentFeeUSD: investmentFeeUSD,
-        investmentFeeBTC: investmentFeeBTC,
-        expectedReturnUSD: expectedReturnUSD,
-        expectedReturnBTC: expectedReturnBTC,
+        amountAfterFeeUSD: firstCyclePrincipalAfterFeeUSD,
+        amountAfterFeeBTC: firstCyclePrincipalAfterFeeBTC,
+        investmentFeeUSD: firstCycleFeeUSD,
+        investmentFeeBTC: firstCycleFeeBTC,
+        expectedReturnUSD: firstCycleReturnUSD,
+        expectedReturnBTC: firstCycleReturnBTC,
         btcPriceAtInvestment: btcPrice,
         duration: plan.duration,
         roiPercentage: plan.percentage,
-        endDate: endDate,
-        balanceTypeUsed: balanceType
+        endDate: firstCycleEndDate,
+        balanceTypeUsed: balanceType,
+        autoCompoundMonths: autoCompoundMonths || null,
+        totalCycles: totalCycles,
+        assignedHashrate: initialHashpower,
+        multiplierCap: multiplierCap
       },
       relatedEntity: investment._id,
       relatedEntityModel: 'Investment'
     });
 
-    // Handle referral commissions
+    // =============================================
+    // REFERRAL COMMISSIONS (unchanged)
+    // =============================================
     await calculateReferralCommissions(investment);
 
-    // Handle direct referral bonus
+    // =============================================
+    // DIRECT REFERRAL BONUS
+    // =============================================
     if (user.referredBy) {
       const referralBonusUSD = (amount * plan.referralBonus) / 100;
       const referralBonusBTC = referralBonusUSD / btcPrice;
-      
+
       const referrer = await User.findById(user.referredBy);
       if (referrer) {
         if (!referrer.balances) {
           referrer.balances = { main: new Map(), active: new Map(), matured: new Map() };
         }
-        const currentReferrerBTC = referrer.balances.main?.get('btc') || 0;
+        if (!referrer.balances.main) referrer.balances.main = new Map();
+        const currentReferrerBTC = referrer.balances.main.get('btc') || 0;
         referrer.balances.main.set('btc', currentReferrerBTC + referralBonusBTC);
         await referrer.save();
-        
+
         console.log(`🎁 Referral bonus: ${referralBonusBTC.toFixed(8)} BTC paid to ${referrer.email}`);
       }
     }
 
     // =============================================
-    // SEND SISTER EMAIL FOR INVESTMENT CREATION
-    // Using direct email sending to match deposit_approved style
+    // SEND CONFIRMATION EMAIL
     // =============================================
     try {
       const getCryptoLogoUrl = (asset) => {
@@ -16255,16 +16552,14 @@ const investment = await Investment.create({
 
       const cryptoLogoUrl = getCryptoLogoUrl('BTC');
       const formattedAmount = amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedInvestmentBTC = investmentAmountAfterFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const formattedInvestmentBTC = firstCyclePrincipalAfterFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedOriginalBTC = investmentBTCAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedFeeUSD = investmentFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedFeeBTC = investmentFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedExpectedReturnUSD = expectedReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedExpectedReturnBTC = expectedReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedNetProfitUSD = netProfitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedNetProfitBTC = netProfitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const formattedFeeUSD = firstCycleFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedFeeBTC = firstCycleFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const formattedExpectedReturnUSD = firstCycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedExpectedReturnBTC = firstCycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedBtcPrice = btcPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedStartDate = new Date().toLocaleString('en-US', {
+      const formattedStartDate = firstCycleStartDate.toLocaleString('en-US', {
         year: 'numeric',
         month: 'long',
         day: 'numeric',
@@ -16273,7 +16568,7 @@ const investment = await Investment.create({
         second: '2-digit',
         timeZoneName: 'short'
       });
-      const formattedEndDate = endDate.toLocaleString('en-US', {
+      const formattedEndDate = firstCycleEndDate.toLocaleString('en-US', {
         year: 'numeric',
         month: 'long',
         day: 'numeric',
@@ -16282,17 +16577,32 @@ const investment = await Investment.create({
         second: '2-digit',
         timeZoneName: 'short'
       });
-      
-      // Get accurate wallet balances from database after save
+
       const newActiveBTCBalance = user.balances.active?.get('btc') || 0;
       const newActiveUSDBalance = user.balances.active?.get('usd') || 0;
       const formattedNewActiveBTC = newActiveBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedNewActiveUSD = newActiveUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-      // Direct email sending using nodemailer to ensure delivery
+      // Build the auto-compound block for the email (only if applicable)
+      const autoCompoundEmailBlock = (autoCompoundMonths && totalCycles > 1)
+        ? `
+          <tr style="border-top: 1px solid #E2E8F0;">
+            <td style="padding: 8px 0;"><strong>Auto-Compound Duration:</strong></td>
+            <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${autoCompoundMonths} month(s)</td>
+          </tr>
+          <tr style="border-top: 1px solid #E2E8F0;">
+            <td style="padding: 8px 0;"><strong>Total Compounding Cycles:</strong></td>
+            <td style="padding: 8px 0; text-align: right; font-weight: bold;">${totalCycles} cycles</td>
+          </tr>
+          <tr style="border-top: 1px solid #E2E8F0;">
+            <td style="padding: 8px 0;"><strong>Per-Cycle Fee:</strong></td>
+            <td style="padding: 8px 0; text-align: right; color: #EF4444;">${CYCLE_FEE_PERCENT}% deducted at start of each cycle</td>
+          </tr>
+        `
+        : '';
+
       const mailTransporter = infoTransporter;
-      
-      // Build the HTML email matching deposit_approved style
+
       const emailHtml = `
         <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
           <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
@@ -16300,7 +16610,7 @@ const investment = await Investment.create({
             <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
             <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
           </div>
-          
+
           <div style="padding: 30px; background: #FFFFFF;">
             <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
               <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
@@ -16310,111 +16620,107 @@ const investment = await Investment.create({
                   <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
               </div>
-              <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;"> Mining Contract Activated!</h2>
-              <p style="color: #065F46; font-size: 13px; margin: 0;">Your mining contract is now active</p>
+              <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
+              <p style="color: #065F46; font-size: 13px; margin: 0;">${autoCompoundMonths ? `Auto-compounding for ${autoCompoundMonths} month(s) - ${totalCycles} cycles` : 'Your mining contract is now active'}</p>
             </div>
-            
+
             <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-            <p style="color: #333333; line-height: 1.6;">Great news! Your Mining contract in the <strong>${plan.name}</strong> plan has been successfully activated and credited to your <strong style="color: #10B981;">Active Wallet</strong>.</p>
-            
+            <p style="color: #333333; line-height: 1.6;">Great news! Your Mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
+
             <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
               <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
                 <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                 <div>
                   <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedInvestmentBTC} BTC</div>
-                  <div style="color: #64748B; font-size: 12px;">≈ $${(investmentAmountAfterFeeUSD).toLocaleString()} USD credited to Active Wallet</div>
+                  <div style="color: #64748B; font-size: 12px;">≈ $${firstCyclePrincipalAfterFeeUSD.toLocaleString()} USD in active mining</div>
                 </div>
               </div>
-              
+
               <table style="width: 100%; border-collapse: collapse;">
                 <tr>
                   <td style="padding: 8px 0;"><strong>Plan Name:</strong></td>
                   <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong> BTC Invested (Gross):</strong></td>
+                  <td style="padding: 8px 0;"><strong>BTC Invested (Gross):</strong></td>
                   <td style="padding: 8px 0; text-align: right;">${formattedOriginalBTC} BTC (≈ $${formattedAmount} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Contract Initiation Fee (3%):</strong></td>
+                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Initiation Fee (Cycle 1, ${CYCLE_FEE_PERCENT}%):</strong></td>
                   <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Net BTC Invested:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${formattedInvestmentBTC} BTC (≈ $${investmentAmountAfterFeeUSD.toLocaleString()} USD)</td>
+                  <td style="padding: 8px 0;"><strong>Net BTC in Mining:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${formattedInvestmentBTC} BTC (≈ $${firstCyclePrincipalAfterFeeUSD.toLocaleString()} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Expected BTC Return at Maturity:</strong></td>
+                  <td style="padding: 8px 0;"><strong>Expected Cycle 1 Return:</strong></td>
                   <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedExpectedReturnBTC} BTC (≈ $${formattedExpectedReturnUSD} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Net BTC Profit Expected:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetProfitBTC} BTC (≈ $${formattedNetProfitUSD} USD)</td>
+                  <td style="padding: 8px 0;"><strong>Return Per Cycle:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; color: #10B981;">+${plan.percentage}%</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>ROI Percentage:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; color: #10B981;">+${plan.percentage}%</strong></td>
+                  <td style="padding: 8px 0;"><strong>Cycle Duration:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${plan.duration} hours</td>
                 </tr>
+                ${autoCompoundEmailBlock}
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Duration:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${plan.duration} hours</strong></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Hashrate (TH/s):</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${plan.duration === 10 ? '68' : plan.duration === 24 ? '110' : plan.duration === 48 ? '150' : plan.duration === 72 ? '234' : '255'} TH/s</strong></td>
+                  <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold;">${initialHashpower} TH/s</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Mining Type:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">SHA-256 ASIC mining</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">SHA-256 ASIC mining</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Start Date:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</strong></td>
+                  <td style="padding: 8px 0;"><strong>Cycle 1 Start:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Expected Maturity:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; color: #F7A600;">${formattedEndDate}</strong></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Wallet Credited:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;"><span style="background: #10B981; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px;">Active Wallet</span></strong></td>
+                  <td style="padding: 8px 0;"><strong>Cycle 1 End:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; color: #F7A600;">${formattedEndDate}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Deducted From:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">${walletName} Wallet</span></strong></td>
+                  <td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">${walletName} Wallet</span></td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>New Active Wallet Balance:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewActiveBTC} BTC (≈ $${formattedNewActiveUSD} USD)</strong></td>
+                  <td style="padding: 8px 0;"><strong>New Active Wallet:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewActiveBTC} BTC (≈ $${formattedNewActiveUSD} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Exchange Rate (BTC/USD):</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">1 BTC = $${formattedBtcPrice}</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">1 BTC = $${formattedBtcPrice}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
                 </tr>
               </table>
             </div>
-            
+
             <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
               <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Mining Information</p>
-              <p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet.</p>
+              ${autoCompoundMonths && totalCycles > 1
+                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will auto-compound for <strong>${totalCycles} cycles</strong> (${autoCompoundMonths} month(s)). At the start of each new cycle, a ${CYCLE_FEE_PERCENT}% initiation fee is deducted from the reinvested principal, and hashpower is recalculated based on the current BTC price. The final proceeds will be credited to your Matured Wallet at the end of the last cycle.</p>`
+                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet.</p>`
+              }
             </div>
-            
+
             <div style="text-align: center; margin: 30px 0;">
               <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Track Your Contract</a>
             </div>
-            
+
             <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedStartDate}</p>
           </div>
-          
+
           <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
             <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
             <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
             <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-              <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | 
+              <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
               <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
             </p>
           </div>
@@ -16424,15 +16730,18 @@ const investment = await Investment.create({
       await mailTransporter.sendMail({
         from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
         to: user.email,
-        subject: ` ✅ Mining Contract Activated  - ₿itHash Capital`,
+        subject: `✅ Mining Contract Activated${autoCompoundMonths ? ` (${autoCompoundMonths}-Month Auto-Compound)` : ''} - ₿itHash Capital`,
         html: emailHtml
       });
-      
+
       console.log(`📧 Investment confirmation email sent to ${user.email}`);
     } catch (emailError) {
       console.error('Failed to send investment email:', emailError);
     }
 
+    // =============================================
+    // RESPONSE
+    // =============================================
     res.status(201).json({
       status: 'success',
       data: {
@@ -16441,12 +16750,20 @@ const investment = await Investment.create({
           plan: plan.name,
           amountUSD: investment.amount,
           amountBTC: investment.amountBTC,
-          investmentFeeUSD: investmentFeeUSD,
-          investmentFeeBTC: investmentFeeBTC,
+          originalAmountUSD: amount,
+          originalAmountBTC: investmentBTCAmount,
+          investmentFeeUSD: firstCycleFeeUSD,
+          investmentFeeBTC: firstCycleFeeBTC,
           expectedReturnUSD: investment.expectedReturn,
           expectedReturnBTC: investment.expectedReturnBTC,
-          netProfitUSD: netProfitUSD,
-          netProfitBTC: netProfitBTC,
+          currentHashrate: initialHashpower,
+          currentCycle: 1,
+          totalCycles: totalCycles,
+          autoCompoundMonths: autoCompoundMonths || null,
+          isAutoCompoundActive: investment.isAutoCompoundActive,
+          compoundMultiplierCap: multiplierCap,
+          cycleDurationHours: plan.duration,
+          firstCycleEndDate: investment.endDate,
           endDate: investment.endDate,
           status: investment.status,
           balanceType: balanceType,
@@ -16454,7 +16771,7 @@ const investment = await Investment.create({
         }
       }
     });
-    
+
   } catch (err) {
     console.error('Investment creation error:', err);
     res.status(500).json({
@@ -16464,13 +16781,14 @@ const investment = await Investment.create({
   }
 });
 
+
 // =============================================
 // REAL-TIME BITCOIN PRICE WITH MULTIPLE API FALLBACKS
 // ALL FALLBACKS FETCH FROM ONLINE APIs - NO HARDCODED VALUES
 // =============================================
 async function getRealTimeBitcoinPrice() {
   const errors = [];
-  
+
   // API 1: CoinGecko
   try {
     const controller = new AbortController();
@@ -16490,7 +16808,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`CoinGecko: ${err.message}`);
   }
-  
+
   // API 2: Binance
   try {
     const controller = new AbortController();
@@ -16511,7 +16829,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Binance: ${err.message}`);
   }
-  
+
   // API 3: Kraken
   try {
     const controller = new AbortController();
@@ -16534,7 +16852,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Kraken: ${err.message}`);
   }
-  
+
   // API 4: CryptoCompare
   try {
     const controller = new AbortController();
@@ -16554,7 +16872,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`CryptoCompare: ${err.message}`);
   }
-  
+
   // API 5: Coinbase
   try {
     const controller = new AbortController();
@@ -16575,7 +16893,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Coinbase: ${err.message}`);
   }
-  
+
   // API 6: KuCoin
   try {
     const controller = new AbortController();
@@ -16596,7 +16914,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`KuCoin: ${err.message}`);
   }
-  
+
   // API 7: Bybit
   try {
     const controller = new AbortController();
@@ -16619,7 +16937,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Bybit: ${err.message}`);
   }
-  
+
   // API 8: OKX
   try {
     const controller = new AbortController();
@@ -16640,7 +16958,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`OKX: ${err.message}`);
   }
-  
+
   // API 9: Huobi
   try {
     const controller = new AbortController();
@@ -16661,7 +16979,7 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Huobi: ${err.message}`);
   }
-  
+
   // API 10: Gemini
   try {
     const controller = new AbortController();
@@ -16682,12 +17000,17 @@ async function getRealTimeBitcoinPrice() {
   } catch (err) {
     errors.push(`Gemini: ${err.message}`);
   }
-  
+
   // If all APIs failed, log error and throw
   console.error('❌ All BTC price APIs failed. Errors:', errors);
   throw new Error('Unable to fetch current BTC price. Please try again later.');
 }
 
+
+// =============================================
+// INVESTMENT MATURITY CRON
+// Handles: cycle completion, auto-compound advance, cap stop, final payout
+// =============================================
 const completeMaturedInvestmentsCron = async () => {
   const startTime = Date.now();
   console.log('🔄 [CRON] Running automatic investment maturity check...');
@@ -16695,7 +17018,7 @@ const completeMaturedInvestmentsCron = async () => {
   try {
     const now = new Date();
 
-    // Find all active investments where endDate has passed
+    // Find active investments where the CURRENT CYCLE's endDate has passed
     const maturedInvestments = await Investment.find({
       status: 'active',
       endDate: { $lte: now }
@@ -16706,139 +17029,252 @@ const completeMaturedInvestmentsCron = async () => {
       return;
     }
 
-    console.log(`🎯 [CRON] Found ${maturedInvestments.length} matured investment(s) to complete`);
+    console.log(`🎯 [CRON] Found ${maturedInvestments.length} matured cycle(s) to process`);
 
+    let advancedCount = 0;
     let completedCount = 0;
     let failedCount = 0;
 
     for (const investment of maturedInvestments) {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
       try {
         const userId = investment.user._id;
-        const user = await User.findById(userId);
+        const user = await User.findById(userId).session(session);
 
         if (!user) {
-          console.error(`❌ [CRON] User not found for investment ${investment._id}`);
-          failedCount++;
-          continue;
+          throw new Error('User not found');
         }
 
-        // Get current BTC price
+        const plan = investment.plan;
+        if (!plan) {
+          throw new Error('Plan not found');
+        }
+
+        // Fetch fresh BTC price (internal only)
         let currentBTCPrice;
         try {
           currentBTCPrice = await getRealTimeBitcoinPrice();
           console.log(`📊 [CRON] BTC price for ${investment._id}: $${currentBTCPrice}`);
         } catch (priceError) {
-          console.error(`❌ [CRON] Failed to get BTC price for ${investment._id}:`, priceError.message);
-          currentBTCPrice = investment.btcPriceAtInvestment || 50000;
-          console.log(`⚠️ [CRON] Using fallback BTC price: $${currentBTCPrice}`);
+          console.error(`❌ [CRON] Failed to fetch BTC price: ${priceError.message}`);
+          throw new Error('Could not fetch BTC price');
         }
 
-        // CRITICAL: Use existing fields with fallbacks
-        const principalBTC = investment.amountBTC || 0;
-        const principalUSD = investment.amount || 0;
-        const expectedReturnUSD = investment.expectedReturn || principalUSD;
-        const expectedReturnBTC = investment.expectedReturnBTC || (expectedReturnUSD / currentBTCPrice);
-        
-        // Calculate total return
-        const totalReturnBTC = expectedReturnBTC;
-        const totalReturnUSD = expectedReturnUSD;
-        const profitBTC = totalReturnBTC - principalBTC;
-        const profitUSD = totalReturnUSD - principalUSD;
-
-        console.log(`📊 [CRON] Investment ${investment._id}:`);
-        console.log(`   Principal: ${principalBTC} BTC ($${principalUSD})`);
-        console.log(`   Expected Return: ${totalReturnBTC} BTC ($${totalReturnUSD})`);
-        console.log(`   Profit: ${profitBTC} BTC ($${profitUSD})`);
-
-        // Initialize balances Maps
-        if (!user.balances) {
-          user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-        }
-        if (!user.balances.active) user.balances.active = new Map();
-        if (!user.balances.matured) user.balances.matured = new Map();
-
-        // FIXED: CORRECTLY check active balance using Map.get()
-        const currentActiveBTC = user.balances.active.get('btc') || 0;
-        
-        // Check if there's enough balance in active wallet (with small tolerance for floating point)
-        if (currentActiveBTC < principalBTC - 0.00000001) {
-          console.error(`❌ [CRON] Insufficient active BTC balance for ${investment._id}. Required: ${principalBTC}, Available: ${currentActiveBTC}`);
-          failedCount++;
-          continue;
+        // ---- Process the just-completed cycle ----
+        const cycleIdx = (investment.currentCycle || 1) - 1;
+        const currentCycle = investment.cycleHistory[cycleIdx];
+        if (!currentCycle) {
+          throw new Error(`Cycle history mismatch: no entry at index ${cycleIdx}`);
         }
 
-        // CRITICAL: Use session for atomic operation
-        const session = await mongoose.startSession();
-        session.startTransaction();
+        const planReturnDecimal = plan.percentage / 100;
+        const cycleFeeUSD = currentCycle.principalUSD * (CYCLE_FEE_PERCENT / 100);
+        const cyclePrincipalAfterFeeUSD = currentCycle.principalUSD - cycleFeeUSD;
+        const cycleReturnUSD = cyclePrincipalAfterFeeUSD * (1 + planReturnDecimal);
+        const cycleReturnBTC = cycleReturnUSD / currentBTCPrice;
 
-        try {
-          // FIXED: Use Map.set() to update active wallet
-          const newActiveBTC = currentActiveBTC - principalBTC;
+        // Finalize the cycle record
+        currentCycle.returnUSD = cycleReturnUSD;
+        currentCycle.returnBTC = cycleReturnBTC;
+        currentCycle.feeUSD = cycleFeeUSD;
+        currentCycle.feeBTC = cycleFeeUSD / currentBTCPrice;
+        currentCycle.btcPriceAtEnd = currentBTCPrice;
+        currentCycle.status = 'completed';
+
+        // Accumulate returns
+        investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleReturnUSD;
+        investment.cumulativeReturnBTC = (investment.cumulativeReturnBTC || 0) + cycleReturnBTC;
+
+        console.log(`📊 [CRON] Investment ${investment._id} cycle ${investment.currentCycle}/${investment.totalCycles}:`);
+        console.log(`   Principal: ${currentCycle.principalBTC.toFixed(8)} BTC ($${currentCycle.principalUSD.toFixed(2)})`);
+        console.log(`   Fee (${CYCLE_FEE_PERCENT}%): ${cycleFeeUSD.toFixed(2)} USD`);
+        console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
+        console.log(`   Cumulative Return: ${investment.cumulativeReturnBTC.toFixed(8)} BTC ($${investment.cumulativeReturnUSD.toFixed(2)})`);
+
+        // ---- Decide: advance, cap-stop, or final payout ----
+        const currentMultiplier = investment.cumulativeReturnUSD / investment.originalAmount;
+        const capReached = currentMultiplier >= investment.compoundMultiplierCap;
+        const moreCyclesRemaining = investment.isAutoCompoundActive && investment.currentCycle < investment.totalCycles;
+
+        if (moreCyclesRemaining && !capReached) {
+          // ===================================================
+          // START THE NEXT CYCLE
+          // ===================================================
+          investment.currentCycle += 1;
+          const newCycleNumber = investment.currentCycle;
+
+          const newPrincipalUSD = cycleReturnUSD;
+          const newPrincipalBTC = cycleReturnBTC;
+
+          // Recalculate hashpower for the new cycle using fresh BTC price
+          const newHashpower = calculateHashpower(
+            newPrincipalUSD,
+            plan.percentage,
+            plan.duration,
+            currentBTCPrice
+          );
+          investment.currentHashrate = newHashpower;
+          investment.hashrateHistory.push({
+            cycleNumber: newCycleNumber,
+            hashrate: newHashpower,
+            btcPriceAtCalculation: currentBTCPrice,
+            calculatedAt: now
+          });
+
+          const newCycleStart = now;
+          const newCycleEnd = new Date(newCycleStart.getTime() + plan.duration * 60 * 60 * 1000);
+          investment.endDate = newCycleEnd;
+          investment.expectedReturn = newPrincipalUSD * (1 + planReturnDecimal);
+          investment.expectedReturnBTC = newPrincipalBTC * (1 + planReturnDecimal);
+
+          // Add the new cycle to history
+          investment.cycleHistory.push({
+            cycleNumber: newCycleNumber,
+            principalUSD: newPrincipalUSD,
+            principalBTC: newPrincipalBTC,
+            startDate: newCycleStart,
+            endDate: newCycleEnd,
+            returnUSD: 0,
+            returnBTC: 0,
+            feeUSD: 0,
+            feeBTC: 0,
+            btcPriceAtStart: currentBTCPrice,
+            status: 'active'
+          });
+
+          // Record the new cycle's fee (already deducted implicitly in the principal
+          // chain — recorded for accounting only)
+          const newFeeUSD = newPrincipalUSD * (CYCLE_FEE_PERCENT / 100);
+          const newFeeBTC = newPrincipalBTC * (CYCLE_FEE_PERCENT / 100);
+
+          const autoTxRef = `AUTO-COMP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+          const [autoTx] = await Transaction.create([{
+            user: userId,
+            type: 'investment',
+            amount: newPrincipalUSD,
+            amountBTC: newPrincipalBTC,
+            currency: 'BTC',
+            status: 'completed',
+            method: 'INTERNAL',
+            reference: autoTxRef,
+            details: {
+              investmentId: investment._id,
+              cycle: newCycleNumber,
+              totalCycles: investment.totalCycles,
+              planName: plan.name,
+              transactionType: 'debit',
+              assignedHashrate: newHashpower,
+              description: `Auto-compound cycle ${newCycleNumber} of ${investment.totalCycles}: reinvesting ${newPrincipalBTC.toFixed(8)} BTC (≈ $${newPrincipalUSD.toLocaleString()}). Assigned hashpower: ${newHashpower} TH/s.`
+            },
+            fee: newFeeUSD,
+            netAmount: newPrincipalUSD - newFeeUSD
+          }], { session });
+
+          await PlatformRevenue.create([{
+            source: 'investment_fee',
+            amount: newFeeUSD,
+            amountBTC: newFeeBTC,
+            currency: 'BTC',
+            transactionId: autoTx._id,
+            investmentId: investment._id,
+            userId: userId,
+            description: `3% auto-compound fee for cycle ${newCycleNumber} of ${plan.name} investment`,
+            metadata: {
+              planName: plan.name,
+              cycle: newCycleNumber,
+              totalCycles: investment.totalCycles,
+              btcPrice: currentBTCPrice,
+              assignedHashrate: newHashpower
+            }
+          }], { session });
+
+          // Auto-compound does not touch the user's wallet — the reinvestment
+          // stays inside the contract until the final cycle.
+          await investment.save({ session });
+          await session.commitTransaction();
+
+          console.log(`✅ [CRON] Investment ${investment._id} advanced to cycle ${newCycleNumber}/${investment.totalCycles} (hashpower: ${newHashpower} TH/s)`);
+          advancedCount++;
+
+        } else {
+          // ===================================================
+          // FINAL PAYOUT (single cycle, all cycles done, or cap reached)
+          // ===================================================
+          const reason = capReached
+            ? `multiplier cap reached (${currentMultiplier.toFixed(2)}x ≥ ${investment.compoundMultiplierCap}x)`
+            : (investment.totalCycles > 1 ? 'all cycles completed' : 'single cycle completed');
+
+          console.log(`[CRON] Investment ${investment._id} completing: ${reason}`);
+
+          investment.status = 'completed';
+          investment.isAutoCompoundActive = false;
+          investment.completionDate = now;
+          investment.actualReturn = cycleReturnUSD - currentCycle.principalUSD;
+          investment.actualReturnBTC = cycleReturnBTC - currentCycle.principalBTC;
+          investment.btcPriceAtCompletion = currentBTCPrice;
+
+          // Credit the return to the user's matured wallet
+          if (!user.balances) {
+            user.balances = { main: new Map(), active: new Map(), matured: new Map() };
+          }
+          if (!user.balances.matured) user.balances.matured = new Map();
+
+          const currentMaturedBTC = user.balances.matured.get('btc') || 0;
+          user.balances.matured.set('btc', currentMaturedBTC + cycleReturnBTC);
+
+          const currentMaturedUSD = user.balances.matured.get('usd') || 0;
+          user.balances.matured.set('usd', currentMaturedUSD + cycleReturnUSD);
+
+          // Remove the fee-adjusted principal from the active wallet (contract is closing)
+          const currentActiveBTC = user.balances.active?.get('btc') || 0;
+          const newActiveBTC = currentActiveBTC - currentCycle.principalBTC;
           if (newActiveBTC <= 0.00000001) {
             user.balances.active.delete('btc');
           } else {
             user.balances.active.set('btc', newActiveBTC);
           }
 
-          // FIXED: Use Map.set() to update matured wallet
-          const currentMaturedBTC = user.balances.matured.get('btc') || 0;
-          user.balances.matured.set('btc', currentMaturedBTC + totalReturnBTC);
-
-          // Update USD equivalents using Map.set()
-          const currentActiveUSD = user.balances.active.get('usd') || 0;
-          if (currentActiveUSD - principalUSD <= 0.01) {
+          const currentActiveUSD = user.balances.active?.get('usd') || 0;
+          const newActiveUSD = currentActiveUSD - currentCycle.principalUSD;
+          if (newActiveUSD <= 0.01) {
             user.balances.active.delete('usd');
           } else {
-            user.balances.active.set('usd', currentActiveUSD - principalUSD);
+            user.balances.active.set('usd', newActiveUSD);
           }
 
-          const currentMaturedUSD = user.balances.matured.get('usd') || 0;
-          user.balances.matured.set('usd', currentMaturedUSD + totalReturnUSD);
-
-          // Update investment record
-          investment.status = 'completed';
-          investment.completionDate = now;
-          investment.actualReturn = profitUSD;
-          investment.actualReturnBTC = profitBTC;
-          investment.btcPriceAtCompletion = currentBTCPrice;
-
           await user.save({ session });
-          await investment.save({ session });
 
-          // Create transaction record with BTC AMOUNT IN DESCRIPTION so user can see it
-          const transactionRef = `AUTO-MAT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          
+          const finalTxRef = `FINAL-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
           await Transaction.create([{
             user: userId,
             type: 'interest',
-            amount: profitUSD,
-            amountBTC: profitBTC,
+            amount: cycleReturnUSD,
+            amountBTC: cycleReturnBTC,
             currency: 'BTC',
             status: 'completed',
             method: 'INTERNAL',
-            reference: transactionRef,
+            reference: finalTxRef,
             details: {
               investmentId: investment._id,
-              planName: investment.plan?.name || 'Unknown Plan',
-              principalUSD: principalUSD,
-              principalBTC: principalBTC,
-              interestUSD: profitUSD,
-              interestBTC: profitBTC,
-              btcPriceAtStart: investment.btcPriceAtInvestment,
-              btcPriceAtCompletion: currentBTCPrice,
+              planName: plan.name,
+              finalCycle: investment.currentCycle,
+              totalCycles: investment.totalCycles,
+              autoCompoundMonths: investment.autoCompoundMonths || null,
+              capReached: capReached,
+              cumulativeReturnUSD: investment.cumulativeReturnUSD,
+              cumulativeReturnBTC: investment.cumulativeReturnBTC,
               transactionType: 'credit',
-              completedBy: 'system_cron',
-              description: `Mining contract matured! You invested ${principalBTC.toFixed(8)} BTC. You received ${totalReturnBTC.toFixed(8)} BTC (${profitBTC.toFixed(8)} BTC profit). BTC price at investment: $${investment.btcPriceAtInvestment.toLocaleString()}, at maturity: $${currentBTCPrice.toLocaleString()}.`
+              description: capReached
+                ? `Auto-compound stopped early: multiplier cap of ${investment.compoundMultiplierCap}x reached. Final payout: ${cycleReturnBTC.toFixed(8)} BTC (≈ $${cycleReturnUSD.toLocaleString()}).`
+                : `Final payout for completed ${plan.name} contract after ${investment.currentCycle} cycle(s). Return: ${cycleReturnBTC.toFixed(8)} BTC (≈ $${cycleReturnUSD.toLocaleString()}).`
             },
             fee: 0,
-            netAmount: profitUSD,
-            netAmountBTC: profitBTC,
-            exchangeRateAtTime: currentBTCPrice,
-            processedAt: new Date(),
-            processedBy: null
+            netAmount: cycleReturnUSD,
+            exchangeRateAtTime: currentBTCPrice
           }], { session });
 
-          // Create user log
           await UserLog.create([{
             user: userId,
             username: user.email,
@@ -16862,17 +17298,17 @@ const completeMaturedInvestmentsCron = async () => {
             },
             status: 'success',
             metadata: {
-              planName: investment.plan?.name,
-              originalAmountUSD: investment.originalAmount || principalUSD,
-              originalAmountBTC: investment.originalAmountBTC || principalBTC,
-              amountAfterFeeUSD: principalUSD,
-              amountAfterFeeBTC: principalBTC,
-              investmentFeeUSD: investment.investmentFee || 0,
-              investmentFeeBTC: investment.investmentFeeBTC || 0,
-              expectedReturnBTC: expectedReturnBTC,
-              actualReturnBTC: totalReturnBTC,
-              profitBTC: profitBTC,
-              profitUSD: profitUSD,
+              planName: plan.name,
+              originalAmountUSD: investment.originalAmount,
+              originalAmountBTC: investment.originalAmountBTC,
+              totalCycles: investment.totalCycles,
+              completedCycles: investment.currentCycle,
+              autoCompoundMonths: investment.autoCompoundMonths || null,
+              capReached: capReached,
+              finalReturnBTC: cycleReturnBTC,
+              finalReturnUSD: cycleReturnUSD,
+              cumulativeReturnBTC: investment.cumulativeReturnBTC,
+              cumulativeReturnUSD: investment.cumulativeReturnUSD,
               btcPriceAtStart: investment.btcPriceAtInvestment,
               btcPriceAtCompletion: currentBTCPrice,
               startDate: investment.startDate,
@@ -16884,13 +17320,14 @@ const completeMaturedInvestmentsCron = async () => {
             relatedEntityModel: 'Investment'
           }], { session });
 
+          await investment.save({ session });
           await session.commitTransaction();
 
-          console.log(`✅ [CRON] Completed investment ${investment._id} for user ${user.email}. Return: ${totalReturnBTC.toFixed(8)} BTC ($${totalReturnUSD.toFixed(2)} USD)`);
+          console.log(`✅ [CRON] Investment ${investment._id} completed. Payout: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
           completedCount++;
 
           // =============================================
-          // SEND EMAIL FOR INVESTMENT MATURATION
+          // SEND MATURITY EMAIL
           // =============================================
           try {
             const getCryptoLogoUrl = (asset) => {
@@ -16903,15 +17340,12 @@ const completeMaturedInvestmentsCron = async () => {
             };
 
             const cryptoLogoUrl = getCryptoLogoUrl('BTC');
-            const formattedPrincipalUSD = principalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedPrincipalBTC = principalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedReturnUSD = totalReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedReturnBTC = totalReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedProfitUSD = profitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedProfitBTC = profitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedStartPrice = (investment.btcPriceAtInvestment || 50000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedPrincipalUSD = currentCycle.principalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedPrincipalBTC = currentCycle.principalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+            const formattedReturnUSD = cycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedReturnBTC = cycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+            const formattedStartPrice = (investment.btcPriceAtInvestment || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const formattedEndPrice = currentBTCPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const priceChangePercent = ((currentBTCPrice - (investment.btcPriceAtInvestment || 50000)) / (investment.btcPriceAtInvestment || 50000) * 100).toFixed(2);
             const formattedCompletionDate = now.toLocaleString('en-US', {
               year: 'numeric',
               month: 'long',
@@ -16921,15 +17355,36 @@ const completeMaturedInvestmentsCron = async () => {
               second: '2-digit',
               timeZoneName: 'short'
             });
-            
-            const newMaturedBTCBalance = (user.balances.matured?.get('btc') || 0);
-            // ✅ FIX: Calculate USD from BTC balance using current price
-            const newMaturedUSDBalance = newMaturedBTCBalance * currentBTCPrice;
+
+            const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
             const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+            // Auto-compound summary block (only if applicable)
+            const compoundSummaryBlock = (investment.autoCompoundMonths && investment.totalCycles > 1)
+              ? `
+                <tr style="border-top: 1px solid #E2E8F0;">
+                  <td style="padding: 8px 0;"><strong>Auto-Compound Duration:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${investment.autoCompoundMonths} month(s) (${investment.totalCycles} cycles)</td>
+                </tr>
+                <tr style="border-top: 1px solid #E2E8F0;">
+                  <td style="padding: 8px 0;"><strong>Cycles Completed:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${investment.currentCycle} of ${investment.totalCycles}</td>
+                </tr>
+                <tr style="border-top: 1px solid #E2E8F0;">
+                  <td style="padding: 8px 0;"><strong>Cumulative Return (All Cycles):</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${investment.cumulativeReturnBTC.toFixed(8)} BTC (≈ $${investment.cumulativeReturnUSD.toLocaleString()})</td>
+                </tr>
+                ${capReached ? `
+                <tr style="border-top: 1px solid #E2E8F0;">
+                  <td style="padding: 8px 0;"><strong>Status:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">Stopped early — multiplier cap of ${investment.compoundMultiplierCap}x reached</td>
+                </tr>
+                ` : ''}
+              `
+              : '';
 
             const mailTransporter = infoTransporter;
-            
+
             const emailHtml = `
               <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
                 <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
@@ -16937,7 +17392,7 @@ const completeMaturedInvestmentsCron = async () => {
                   <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
                   <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
                 </div>
-                
+
                 <div style="padding: 30px; background: #FFFFFF;">
                   <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
                     <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
@@ -16948,12 +17403,12 @@ const completeMaturedInvestmentsCron = async () => {
                       </svg>
                     </div>
                     <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">CONTRACT MATURED!</h2>
-                    <p style="color: #065F46; font-size: 13px; margin: 0;">Your mining contract has successfully matured</p>
+                    <p style="color: #065F46; font-size: 13px; margin: 0;">Your mining contract has successfully completed</p>
                   </div>
-                  
+
                   <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                  <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${investment.plan?.name || 'Investment'}</strong> mining contract has matured. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
-                  
+                  <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
+
                   <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
                     <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
                       <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
@@ -16962,68 +17417,61 @@ const completeMaturedInvestmentsCron = async () => {
                         <div style="color: #64748B; font-size: 12px;">≈ $${formattedReturnUSD} USD credited to Matured Wallet</div>
                       </div>
                     </div>
-                    
+
                     <table style="width: 100%; border-collapse: collapse;">
                       <tr>
                         <td style="padding: 8px 0;"><strong>Plan Name:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${investment.plan?.name || 'Investment Plan'}</td>
+                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>BTC You Invested:</strong></td>
+                        <td style="padding: 8px 0;"><strong>Final Cycle Principal:</strong></td>
                         <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Total BTC Return:</strong></td>
+                        <td style="padding: 8px 0;"><strong>Final Cycle Return:</strong></td>
                         <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedReturnBTC} BTC (≈ $${formattedReturnUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Net BTC Profit Earned:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #10B981;">+ ${formattedProfitBTC} BTC (≈ $${formattedProfitUSD} USD)</td>
+                        <td style="padding: 8px 0;"><strong>ROI Per Cycle:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #10B981;">+${investment.returnPercentage || 0}%</td>
                       </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>ROI Percentage:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #10B981;">+${investment.returnPercentage || 0}%</strong></td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Duration:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${investment.plan?.duration || 0} hours</strong></td>
-                      </tr>
+                      ${compoundSummaryBlock}
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>BTC Price at Investment:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">$${formattedStartPrice}</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">$${formattedStartPrice}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>BTC Price at Maturity:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">$${formattedEndPrice} (${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent}%)</strong></td>
+                        <td style="padding: 8px 0;"><strong>BTC Price at Completion:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">$${formattedEndPrice}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</strong></td>
+                        <td style="padding: 8px 0;"><strong>New Matured Wallet:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC</td>
                       </tr>
                     </table>
                   </div>
-                  
+
                   <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;"> Funds Available in Matured Wallet</p>
+                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
                     <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
                   </div>
-                  
+
                   <div style="text-align: center; margin: 30px 0;">
                     <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
                   </div>
-                  
+
                   <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
                 </div>
-                
+
                 <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
                   <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
                   <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
                   <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | 
+                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
                     <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
                   </p>
                 </div>
@@ -17033,16 +17481,18 @@ const completeMaturedInvestmentsCron = async () => {
             await mailTransporter.sendMail({
               from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
               to: user.email,
-              subject: `Congratulations!!!Your Mining Rewards Are Here - ₿itHash Capital`,
+              subject: capReached
+                ? `Mining Contract Completed (Cap Reached) - ₿itHash Capital`
+                : `Congratulations! Your Mining Rewards Are Here - ₿itHash Capital`,
               html: emailHtml
             });
-            
-            console.log(`📧 [CRON] Investment maturity email sent to ${user.email}`);
+
+            console.log(`📧 [CRON] Maturity email sent to ${user.email}`);
           } catch (emailError) {
-            console.error(`❌ [CRON] Failed to send investment maturity email for ${investment._id}:`, emailError);
+            console.error(`❌ [CRON] Failed to send maturity email for ${investment._id}:`, emailError);
           }
 
-          // Emit real-time balance update via Socket.IO
+          // Emit real-time balance update
           const io = global.io;
           if (io) {
             io.to(`user_${userId}`).emit('balance_update', {
@@ -17050,25 +17500,31 @@ const completeMaturedInvestmentsCron = async () => {
               active: user.balances.active?.get('usd') || 0,
               matured: user.balances.matured?.get('usd') || 0
             });
-          }
 
-        } catch (transactionError) {
-          await session.abortTransaction();
-          console.error(`❌ [CRON] Transaction failed for investment ${investment._id}:`, transactionError);
-          failedCount++;
-        } finally {
-          session.endSession();
+            io.to(`user_${userId}`).emit('investment_update', {
+              investmentId: investment._id,
+              status: 'completed',
+              cycle: investment.currentCycle,
+              totalCycles: investment.totalCycles,
+              capReached: capReached,
+              timestamp: Date.now()
+            });
+          }
         }
 
       } catch (investmentError) {
-        console.error(`❌ [CRON] Error processing investment ${investment._id}:`, investmentError);
+        await session.abortTransaction();
+        console.error(`❌ [CRON] Transaction failed for investment ${investment._id}:`, investmentError);
         failedCount++;
+      } finally {
+        session.endSession();
       }
     }
 
     const elapsedTime = Date.now() - startTime;
     console.log(`📊 [CRON] Investment maturity check completed in ${elapsedTime}ms`);
-    console.log(`   ✅ Completed: ${completedCount}`);
+    console.log(`   ✅ Advanced to next cycle: ${advancedCount}`);
+    console.log(`   ✅ Completed (final payout): ${completedCount}`);
     console.log(`   ❌ Failed: ${failedCount}`);
 
   } catch (error) {
@@ -17076,60 +17532,61 @@ const completeMaturedInvestmentsCron = async () => {
   }
 };
 
+
 // =============================================
 // SCHEDULE INVESTMENT MATURITY CRON JOB - EVERY 10 SECONDS
 // WITH USER DETECTION LOGS
 // =============================================
-
-// Schedule the cron job to run every 10 seconds
 cron.schedule('*/10 * * * * *', async () => {
   const runTime = new Date().toISOString();
   console.log(`\n${'='.repeat(70)}`);
   console.log(`⏰ [CRON SCHEDULER] Investment maturity check STARTED at ${runTime}`);
   console.log(`⏰ [CRON SCHEDULER] Next check scheduled in 10 seconds`);
   console.log(`${'='.repeat(70)}`);
-  
+
   try {
-    // Find matured investments first to log which users were found
+    // Find matured cycles first to log which users were found
     const now = new Date();
     const maturedInvestments = await Investment.find({
       status: 'active',
       endDate: { $lte: now }
     }).populate('user plan');
-    
+
     if (maturedInvestments.length > 0) {
-      console.log(`\n🔍 [CRON SCHEDULER] FOUND ${maturedInvestments.length} USER(S) WITH MATURED INVESTMENTS:`);
+      console.log(`\n🔍 [CRON SCHEDULER] FOUND ${maturedInvestments.length} USER(S) WITH MATURED CYCLES:`);
       console.log(`${'─'.repeat(70)}`);
-      
+
       for (const investment of maturedInvestments) {
         const userEmail = investment.user?.email || 'Unknown User';
         const userName = investment.user ? `${investment.user.firstName || ''} ${investment.user.lastName || ''}`.trim() || 'Unknown' : 'Unknown';
         const planName = investment.plan?.name || 'Unknown Plan';
-        const investmentAmount = investment.amount || 0;
-        const expectedReturn = investment.expectedReturn || 0;
-        
+        const cycleNum = investment.currentCycle || 1;
+        const totalCycles = investment.totalCycles || 1;
+        const isAuto = investment.isAutoCompoundActive && totalCycles > 1;
+
         console.log(`\n👤 USER FOUND: ${userEmail} (${userName})`);
         console.log(`   ├─ Investment ID: ${investment._id}`);
         console.log(`   ├─ Plan: ${planName}`);
-        console.log(`   ├─ BTC Invested: ${investment.amountBTC?.toFixed(8) || '0'} BTC`);
-        console.log(`   ├─ Expected BTC Return: ${investment.expectedReturnBTC?.toFixed(8) || '0'} BTC`);
-        console.log(`   ├─ Profit BTC: ${((investment.expectedReturnBTC || 0) - (investment.amountBTC || 0)).toFixed(8)} BTC`);
-        console.log(`   └─ End Date: ${investment.endDate}`);
+        console.log(`   ├─ Cycle: ${cycleNum} of ${totalCycles} ${isAuto ? '(auto-compounding)' : '(single cycle)'}`);
+        console.log(`   ├─ Current Hashpower: ${investment.currentHashrate || 0} TH/s`);
+        console.log(`   ├─ Cycle Principal: ${investment.amountBTC?.toFixed(8) || '0'} BTC`);
+        console.log(`   ├─ Expected Cycle Return: ${investment.expectedReturnBTC?.toFixed(8) || '0'} BTC`);
+        console.log(`   └─ Cycle End Date: ${investment.endDate}`);
       }
       console.log(`\n${'─'.repeat(70)}`);
-      console.log(`🔄 [CRON SCHEDULER] Processing ${maturedInvestments.length} matured investment(s)...\n`);
+      console.log(`🔄 [CRON SCHEDULER] Processing ${maturedInvestments.length} matured cycle(s)...\n`);
     } else {
-      console.log(`📭 [CRON SCHEDULER] No users with matured investments found at ${runTime}`);
+      console.log(`📭 [CRON SCHEDULER] No matured investment cycles found at ${runTime}`);
     }
-    
-    // Run the actual cron job to process them
+
+    // Run the actual cron job
     await completeMaturedInvestmentsCron();
-    
+
     const endTime = new Date().toISOString();
     console.log(`✅ [CRON SCHEDULER] Investment maturity check COMPLETED at ${endTime}`);
     console.log(`✅ [CRON SCHEDULER] Duration: ${Date.now() - new Date(runTime).getTime()}ms`);
     console.log(`${'='.repeat(70)}\n`);
-    
+
   } catch (error) {
     console.error(`❌ [CRON SCHEDULER] Investment maturity check FAILED at ${new Date().toISOString()}`);
     console.error(`❌ [CRON SCHEDULER] Error:`, error.message);
@@ -17138,9 +17595,8 @@ cron.schedule('*/10 * * * * *', async () => {
 });
 
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
-console.log('📊 The system will log which users have matured investments at each check');
-console.log('⏰ First check will run immediately when the schedule triggers\n');
-
+console.log('📊 The system will log which users have matured cycles at each check');
+console.log('⏰ Handles single-cycle contracts, auto-compounding cycles, and multiplier caps\n');
 
 
 
@@ -20183,15 +20639,14 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 // =============================================
-// CLOUD MINING HASHRATE PLANS ENDPOINT - REWRITTEN
+// CLOUD MINING HASHRATE PLANS ENDPOINT
+// User-facing only — internal mining formulas are NOT exposed.
 // =============================================
-
 app.get('/api/plans', async (req, res) => {
     try {
         const plans = await Plan.find({ isActive: true }).lean();
-        
+
         if (!plans || plans.length === 0) {
             return res.status(200).json({
                 status: 'success',
@@ -20207,12 +20662,14 @@ app.get('/api/plans', async (req, res) => {
                         maturedBalance: { usd: 0 },
                         totalPortfolio: { usd: 0 }
                     },
-                    estimatedReturns: {}
+                    autoCompoundOptions: []
                 }
             });
         }
 
-        // Get BTC price
+        // =============================================
+        // FETCH BTC PRICE (INTERNAL — used only for user-facing BTC conversions)
+        // =============================================
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -20221,7 +20678,9 @@ app.get('/api/plans', async (req, res) => {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
 
-        // Get user context
+        // =============================================
+        // USER CONTEXT
+        // =============================================
         let userContext = {
             isLoggedIn: false,
             canRent: false,
@@ -20229,26 +20688,28 @@ app.get('/api/plans', async (req, res) => {
             hasRecentTransaction: false,
             mainBalance: { usd: 0 },
             maturedBalance: { usd: 0 },
-            totalPortfolio: { usd: 0 }
+            totalPortfolio: { usd: 0 },
+            activeInvestmentsByPlan: {}
         };
 
         const token = req.headers.authorization?.split(' ')[1] || req.cookies?.jwt;
-        
+
         if (token) {
             try {
                 const decoded = verifyJWT(token);
                 const user = await User.findById(decoded.id)
                     .select('balances kycStatus firstName lastName email isVerified');
-                
+
                 if (user) {
-                    const kycVerified = user.kycStatus?.identity === 'verified' && 
-                                     user.kycStatus?.address === 'verified' &&
-                                     user.kycStatus?.facial === 'verified';
-                    
+                    const kycVerified =
+                        user.kycStatus?.identity === 'verified' &&
+                        user.kycStatus?.address === 'verified' &&
+                        user.kycStatus?.facial === 'verified';
+
                     const balances = await calculateRealWalletBalances(user);
                     const mainBalanceUSD = balances.mainUSD || 0;
                     const maturedBalanceUSD = balances.maturedUSD || 0;
-                    
+
                     const thirtyDaysAgo = new Date();
                     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
                     const recentTx = await Transaction.findOne({
@@ -20258,7 +20719,24 @@ app.get('/api/plans', async (req, res) => {
                         createdAt: { $gte: thirtyDaysAgo }
                     });
                     const hasRecentTransaction = !!recentTx;
-                    
+
+                    // Look up active investments so we can lock plans the user is already in
+                    const activeInvestments = await Investment.find({
+                        user: user._id,
+                        status: 'active'
+                    }).select('plan currentCycle totalCycles isAutoCompoundActive endDate').lean();
+
+                    const activeInvestmentsByPlan = {};
+                    for (const inv of activeInvestments) {
+                        const planIdStr = inv.plan.toString();
+                        activeInvestmentsByPlan[planIdStr] = {
+                            currentCycle: inv.currentCycle || 1,
+                            totalCycles: inv.totalCycles || 1,
+                            isAutoCompoundActive: !!inv.isAutoCompoundActive,
+                            endDate: inv.endDate
+                        };
+                    }
+
                     userContext = {
                         isLoggedIn: true,
                         firstName: user.firstName,
@@ -20270,7 +20748,8 @@ app.get('/api/plans', async (req, res) => {
                         maturedBalance: { usd: maturedBalanceUSD },
                         totalPortfolio: { usd: mainBalanceUSD + maturedBalanceUSD },
                         hasRecentTransaction: hasRecentTransaction,
-                        canRent: kycVerified && hasRecentTransaction
+                        canRent: kycVerified && hasRecentTransaction,
+                        activeInvestmentsByPlan: activeInvestmentsByPlan
                     };
                 }
             } catch (authErr) {
@@ -20278,110 +20757,62 @@ app.get('/api/plans', async (req, res) => {
             }
         }
 
-        // Enhanced plans
+        // =============================================
+        // BUILD ENHANCED PLANS (USER-FACING ONLY)
+        // =============================================
         const enhancedPlans = plans.map((plan) => {
             const minAmountUSD = plan.minAmount || 0;
             const maxAmountUSD = plan.maxAmount || 0;
             const percentage = plan.percentage || 0;
             const durationHours = plan.duration || 0;
-            const hashrate = plan.hashrate || 0;
             const planName = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
-            
-            // Calculate BTC amounts
+
+            // BTC amounts at the current price (user-facing)
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
             const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
-            
-            const durationDays = durationHours / 24;
-            const dailyMiningPercentage = durationDays > 0 ? percentage / durationDays : percentage;
-            
-            const dailyMiningMin = minAmountUSD * (dailyMiningPercentage / 100);
-            const dailyMiningMax = maxAmountUSD * (dailyMiningPercentage / 100);
-            const dailyMiningBTC = btcPrice > 0 ? dailyMiningMin / btcPrice : 0;
-            
-            // =============================================
-            // PLAN TIER DETECTION - UPDATED
-            // =============================================
+
+            // Per-cycle return (user-facing, based on the plan's advertised %)
+            const minCycleReturnUSD = minAmountUSD * (percentage / 100);
+            const maxCycleReturnUSD = maxAmountUSD * (percentage / 100);
+            const minCycleReturnBTC = btcPrice > 0 ? minCycleReturnUSD / btcPrice : 0;
+            const maxCycleReturnBTC = btcPrice > 0 ? maxCycleReturnUSD / btcPrice : 0;
+
+            // ---- Plan tier / badge detection ----
             const planNameLower = planName.toLowerCase();
             let tierKey = 'standard';
             let badge = 'Standard';
-            let displayName = planName; // Default to plan name
-            let color = '#2ECC71';
-            let lightColor = '#58D68D';
-            let bgColor = 'rgba(46, 204, 113, 0.12)';
-            let borderColor = 'rgba(46, 204, 113, 0.3)';
+            let displayName = 'Standard Contract';
             let isPopular = false;
             let isBestValue = false;
-            
-            // Check for Gold plan FIRST - ONLY Gold gets both badges
+
             if (planNameLower.includes('gold') || planNameLower.includes('premium')) {
                 tierKey = 'gold';
                 badge = 'Gold';
-                displayName = 'Gold Contract'; // Label format
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
+                displayName = 'Gold Contract';
                 isPopular = true;
-                isBestValue = true; // ONLY Gold is Best Value
-            } 
-            // Check for Basic/Starter
-            else if (planNameLower.includes('starter') || planNameLower.includes('basic')) {
+                isBestValue = true;
+            } else if (planNameLower.includes('starter') || planNameLower.includes('basic')) {
                 tierKey = 'starter';
                 badge = 'Basic';
                 displayName = 'Basic Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } 
-            // Check for Enterprise/Business
-            else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
+            } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
                 tierKey = 'enterprise';
                 badge = 'Enterprise';
                 displayName = 'Enterprise Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } 
-            // Check for Ultimate/Max
-            else if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
+            } else if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
                 tierKey = 'ultimate';
                 badge = 'Ultimate';
                 displayName = 'Ultimate Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
             }
-            // Default for Standard
-            else {
-                tierKey = 'standard';
-                badge = 'Standard';
-                displayName = 'Standard Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            }
-            
-            // Build features
+
+            // ---- Features (no hashrate exposed) ----
             const features = [
                 'SHA-256 ASIC mining',
                 '24/7 performance monitoring',
-                'Automatic daily mining rewards',
-                `${hashrate > 0 ? hashrate + ' TH/s hashrate' : 'Premium mining capacity'}`
+                'Automatic mining rewards'
             ];
-            
+
             if (tierKey === 'gold' || tierKey === 'enterprise' || tierKey === 'ultimate') {
                 features.push('Priority support');
             }
@@ -20391,25 +20822,37 @@ app.get('/api/plans', async (req, res) => {
             if (tierKey === 'ultimate') {
                 features.push('Exclusive bonuses');
             }
-            
-            // BTC range - EXACT FORMAT HTML EXPECTS
-            const btcRange = btcPrice > 0 
-                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC` 
+
+            // ---- BTC range display ----
+            const btcRange = btcPrice > 0
+                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
                 : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
-            
-            // Daily return - EXACT FORMAT HTML EXPECTS
-            const dailyReturnDisplay = btcPrice > 0 
-                ? `${dailyMiningBTC.toFixed(5)} BTC` 
-                : `$${dailyMiningMin.toFixed(2)} - $${dailyMiningMax.toFixed(2)}`;
-            
-            // Button state
+
+            // ---- Per-cycle return display ----
+            const perCycleReturnDisplay = btcPrice > 0
+                ? `${minCycleReturnBTC.toFixed(5)} - ${maxCycleReturnBTC.toFixed(5)} BTC`
+                : `$${minCycleReturnUSD.toFixed(2)} - $${maxCycleReturnUSD.toFixed(2)}`;
+
+            // ---- Lock-in check ----
+            const planIdStr = plan._id.toString();
+            const activeForPlan = userContext.activeInvestmentsByPlan[planIdStr] || null;
+            const isLocked = !!activeForPlan;
+
+            // ---- Button state ----
             let buttonState = 'login';
             let buttonText = 'Login to Rent Hashrate';
             let buttonTooltip = 'Please login to rent hashrate';
             let canRent = false;
-            
+
             if (userContext.isLoggedIn) {
-                if (!userContext.kycVerified) {
+                if (isLocked) {
+                    const remaining = (activeForPlan.totalCycles || 1) - (activeForPlan.currentCycle || 1) + 1;
+                    buttonState = 'locked';
+                    buttonText = 'Active Contract';
+                    buttonTooltip = activeForPlan.isAutoCompoundActive
+                        ? `You have an active contract on this plan (cycle ${activeForPlan.currentCycle} of ${activeForPlan.totalCycles}). Please wait until it completes.`
+                        : `You have an active contract on this plan. Please wait until it completes.`;
+                } else if (!userContext.kycVerified) {
                     buttonState = 'kyc_required';
                     buttonText = 'Complete KYC';
                     buttonTooltip = 'KYC verification required to rent hashrate';
@@ -20423,7 +20866,7 @@ app.get('/api/plans', async (req, res) => {
                         canRent = true;
                         buttonState = 'rent';
                         buttonText = 'Rent Hashrate';
-                        buttonTooltip = `Rent ${hashrate} TH/s mining capacity`;
+                        buttonTooltip = `Rent mining capacity for ${displayName}`;
                     } else {
                         buttonState = 'insufficient';
                         buttonText = `Need $${minAmountUSD.toLocaleString()}`;
@@ -20431,51 +20874,56 @@ app.get('/api/plans', async (req, res) => {
                     }
                 }
             }
-            
+
             // =============================================
-            // HTML EXPECTED FORMAT - WITH VIDEO URL
+            // RESPONSE OBJECT (USER-FACING FIELDS ONLY)
             // =============================================
             return {
-                id: plan._id.toString(),
-                name: displayName,  // Display as label (e.g., "Gold Contract")
+                id: planIdStr,
+                name: displayName,
                 badge: badge,
                 description: planDescription,
                 tier: tierKey,
-                isPopular: isPopular,      // TRUE only for Gold
-                isBestValue: isBestValue,  // TRUE only for Gold
-                bgColor: bgColor,
-                color: color,
-                borderColor: borderColor,
+                isPopular: isPopular,
+                isBestValue: isBestValue,
                 percentage: percentage,
                 duration: {
                     hours: durationHours
                 },
-                hashrate: hashrate,
                 minAmount: {
-                    usd: minAmountUSD
+                    usd: minAmountUSD,
+                    btc: minAmountBTC
                 },
                 maxAmount: {
-                    usd: maxAmountUSD
+                    usd: maxAmountUSD,
+                    btc: maxAmountBTC
                 },
                 btcRange: btcRange,
                 features: features,
                 estimatedReturns: {
-                    daily: {
-                        display: dailyReturnDisplay
+                    perCycle: {
+                        display: perCycleReturnDisplay,
+                        minUSD: minCycleReturnUSD,
+                        maxUSD: maxCycleReturnUSD,
+                        minBTC: minCycleReturnBTC,
+                        maxBTC: maxCycleReturnBTC
                     }
                 },
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
                 canRent: canRent,
-                lightColor: lightColor,
-                minAmountBTC: minAmountBTC,
-                maxAmountBTC: maxAmountBTC,
-                dailyMining: {
-                    min: dailyMiningMin,
-                    max: dailyMiningMax,
-                    minBTC: dailyMiningBTC
-                }
+                isLocked: isLocked,
+                // Auto-compound options the user can pick at checkout.
+                // Internal cycle counts and formulas stay hidden.
+                autoCompoundOptions: [
+                    { months: null, label: 'Single Cycle' },
+                    { months: 1,    label: '1 Month' },
+                    { months: 3,    label: '3 Months' },
+                    { months: 6,    label: '6 Months' },
+                    { months: 9,    label: '9 Months' },
+                    { months: 12,   label: '12 Months' }
+                ]
             };
         });
 
@@ -20487,8 +20935,7 @@ app.get('/api/plans', async (req, res) => {
                     btcPrice: btcPrice,
                     timestamp: new Date().toISOString()
                 },
-                userContext: userContext,
-                estimatedReturns: {}
+                userContext: userContext
             }
         };
 
@@ -20504,8 +20951,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
 
 
 
