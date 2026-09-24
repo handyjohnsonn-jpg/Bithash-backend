@@ -21740,6 +21740,9 @@ console.log('   - Activity logging for both users and guests');
 
 
 
+
+
+
 // =============================================
 // CLOUD MINING HASHPOWER PLANS ENDPOINT
 // User-facing only. Internal mining economics
@@ -21836,9 +21839,17 @@ app.get('/api/plans', async (req, res) => {
         }
 
         // =============================================
+        // HELPER: Format hashpower value cleanly
+        // =============================================
+        const formatHashpower = (v) => {
+            if (!v || v <= 0) return '0';
+            if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+            if (v >= 1) return v.toFixed(3);
+            return v.toFixed(4);
+        };
+
+        // =============================================
         // BUILD USER-FACING PLAN CARDS
-        // Colors, badges, tier logic preserved.
-        // Hashrate range calculated live from investment range + BTC price.
         // =============================================
         const enhancedPlans = plans.map((plan) => {
             const minAmountUSD = plan.minAmount || 0;
@@ -21848,38 +21859,21 @@ app.get('/api/plans', async (req, res) => {
             const planName = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
 
-            // ---- BTC amounts for display ----
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
             const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
-
             const durationDays = durationHours / 24;
 
-            // =============================================
-            // LIVE HASHPOWER RANGE (TH/s)
-            // Uses the internal mining economics (BTC_PER_TH_PER_HOUR,
-            // plan return %, plan duration) to determine the min and max
-            // hashpower a user could be assigned for this plan at the
-            // current BTC price. Values fluctuate in real time as BTC price changes.
-            //
-            // Hashpower is computed from the NET principal (incoming balance
-            // minus the per-cycle fee), because that is what actually mines.
-            // =============================================
+            // ---- LIVE HASHPOWER RANGE (TH/s) ----
+            // Computed from the NET principal (incoming balance minus the
+            // per-cycle 3% fee), because that is what actually mines.
             const minNetPrincipal = minAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
             const maxNetPrincipal = maxAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
 
             const minHashpower = calculateHashpower(minNetPrincipal, percentage, durationHours, btcPrice);
             const maxHashpower = calculateHashpower(maxNetPrincipal, percentage, durationHours, btcPrice);
 
-            // Format nicely: no decimals for big numbers, 2 decimals for small ones
-            const formatHashpower = (v) => {
-                if (!v || v <= 0) return '0';
-                if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-                if (v >= 1) return v.toFixed(1);
-                return v.toFixed(3);
-            };
-
             const hashrateRangeDisplay = (minHashpower > 0 && maxHashpower > 0)
-                ? `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} TH/s`
+                ? `${formatHashpower(minHashpower)} TH/s - ${formatHashpower(maxHashpower)} TH/s`
                 : 'Calculating...';
 
             // ---- Tier detection (colors preserved exactly) ----
@@ -21947,9 +21941,6 @@ app.get('/api/plans', async (req, res) => {
             }
 
             // ---- Features (tier-differentiated, capped at 6 per tier) ----
-            // Cheaper plans have fewer features; higher plans add more value,
-            // up to the 6-item ceiling. Each tier inherits the tier below
-            // and adds one or two new perks.
             let features = [];
 
             if (tierKey === 'starter') {
@@ -22000,11 +21991,6 @@ app.get('/api/plans', async (req, res) => {
                 ];
             }
 
-            // BTC range display
-            const btcRange = btcPrice > 0
-                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
-                : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
-
             // ---- Button state ----
             let buttonState = 'login';
             let buttonText = 'Login to Rent Hashpower';
@@ -22038,9 +22024,9 @@ app.get('/api/plans', async (req, res) => {
             // =============================================
             // USER-FACING RESPONSE
             // Internal economics (per-cycle fee, multiplier cap, formula) NOT exposed.
+            // NO _id / no contract id exposed to the frontend.
             // =============================================
             return {
-                id: plan._id.toString(),
                 name: displayName,
                 badge: badge,
                 description: planDescription,
@@ -22064,7 +22050,9 @@ app.get('/api/plans', async (req, res) => {
                 },
                 minAmountBTC: minAmountBTC,
                 maxAmountBTC: maxAmountBTC,
-                btcRange: btcRange,
+                btcRange: btcPrice > 0
+                    ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
+                    : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`,
                 features: features,
 
                 // ---- Live hashrate range (fluctuates with BTC price) ----
@@ -22080,8 +22068,6 @@ app.get('/api/plans', async (req, res) => {
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
                 canRent: canRent
-                // REMOVED: dailyMining object, estimatedReturns.daily, returnDisplay
-                // (the percentage and duration fields above already convey the return)
             };
         });
 
@@ -22109,10 +22095,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
-
-
 
 
 
