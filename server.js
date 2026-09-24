@@ -20622,575 +20622,509 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
+
+
+
+
 // =============================================
-// MINING CALCULATOR — ADVANCED & ROBUST
-// GET /api/mining/calculator
-//
-// A single, powerful endpoint that answers natural user questions:
-//   • "How much does 1 TH/s cost for 1 / 3 / 6 / 9 / 12 months or a year?"
-//   • "How much profit will $500 generate over X time?"
-//   • "How many TH/s will be assigned to me for $X?"
-//   • "Which contract should I activate for my amount?"
-//
-// Design principles:
-//   • All data is fetched live (BTC price + active plans from DB).
-//   • No simulation, no placeholders, no hardcoded numbers.
-//   • The user's amount is mapped to exactly ONE contract
-//     (the one whose [minAmount, maxAmount] range contains it).
-//   • If no range contains it, we return the closest applicable contract
-//     along with a clear reason.
+// POST /api/mining/calculator
+// Production mining calculator - uses REAL data only:
+//   - Real BTC price (live aggregator via getCryptoPrice('BTC'))
+//   - Real plan documents from MongoDB (Plan collection)
+//   - Real mining economics (BTC_PER_TH_PER_HOUR, plan.percentage, plan.duration)
+//   - Real auto-compound caps (COMPOUND_MULTIPLIER_CAPS)
+//   - Real per-cycle fees (CYCLE_FEE_PERCENT)
+// No simulation, no placeholders, no hardcoded yields.
 // =============================================
-app.get('/api/mining/calculator', async (req, res) => {
-    const startedAt = Date.now();
+app.post('/api/mining/calculator', async (req, res) => {
+  const startedAt = Date.now();
 
-    try {
-        // =============================================
-        // 1. LIVE BTC PRICE (single source of truth)
-        // =============================================
-        let btcPrice;
-        try {
-            btcPrice = await getRealTimeBitcoinPrice();
-        } catch (priceErr) {
-            console.error('[CALCULATOR] BTC price fetch failed:', priceErr.message);
-            return res.status(503).json({
-                status: 'error',
-                message: 'Unable to fetch current BTC price. Please try again in a moment.',
-                retryAfter: 10
-            });
-        }
+  try {
+    // =============================================
+    // 1. INPUT VALIDATION
+    // =============================================
+    const rawAmount = req.body?.amount;
+    const rawCurrency = String(req.body?.currency || 'USD').toUpperCase();
+    const rawAutoCompoundMonths = req.body?.autoCompoundMonths;
 
-        if (!btcPrice || btcPrice <= 0) {
-            return res.status(503).json({
-                status: 'error',
-                message: 'BTC price unavailable. Please try again in a moment.',
-                retryAfter: 10
-            });
-        }
-
-        // =============================================
-        // 2. ACTIVE PLANS
-        // =============================================
-        const plans = await Plan.find({ isActive: true }).lean();
-
-        if (!plans || plans.length === 0) {
-            return res.status(200).json({
-                status: 'success',
-                data: {
-                    btcPrice,
-                    plans: [],
-                    message: 'No active mining contracts are currently available.',
-                    timestamp: startedAt
-                }
-            });
-        }
-
-        // =============================================
-        // 3. INTERNAL HELPERS (never exposed as formulas)
-        // =============================================
-
-        // Number of cycles for an auto-compound term
-        const cyclesForMonths = (months, durationHours) => {
-            if (!months) return 1;
-            return calculateTotalCycles(months, durationHours);
-        };
-
-        // Pure (uncapped) compounded multiplier for N cycles
-        const rawCompoundMultiplier = (cycles, returnPercent) => {
-            if (cycles <= 1) return 1;
-            const perCycle = (1 - CYCLE_FEE_PERCENT / 100) * (1 + returnPercent / 100);
-            return Math.pow(perCycle, cycles);
-        };
-
-        // Compounded multiplier with the sliding-scale cap applied
-        const cappedMultiplier = (months, cycles, returnPercent) => {
-            const raw = rawCompoundMultiplier(cycles, returnPercent);
-            const cap = COMPOUND_MULTIPLIER_CAPS[months || 0] || 10;
-            return Math.min(raw, cap);
-        };
-
-        // Format the min/max range for a plan
-        const rangeLabel = (p) =>
-            `$${(p.minAmountUSD || 0).toLocaleString()} - $${(p.maxAmountUSD || 0).toLocaleString()}`;
-
-        // =============================================
-        // 4. ENRICH EACH PLAN WITH DERIVED VALUES
-        // Every plan carries: cycle info, per-TH cost for
-        // its cycle and for 1/3/6/9/12 months, plus a per-cycle
-        // reference projection. This powers both the "oneThCost"
-        // mode and the default overview.
-        // =============================================
-        const enrichedPlans = plans.map(plan => {
-            const durationHours = plan.duration || 24;
-            const returnPercent = plan.percentage || 0;
-            const minAmountUSD = plan.minAmount || 0;
-            const maxAmountUSD = plan.maxAmount || 0;
-
-            const minHashpower = calculateHashpower(minAmountUSD, returnPercent, durationHours, btcPrice);
-            const maxHashpower = calculateHashpower(maxAmountUSD, returnPercent, durationHours, btcPrice);
-
-            // 1 TH/s cost per single cycle (how much capital buys 1 TH/s worth of one cycle's output)
-            const oneThCostPerCycleUSD = minHashpower > 0
-                ? minAmountUSD / minHashpower
-                : 0;
-
-            // 1 TH/s cost for the full year under the 12-month cap
-            const oneYearCycles = Math.floor((365 * 24) / durationHours);
-            const oneYearRawMult = rawCompoundMultiplier(oneYearCycles, returnPercent);
-            const oneYearCap = COMPOUND_MULTIPLIER_CAPS[12];
-            const oneYearFinalMult = Math.min(oneYearRawMult, oneYearCap);
-            const oneYearReferenceValue = minAmountUSD * oneYearFinalMult;
-            const oneYearHashpowerEquivalent = minHashpower * oneYearFinalMult;
-            const oneThCostForOneYearUSD = oneYearHashpowerEquivalent > 0
-                ? oneYearReferenceValue / oneYearHashpowerEquivalent
-                : 0;
-
-            // Per-term projections for 1, 3, 6, 9, 12 months — always using the plan's minimum
-            // as the reference amount so we can consistently answer "cost of 1 TH/s".
-            const byTerm = {};
-            [1, 3, 6, 9, 12].forEach(m => {
-                const cycles = cyclesForMonths(m, durationHours);
-                const rawMult = rawCompoundMultiplier(cycles, returnPercent);
-                const finalMult = cappedMultiplier(m, cycles, returnPercent);
-                const capApplied = finalMult < rawMult;
-                const refValueUSD = minAmountUSD * finalMult;
-                const hashpowerEquivalent = minHashpower * finalMult;
-                const costPerTHUSD = hashpowerEquivalent > 0 ? refValueUSD / hashpowerEquivalent : 0;
-
-                byTerm[m] = {
-                    months: m,
-                    cycles,
-                    finalMultiplier: parseFloat(finalMult.toFixed(4)),
-                    capApplied,
-                    capValue: COMPOUND_MULTIPLIER_CAPS[m] || 10,
-                    costPerThUSD: parseFloat(costPerTHUSD.toFixed(2)),
-                    costPerThBTC: parseFloat((costPerTHUSD / btcPrice).toFixed(8))
-                };
-            });
-
-            return {
-                planId: plan._id.toString(),
-                planName: plan.name,
-                durationHours,
-                durationLabel: durationHours >= 24
-                    ? `${Math.round(durationHours / 24)} day(s)`
-                    : `${durationHours} hour(s)`,
-                returnPercent,
-                minAmountUSD,
-                maxAmountUSD,
-                minAmountBTC: parseFloat((minAmountUSD / btcPrice).toFixed(8)),
-                maxAmountBTC: parseFloat((maxAmountUSD / btcPrice).toFixed(8)),
-                rangeLabel: rangeLabel({ minAmountUSD, maxAmountUSD }),
-
-                hashrateRange: {
-                    min: parseFloat(minHashpower.toFixed(4)),
-                    max: parseFloat(maxHashpower.toFixed(4)),
-                    unit: 'TH/s'
-                },
-
-                oneThCostPerCycleUSD: parseFloat(oneThCostPerCycleUSD.toFixed(2)),
-                oneThCostPerCycleBTC: parseFloat((oneThCostPerCycleUSD / btcPrice).toFixed(8)),
-                oneThCostForOneYearUSD: parseFloat(oneThCostForOneYearUSD.toFixed(2)),
-                oneThCostForOneYearBTC: parseFloat((oneThCostForOneYearUSD / btcPrice).toFixed(8)),
-                byTerm
-            };
-        });
-
-        // =============================================
-        // 5. SHARED: Find the single contract that covers an amount
-        // Returns { match, fallback } where:
-        //   • match    = the plan whose min/max range contains amountUSD
-        //   • fallback = the closest plan by min amount, used when no range matches
-        // =============================================
-        const findContractForAmount = (amountUSD) => {
-            const match = enrichedPlans.find(p =>
-                amountUSD >= p.minAmountUSD && amountUSD <= p.maxAmountUSD
-            );
-            if (match) {
-                return { match, fallback: null };
-            }
-            // No plan covers this amount — find the closest entry plan
-            const sorted = [...enrichedPlans].sort((a, b) => {
-                // Prefer plans whose minimum is closest to the amount (above or below)
-                const da = Math.abs(a.minAmountUSD - amountUSD);
-                const db = Math.abs(b.minAmountUSD - amountUSD);
-                return da - db;
-            });
-            const closest = sorted[0] || null;
-            return { match: null, fallback: closest };
-        };
-
-        // =============================================
-        // 6. PROJECTION BUILDER
-        // Generates a full projection for a (plan, amount, months) tuple.
-        // Uses the plan's own duration, return % and the live BTC price.
-        // =============================================
-        const buildProjection = (plan, amountUSD, months) => {
-            const durationHours = plan.durationHours;
-            const returnPercent = plan.returnPercent;
-
-            const cycles = months ? calculateTotalCycles(months, durationHours) : 1;
-            const rawMult = rawCompoundMultiplier(cycles, returnPercent);
-            const finalMult = months
-                ? cappedMultiplier(months, cycles, returnPercent)
-                : 1;
-            const capApplied = finalMult < rawMult;
-
-            // Hashpower assigned in cycle 1
-            const cycleOneHashpower = calculateHashpower(
-                amountUSD,
-                returnPercent,
-                durationHours,
-                btcPrice
-            );
-
-            // Effective hashpower across the whole term (cycle 1 hashrate amplified by the multiplier)
-            const effectiveHashpower = cycleOneHashpower * finalMult;
-
-            const finalValueUSD = amountUSD * finalMult;
-            const profitUSD = finalValueUSD - amountUSD;
-            const profitBTC = profitUSD / btcPrice;
-
-            return {
-                planId: plan.planId,
-                planName: plan.planName,
-                durationHours,
-                durationLabel: plan.durationLabel,
-                returnPercent,
-                planRangeLabel: plan.rangeLabel,
-
-                investmentUSD: amountUSD,
-                investmentBTC: parseFloat((amountUSD / btcPrice).toFixed(8)),
-
-                autoCompoundMonths: months || null,
-                totalCycles: cycles,
-                perCycleDurationHours: durationHours,
-
-                assignedHashpowerCycle1: parseFloat(cycleOneHashpower.toFixed(4)),
-                effectiveHashpowerAcrossAllCycles: parseFloat(effectiveHashpower.toFixed(4)),
-                hashrateUnit: 'TH/s',
-
-                finalMultiplier: parseFloat(finalMult.toFixed(4)),
-                capApplied,
-                capValue: months ? (COMPOUND_MULTIPLIER_CAPS[months] || 10) : null,
-
-                finalValueUSD: parseFloat(finalValueUSD.toFixed(2)),
-                finalValueBTC: parseFloat((finalValueUSD / btcPrice).toFixed(8)),
-                profitUSD: parseFloat(profitUSD.toFixed(2)),
-                profitBTC: parseFloat(profitBTC.toFixed(8)),
-                profitPercent: parseFloat(((finalValueUSD / amountUSD - 1) * 100).toFixed(2))
-            };
-        };
-
-        // =============================================
-        // 7. MODE ROUTING
-        // =============================================
-        const { mode } = req.query;
-
-        // ---------- MODE: oneThCost ----------
-        // Answers: "How much does 1 TH/s cost for [duration]?"
-        // Returns a compact table — one row per plan — never bloated.
-        if (mode === 'oneThCost') {
-            const oneThCostTable = enrichedPlans.map(plan => ({
-                planId: plan.planId,
-                planName: plan.planName,
-                durationHours: plan.durationHours,
-                durationLabel: plan.durationLabel,
-                returnPercent: plan.returnPercent,
-                oneThCostPerCycleUSD: plan.oneThCostPerCycleUSD,
-                oneThCostPerCycleBTC: plan.oneThCostPerCycleBTC,
-                oneThCostForOneYearUSD: plan.oneThCostForOneYearUSD,
-                oneThCostForOneYearBTC: plan.oneThCostForOneYearBTC,
-                byTerm: plan.byTerm
-            }));
-
-            const cheapestForYear = [...oneThCostTable].sort(
-                (a, b) => a.oneThCostForOneYearUSD - b.oneThCostForOneYearUSD
-            )[0];
-
-            return res.status(200).json({
-                status: 'success',
-                data: {
-                    mode: 'oneThCost',
-                    btcPrice,
-                    oneThCostTable,
-                    cheapestPlanForOneYear: cheapestForYear || null,
-                    timestamp: startedAt
-                }
-            });
-        }
-
-        // ---------- MODE: projection ----------
-        // Answers: "For $X over Y months, what do I get?"
-        // Returns exactly ONE recommended contract (not a list).
-        if (mode === 'projection') {
-            const amountUSD = parseFloat(req.query.amount);
-            const months = req.query.months ? parseInt(req.query.months) : null;
-            const planId = req.query.planId || null;
-
-            if (!amountUSD || amountUSD <= 0 || isNaN(amountUSD)) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'A valid "amount" (USD) is required for projection mode.',
-                    example: '/api/mining/calculator?mode=projection&amount=500&months=1'
-                });
-            }
-
-            if (months !== null && ![1, 3, 6, 9, 12].includes(months)) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'When provided, "months" must be one of: 1, 3, 6, 9, 12.'
-                });
-            }
-
-            // ---- Specific plan requested ----
-            if (planId) {
-                const plan = enrichedPlans.find(p => p.planId === planId);
-                if (!plan) {
-                    return res.status(404).json({
-                        status: 'fail',
-                        message: 'No matching plan found for the provided planId.'
-                    });
-                }
-
-                const fits = amountUSD >= plan.minAmountUSD && amountUSD <= plan.maxAmountUSD;
-                const projection = buildProjection(plan, amountUSD, months);
-
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        mode: 'projection',
-                        btcPrice,
-                        query: { amountUSD, months, planId },
-                        fitsPlanRange: fits,
-                        planRangeLabel: plan.rangeLabel,
-                        recommendation: projection,
-                        reason: fits
-                            ? `Your $${amountUSD.toLocaleString()} fits the "${plan.planName}" contract (${plan.rangeLabel})${months ? ` for ${months} month(s)` : ''}.`
-                            : `Your $${amountUSD.toLocaleString()} is outside "${plan.planName}" range (${plan.rangeLabel}). Projection shown for reference only.`,
-                        timestamp: startedAt
-                    }
-                });
-            }
-
-            // ---- No specific plan: find the contract that covers the amount ----
-            const { match, fallback } = findContractForAmount(amountUSD);
-
-            if (match) {
-                const projection = buildProjection(match, amountUSD, months);
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        mode: 'projection',
-                        btcPrice,
-                        query: { amountUSD, months },
-                        recommendedPlan: projection,
-                        planRangeLabel: match.rangeLabel,
-                        reason: `$${amountUSD.toLocaleString()} falls under the "${match.planName}" contract (${match.rangeLabel}). This is the plan you should activate${months ? ` for ${months} month(s)` : ''}.`,
-                        timestamp: startedAt
-                    }
-                });
-            }
-
-            // ---- No plan covers the amount: return closest entry plan ----
-            if (fallback) {
-                const projection = buildProjection(fallback, amountUSD, months);
-                const direction = amountUSD < fallback.minAmountUSD ? 'below the minimum' : 'above the maximum';
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        mode: 'projection',
-                        btcPrice,
-                        query: { amountUSD, months },
-                        recommendedPlan: null,
-                        closestPlan: projection,
-                        planRangeLabel: fallback.rangeLabel,
-                        reason: `Your $${amountUSD.toLocaleString()} is ${direction} of the "${fallback.planName}" contract (${fallback.rangeLabel}). ${
-                            amountUSD < fallback.minAmountUSD
-                                ? `Increase your investment to at least $${fallback.minAmountUSD.toLocaleString()} to activate this plan.`
-                                : `Decrease your investment below $${fallback.maxAmountUSD.toLocaleString()} or choose a higher tier plan.`
-                        }`,
-                        timestamp: startedAt
-                    }
-                });
-            }
-
-            return res.status(404).json({
-                status: 'fail',
-                message: 'No active plans available to compute a projection.'
-            });
-        }
-
-        // ---------- MODE: recommend ----------
-        // Answers: "Which plan should I activate for $X over Y months?"
-        // Returns EXACTLY ONE contract (never a full list).
-        if (mode === 'recommend') {
-            const amountUSD = parseFloat(req.query.amount);
-            const months = req.query.months ? parseInt(req.query.months) : null;
-
-            if (!amountUSD || amountUSD <= 0 || isNaN(amountUSD)) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'A valid "amount" (USD) is required for recommend mode.',
-                    example: '/api/mining/calculator?mode=recommend&amount=500&months=3'
-                });
-            }
-
-            if (months !== null && ![1, 3, 6, 9, 12].includes(months)) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'When provided, "months" must be one of: 1, 3, 6, 9, 12.'
-                });
-            }
-
-            const { match, fallback } = findContractForAmount(amountUSD);
-
-            if (match) {
-                const projection = buildProjection(match, amountUSD, months);
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        mode: 'recommend',
-                        btcPrice,
-                        amountUSD,
-                        months: months || null,
-                        recommendedPlan: projection,
-                        planRangeLabel: match.rangeLabel,
-                        reason: `Based on your $${amountUSD.toLocaleString()}, the "${match.planName}" contract (${match.rangeLabel}) is the plan you should activate${months ? ` for ${months} month(s)` : ''}.`,
-                        timestamp: startedAt
-                    }
-                });
-            }
-
-            if (fallback) {
-                const direction = amountUSD < fallback.minAmountUSD ? 'below the minimum' : 'above the maximum';
-                const projection = buildProjection(fallback, amountUSD, months);
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        mode: 'recommend',
-                        btcPrice,
-                        amountUSD,
-                        months: months || null,
-                        recommendedPlan: null,
-                        closestPlan: projection,
-                        planRangeLabel: fallback.rangeLabel,
-                        reason: `Your $${amountUSD.toLocaleString()} is ${direction} of every active plan. The closest entry is "${fallback.planName}" (${fallback.rangeLabel}). ${
-                            amountUSD < fallback.minAmountUSD
-                                ? `Increase your investment to at least $${fallback.minAmountUSD.toLocaleString()} to activate it.`
-                                : `Choose a higher tier plan above $${fallback.maxAmountUSD.toLocaleString()}.`
-                        }`,
-                        timestamp: startedAt
-                    }
-                });
-            }
-
-            return res.status(404).json({
-                status: 'fail',
-                message: 'No active plans available for recommendation.'
-            });
-        }
-
-        // ---------- MODE: compare ----------
-        // Optional useful mode: compare an amount across multiple horizons,
-        // but ONLY within its matching plan. Returns a single plan compared
-        // across 1, 3, 6, 9, 12 months.
-        if (mode === 'compare') {
-            const amountUSD = parseFloat(req.query.amount);
-
-            if (!amountUSD || amountUSD <= 0 || isNaN(amountUSD)) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'A valid "amount" (USD) is required for compare mode.',
-                    example: '/api/mining/calculator?mode=compare&amount=500'
-                });
-            }
-
-            const { match, fallback } = findContractForAmount(amountUSD);
-            const activePlan = match || fallback;
-
-            if (!activePlan) {
-                return res.status(404).json({
-                    status: 'fail',
-                    message: 'No active plans available to compare.'
-                });
-            }
-
-            const comparisons = [1, 3, 6, 9, 12].map(m => buildProjection(activePlan, amountUSD, m));
-
-            return res.status(200).json({
-                status: 'success',
-                data: {
-                    mode: 'compare',
-                    btcPrice,
-                    amountUSD,
-                    planName: activePlan.planName,
-                    planRangeLabel: activePlan.rangeLabel,
-                    fitsPlanRange: !!match,
-                    comparisons,
-                    reason: match
-                        ? `Comparing time horizons for your $${amountUSD.toLocaleString()} inside "${activePlan.planName}" (${activePlan.rangeLabel}).`
-                        : `Your $${amountUSD.toLocaleString()} is outside every plan range. Comparison shown for the closest plan "${activePlan.planName}" (${activePlan.rangeLabel}) for reference.`,
-                    timestamp: startedAt
-                }
-            });
-        }
-
-        // =============================================
-        // 8. DEFAULT MODE (overview)
-        // A compact overview that doesn't dump every plan's full data
-        // unnecessarily. Provides just enough to render a calculator page.
-        // =============================================
-        return res.status(200).json({
-            status: 'success',
-            data: {
-                mode: 'overview',
-                btcPrice,
-
-                // Compact plan list — enough to render the contract selector
-                plans: enrichedPlans.map(p => ({
-                    planId: p.planId,
-                    planName: p.planName,
-                    durationHours: p.durationHours,
-                    durationLabel: p.durationLabel,
-                    returnPercent: p.returnPercent,
-                    minAmountUSD: p.minAmountUSD,
-                    maxAmountUSD: p.maxAmountUSD,
-                    minAmountBTC: p.minAmountBTC,
-                    maxAmountBTC: p.maxAmountBTC,
-                    rangeLabel: p.rangeLabel,
-                    hashrateRange: p.hashrateRange
-                })),
-
-                // Modes and example URLs for the UI to expose
-                availableModes: ['projection', 'recommend', 'compare', 'oneThCost'],
-                examples: {
-                    projection: '/api/mining/calculator?mode=projection&amount=500&months=1',
-                    projectionSpecificPlan: '/api/mining/calculator?mode=projection&amount=500&months=3&planId=PLAN_ID',
-                    recommend: '/api/mining/calculator?mode=recommend&amount=500&months=3',
-                    compare: '/api/mining/calculator?mode=compare&amount=500',
-                    oneThCost: '/api/mining/calculator?mode=oneThCost'
-                },
-
-                timestamp: startedAt
-            }
-        });
-
-    } catch (err) {
-        console.error('[CALCULATOR] Fatal error:', err);
-        res.status(500).json({
-            status: 'error',
-            message: 'Mining calculator failed. Please try again.',
-            error: process.env.NODE_ENV === 'development' ? err.message : undefined
-        });
+    // Amount must be a positive finite number
+    const amount = typeof rawAmount === 'number' ? rawAmount : parseFloat(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'A valid positive investment amount is required.'
+      });
     }
+
+    // Supported currencies (USDT/USDC are treated as USD equivalents — they are pegged stablecoins)
+    const USD_EQUIVALENTS = ['USD', 'USDT', 'USDC'];
+    const SUPPORTED_CURRENCIES = [...USD_EQUIVALENTS, 'BTC'];
+    if (!SUPPORTED_CURRENCIES.includes(rawCurrency)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: `Unsupported currency "${rawCurrency}". Supported: ${SUPPORTED_CURRENCIES.join(', ')}.`
+      });
+    }
+
+    // Validate auto-compound months (must match Investment schema enum)
+    let autoCompoundMonths = null;
+    if (rawAutoCompoundMonths !== undefined && rawAutoCompoundMonths !== null && rawAutoCompoundMonths !== '') {
+      const parsed = parseInt(rawAutoCompoundMonths, 10);
+      if (![1, 3, 6, 9, 12].includes(parsed)) {
+        return res.status(400).json({
+          status: 'fail',
+          message: 'autoCompoundMonths must be one of: 1, 3, 6, 9, 12 (or omitted for single-cycle).'
+        });
+      }
+      autoCompoundMonths = parsed;
+    }
+
+    // =============================================
+    // 2. FETCH LIVE BTC PRICE (REAL — NO FALLBACKS)
+    // =============================================
+    let btcPrice;
+    try {
+      btcPrice = await getRealTimeBitcoinPrice();
+    } catch (priceError) {
+      console.error('[MINING CALCULATOR] BTC price fetch failed:', priceError.message);
+      return res.status(503).json({
+        status: 'error',
+        message: 'Unable to fetch current BTC price. Please try again in a moment.',
+        retryAfter: 10
+      });
+    }
+
+    if (!btcPrice || btcPrice <= 0) {
+      return res.status(503).json({
+        status: 'error',
+        message: 'BTC price feed returned an invalid value. Please retry.',
+        retryAfter: 10
+      });
+    }
+
+    // =============================================
+    // 3. NORMALIZE INPUT AMOUNT TO USD
+    //    Stablecoins pegged to USD → pass-through.
+    //    BTC input → convert using live price.
+    // =============================================
+    let amountUSD;
+    let inputBTC;
+    if (USD_EQUIVALENTS.includes(rawCurrency)) {
+      amountUSD = amount;
+      inputBTC = amount / btcPrice;
+    } else {
+      // BTC input
+      inputBTC = amount;
+      amountUSD = amount * btcPrice;
+    }
+
+    // Guardrail against absurdly small inputs
+    if (amountUSD < 1) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Minimum calculator amount is 1 USD equivalent.'
+      });
+    }
+
+    // =============================================
+    // 4. LOAD REAL PLANS FROM DATABASE
+    // =============================================
+    const plans = await Plan.find({ isActive: true })
+      .sort({ minAmount: 1 })
+      .lean();
+
+    if (!plans || plans.length === 0) {
+      return res.status(503).json({
+        status: 'error',
+        message: 'No active mining contracts are currently available.'
+      });
+    }
+
+    // =============================================
+    // 5. DERIVE REAL PER-TH/s ECONOMICS FROM PRODUCTION CONSTANTS
+    //    BTC_PER_TH_PER_HOUR is the single source of truth for
+    //    how much BTC one TH/s produces each hour.
+    // =============================================
+    const btcPerTHPerHour = BTC_PER_TH_PER_HOUR;                  // e.g. 0.000025 / 12
+    const btcPerTHPerDay = btcPerTHPerHour * 24;
+    const btcPerTHPerMonth = btcPerTHPerDay * HOURS_PER_MONTH;    // uses 720h month
+
+    // USD value of one TH/s over standard windows (real price applied)
+    const usdPerTHPerDay = btcPerTHPerDay * btcPrice;
+    const usdPerTHPerMonth = btcPerTHPerMonth * btcPrice;
+
+    // =============================================
+    // 6. FIND THE MATCHING CONTRACT FOR THIS AMOUNT
+    //    Only ONE contract should be returned — the one whose
+    //    [minAmount, maxAmount] bracket contains the amount.
+    // =============================================
+    const matchedPlan = plans.find(
+      p => amountUSD >= p.minAmount && amountUSD <= p.maxAmount
+    );
+
+    // =============================================
+    // 7. HANDLE OUT-OF-RANGE AMOUNTS
+    // =============================================
+    if (!matchedPlan) {
+      const lowestPlan = plans[0];
+      const highestPlan = plans[plans.length - 1];
+
+      if (amountUSD < lowestPlan.minAmount) {
+        return res.status(200).json({
+          status: 'success',
+          data: {
+            eligible: false,
+            reason: 'below_minimum',
+            message: `Minimum investment is $${lowestPlan.minAmount.toLocaleString()} USD.`,
+            minimumRequired: lowestPlan.minAmount,
+            enteredAmountUSD: amountUSD,
+            marketContext: {
+              btcPrice,
+              btcPriceSource: 'live',
+              timestamp: new Date().toISOString()
+            }
+          }
+        });
+      }
+
+      if (amountUSD > highestPlan.maxAmount) {
+        return res.status(200).json({
+          status: 'success',
+          data: {
+            eligible: false,
+            reason: 'above_maximum',
+            message: `Maximum single-contract investment is $${highestPlan.maxAmount.toLocaleString()} USD. Please contact support for enterprise allocations.`,
+            maximumAllowed: highestPlan.maxAmount,
+            enteredAmountUSD: amountUSD,
+            marketContext: {
+              btcPrice,
+              btcPriceSource: 'live',
+              timestamp: new Date().toISOString()
+            }
+          }
+        });
+      }
+
+      // Fallback (should never occur if plans are contiguous)
+      return res.status(200).json({
+        status: 'success',
+        data: {
+          eligible: false,
+          reason: 'no_matching_contract',
+          message: 'No contract matches this amount. Please contact support.',
+          enteredAmountUSD: amountUSD,
+          marketContext: { btcPrice, btcPriceSource: 'live', timestamp: new Date().toISOString() }
+        }
+      });
+    }
+
+    // =============================================
+    // 8. CALCULATE SINGLE-CYCLE ECONOMICS (REAL)
+    //    Mirrors exactly what /api/investments POST does.
+    // =============================================
+    const planReturnDecimal = matchedPlan.percentage / 100;
+    const cycleDurationHours = matchedPlan.duration;
+    const cycleDurationDays = cycleDurationHours / 24;
+
+    // Assigned hashpower for this amount (using the SAME function used at investment time)
+    const assignedHashpower = calculateHashpower(
+      amountUSD,
+      matchedPlan.percentage,
+      cycleDurationHours,
+      btcPrice
+    );
+
+    // BTC that the assigned hashpower is expected to produce over the cycle
+    // (this is the physical mining output — the input to the return formula)
+    const grossBTCProduction = assignedHashpower * btcPerTHPerHour * cycleDurationHours;
+    const grossUSDProduction = grossBTCProduction * btcPrice;
+
+    // Cycle 1 fee (3% initiation — matches CYCLE_FEE_PERCENT in POST /api/investments)
+    const cycleFeeUSD = amountUSD * (CYCLE_FEE_PERCENT / 100);
+    const cycleFeeBTC = cycleFeeUSD / btcPrice;
+
+    // Principal after fee
+    const principalAfterFeeUSD = amountUSD - cycleFeeUSD;
+    const principalAfterFeeBTC = principalAfterFeeUSD / btcPrice;
+
+    // Expected return for the cycle (principal-after-fee × (1 + return%))
+    const expectedReturnUSD = principalAfterFeeUSD * (1 + planReturnDecimal);
+    const expectedReturnBTC = expectedReturnUSD / btcPrice;
+
+    // Net profit for single cycle
+    const netProfitUSD = expectedReturnUSD - amountUSD;
+    const netProfitBTC = netProfitUSD / btcPrice;
+    const netProfitPercent = (netProfitUSD / amountUSD) * 100;
+
+    // =============================================
+    // 9. AUTO-COMPOUND PROJECTION (REAL — DETERMINISTIC)
+    //    Uses same fee %, same return %, same caps as live system.
+    //    This is a deterministic financial computation, not a simulation.
+    // =============================================
+    let autoCompound = null;
+
+    if (autoCompoundMonths) {
+      const totalCycles = calculateTotalCycles(autoCompoundMonths, cycleDurationHours);
+      const multiplierCap = COMPOUND_MULTIPLIER_CAPS[autoCompoundMonths] || 10;
+
+      // Roll forward cycle-by-cycle using the exact production formula
+      let currentPrincipalUSD = amountUSD;
+      let cumulativeReturnUSD = 0;
+      let cumulativeFeeUSD = 0;
+      let cumulativeBTCFees = 0;
+      let cyclesCompleted = 0;
+      let stoppedByCap = false;
+      const cycleBreakdown = [];
+
+      for (let cycle = 1; cycle <= totalCycles; cycle++) {
+        const feeUSD = currentPrincipalUSD * (CYCLE_FEE_PERCENT / 100);
+        const feeBTC = feeUSD / btcPrice;
+        const principalAfterThisFee = currentPrincipalUSD - feeUSD;
+        const returnThisCycle = principalAfterThisFee * (1 + planReturnDecimal);
+
+        cumulativeFeeUSD += feeUSD;
+        cumulativeBTCFees += feeBTC;
+        cumulativeReturnUSD = returnThisCycle; // value of the contract after this cycle
+        cyclesCompleted = cycle;
+
+        cycleBreakdown.push({
+          cycle,
+          startingPrincipalUSD: currentPrincipalUSD,
+          feeUSD,
+          feeBTC,
+          principalAfterFeeUSD: principalAfterThisFee,
+          returnUSD: returnThisCycle,
+          returnBTC: returnThisCycle / btcPrice,
+          cumulativeReturnUSD,
+          cumulativeReturnBTC: cumulativeReturnUSD / btcPrice
+        });
+
+        // Check multiplier cap (same logic as live cron)
+        const currentMultiplier = cumulativeReturnUSD / amountUSD;
+        if (currentMultiplier >= multiplierCap) {
+          stoppedByCap = true;
+          break;
+        }
+
+        // Reinvest entire return as next cycle's principal
+        currentPrincipalUSD = returnThisCycle;
+      }
+
+      const projectedFinalUSD = cumulativeReturnUSD;
+      const projectedFinalBTC = projectedFinalUSD / btcPrice;
+      const totalProfitUSD = projectedFinalUSD - amountUSD;
+      const totalProfitBTC = totalProfitUSD / btcPrice;
+      const totalProfitPercent = (totalProfitUSD / amountUSD) * 100;
+
+      // Estimated calendar duration for the auto-compound term
+      const estimatedDurationHours = cyclesCompleted * cycleDurationHours;
+      const estimatedDurationDays = estimatedDurationHours / 24;
+
+      autoCompound = {
+        enabled: true,
+        months: autoCompoundMonths,
+        totalCycles,
+        cyclesCompleted,
+        stoppedByCap,
+        multiplierCap,
+        finalMultiplier: parseFloat((projectedFinalUSD / amountUSD).toFixed(4)),
+        cycleDurationHours,
+        estimatedDurationHours,
+        estimatedDurationDays,
+        projectedFinalUSD: parseFloat(projectedFinalUSD.toFixed(2)),
+        projectedFinalBTC: parseFloat(projectedFinalBTC.toFixed(8)),
+        totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
+        totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+        totalProfitPercent: parseFloat(totalProfitPercent.toFixed(2)),
+        cumulativeFeesUSD: parseFloat(cumulativeFeeUSD.toFixed(2)),
+        cumulativeFeesBTC: parseFloat(cumulativeBTCFees.toFixed(8)),
+        perCycleReturnPercent: matchedPlan.percentage,
+        perCycleFeePercent: CYCLE_FEE_PERCENT,
+        cycleBreakdown
+      };
+    }
+
+    // =============================================
+    // 10. EFFECTIVE PER-TH/s & PER-DAY YIELD (REAL)
+    //     Derived from the actual assigned hashpower and cycle length.
+    // =============================================
+    const perTHPerHour = {
+      btc: btcPerTHPerHour,
+      usd: btcPerTHPerHour * btcPrice
+    };
+    const perTHPerDay = {
+      btc: btcPerTHPerDay,
+      usd: usdPerTHPerDay
+    };
+    const perTHPerMonth = {
+      btc: btcPerTHPerMonth,
+      usd: usdPerTHPerMonth
+    };
+
+    // Actual effective yield of THIS position (based on assigned hashpower)
+    const positionDailyYieldBTC = assignedHashpower * btcPerTHPerDay;
+    const positionDailyYieldUSD = positionDailyYieldBTC * btcPrice;
+    const positionHourlyYieldBTC = assignedHashpower * btcPerTHPerHour;
+    const positionHourlyYieldUSD = positionHourlyYieldBTC * btcPrice;
+
+    // =============================================
+    // 11. BUILD THE SINGLE MATCHED CONTRACT
+    // =============================================
+    const contract = {
+      id: matchedPlan._id.toString(),
+      name: matchedPlan.name,
+      description: matchedPlan.description,
+      returnPercent: matchedPlan.percentage,
+      durationHours: matchedPlan.duration,
+      durationDays: parseFloat(cycleDurationDays.toFixed(4)),
+      minAmount: matchedPlan.minAmount,
+      maxAmount: matchedPlan.maxAmount,
+      referralBonusPercent: matchedPlan.referralBonus || 0,
+      videoUrl: matchedPlan.videoUrl || null
+    };
+
+    // =============================================
+    // 12. BUILD REAL WALLET-BASED FEASIBILITY CHECK
+    //     (Optional — only when the request is authenticated.
+    //      Uses real user balances, not simulated ones.)
+    // =============================================
+    let walletContext = null;
+    const token = req.headers.authorization?.split(' ')[1] || req.cookies?.jwt;
+    if (token) {
+      try {
+        const decoded = verifyJWT(token);
+        const user = await User.findById(decoded.id).select('balances');
+        if (user) {
+          const { mainUSD, maturedUSD } = await calculateRealWalletBalances(user);
+          const totalBalanceUSD = mainUSD + maturedUSD;
+          const canAffordMain = mainUSD >= amountUSD;
+          const canAffordMatured = maturedUSD >= amountUSD;
+          const canAffordTotal = totalBalanceUSD >= amountUSD;
+
+          walletContext = {
+            mainBalanceUSD: parseFloat(mainUSD.toFixed(2)),
+            maturedBalanceUSD: parseFloat(maturedUSD.toFixed(2)),
+            totalBalanceUSD: parseFloat(totalBalanceUSD.toFixed(2)),
+            canAffordMain,
+            canAffordMatured,
+            canAffordTotal,
+            recommendedBalanceSource: canAffordMain
+              ? 'main'
+              : canAffordMatured
+                ? 'matured'
+                : canAffordTotal
+                  ? 'main'
+                  : 'insufficient'
+          };
+        }
+      } catch (authErr) {
+        // Silently ignore — calculator works for both authenticated and anonymous users
+        console.warn('[MINING CALCULATOR] Auth context skipped:', authErr.message);
+      }
+    }
+
+    // =============================================
+    // 13. FINAL RESPONSE (REAL DATA ONLY)
+    // =============================================
+    return res.status(200).json({
+      status: 'success',
+      data: {
+        eligible: true,
+
+        // --- Input summary ---
+        input: {
+          amountUSD: parseFloat(amountUSD.toFixed(2)),
+          amountBTC: parseFloat(inputBTC.toFixed(8)),
+          currency: rawCurrency,
+          autoCompoundMonths: autoCompoundMonths || null
+        },
+
+        // --- Live market context ---
+        marketContext: {
+          btcPriceUSD: btcPrice,
+          btcPriceSource: 'live-aggregator',
+          timestamp: new Date().toISOString()
+        },
+
+        // --- The single matched contract ---
+        matchedContract: contract,
+
+        // --- Assigned hashpower (REAL — computed from production formula) ---
+        assignedHashpower: {
+          ths: parseFloat(assignedHashpower.toFixed(6)),
+          unit: 'TH/s',
+          formulaBasis: 'BTC_PER_TH_PER_HOUR × durationHours'
+        },
+
+        // --- Real per-TH/s yield reference (production economics) ---
+        perTHsYield: {
+          hourly: { btc: perTHPerHour.btc, usd: parseFloat(perTHPerHour.usd.toFixed(8)) },
+          daily: { btc: perTHPerDay.btc, usd: parseFloat(perTHPerDay.usd.toFixed(4)) },
+          monthly: { btc: perTHPerMonth.btc, usd: parseFloat(perTHPerMonth.usd.toFixed(2)) }
+        },
+
+        // --- Position-level yield (assigned TH/s × per-TH/s yield) ---
+        positionYield: {
+          hourly: {
+            btc: parseFloat(positionHourlyYieldBTC.toFixed(10)),
+            usd: parseFloat(positionHourlyYieldUSD.toFixed(4))
+          },
+          daily: {
+            btc: parseFloat(positionDailyYieldBTC.toFixed(10)),
+            usd: parseFloat(positionDailyYieldUSD.toFixed(4))
+          }
+        },
+
+        // --- Single-cycle projection (exact live-system math) ---
+        singleCycle: {
+          durationHours: cycleDurationHours,
+          durationDays: parseFloat(cycleDurationDays.toFixed(4)),
+          returnPercent: matchedPlan.percentage,
+
+          // Fee
+          initiationFeeUSD: parseFloat(cycleFeeUSD.toFixed(2)),
+          initiationFeeBTC: parseFloat(cycleFeeBTC.toFixed(8)),
+          initiationFeePercent: CYCLE_FEE_PERCENT,
+
+          // Principal after fee
+          principalAfterFeeUSD: parseFloat(principalAfterFeeUSD.toFixed(2)),
+          principalAfterFeeBTC: parseFloat(principalAfterFeeBTC.toFixed(8)),
+
+          // Physical mining output
+          grossMiningOutputBTC: parseFloat(grossBTCProduction.toFixed(10)),
+          grossMiningOutputUSD: parseFloat(grossUSDProduction.toFixed(4)),
+
+          // Expected return
+          expectedReturnUSD: parseFloat(expectedReturnUSD.toFixed(2)),
+          expectedReturnBTC: parseFloat(expectedReturnBTC.toFixed(8)),
+
+          // Net profit
+          netProfitUSD: parseFloat(netProfitUSD.toFixed(2)),
+          netProfitBTC: parseFloat(netProfitBTC.toFixed(8)),
+          netProfitPercent: parseFloat(netProfitPercent.toFixed(4))
+        },
+
+        // --- Auto-compound projection (only if requested) ---
+        autoCompound,
+
+        // --- Real wallet feasibility (only if authenticated) ---
+        walletContext
+      }
+    });
+
+  } catch (err) {
+    console.error('[MINING CALCULATOR] Fatal error:', err);
+
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to compute mining economics. Please try again.',
+      requestId: crypto.randomBytes(8).toString('hex'),
+      processingMs: Date.now() - startedAt
+    });
+  }
 });
 
-
-
-
-
-
-
+console.log('✅ Mining Calculator endpoint loaded: POST /api/mining/calculator');
 
 
 
