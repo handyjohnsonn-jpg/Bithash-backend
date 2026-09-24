@@ -20627,7 +20627,397 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
+// =============================================
+// MINING CALCULATOR ENDPOINT
+// GET /api/mining/calculator
+//
+// User-facing calculator. Lets a user ask:
+//   - "If I invest $X, how much TH/s and profit can I expect?"
+//   - "How much does 1 TH/s cost for N hours/months?"
+//   - "Which plan should I activate for a given budget and duration?"
+//
+// Query parameters (all optional):
+//   amount        - Investment amount in USD (e.g., 500)
+//   durationHours - Desired mining period in hours (e.g., 24, 720 for 30 days)
+//   durationMonths- Desired mining period in months (1, 3, 6, 9, 12)
+//   planId        - Target a specific plan by ID
+//   autoCompoundMonths - Include auto-compound projection (1, 3, 6, 9, 12)
+//
+// Response always includes:
+//   - live BTC price
+//   - matched plan (or recommended plan)
+//   - assigned hashrate (min/expected/max within plan bounds)
+//   - projected profit for one cycle
+//   - projected profit with auto-compound (if applicable)
+//   - cost per TH/s for the requested duration
+//   - recommendation string ("Use Standard Contract", etc.)
+//
+// Internal economics (BTC_PER_TH_PER_HOUR, multiplier caps, per-cycle fee)
+// are used but NEVER returned as formulas to the user.
+// =============================================
 
+app.get('/api/mining/calculator', async (req, res) => {
+    try {
+        // ---- 1. Fetch live BTC price ----
+        let btcPrice = 0;
+        try {
+            btcPrice = await getRealTimeBitcoinPrice();
+        } catch (priceErr) {
+            console.error('[MINING CALC] BTC price fetch failed:', priceErr.message);
+        }
+
+        if (!btcPrice || btcPrice <= 0) {
+            return res.status(503).json({
+                status: 'error',
+                message: 'Unable to fetch current BTC price. Please try again shortly.',
+                retryAfter: 15
+            });
+        }
+
+        // ---- 2. Load all active plans ----
+        const plans = await Plan.find({ isActive: true }).lean();
+        if (!plans || plans.length === 0) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'No mining contracts are currently available.'
+            });
+        }
+
+        // ---- 3. Parse and validate inputs ----
+        const rawAmount = req.query.amount !== undefined ? parseFloat(req.query.amount) : null;
+        const rawDurationHours = req.query.durationHours !== undefined ? parseFloat(req.query.durationHours) : null;
+        const rawDurationMonths = req.query.durationMonths !== undefined ? parseInt(req.query.durationMonths, 10) : null;
+        const requestedPlanId = req.query.planId ? String(req.query.planId).trim() : null;
+        const rawAutoCompoundMonths = req.query.autoCompoundMonths !== undefined
+            ? parseInt(req.query.autoCompoundMonths, 10)
+            : null;
+
+        const amount = (rawAmount !== null && !isNaN(rawAmount) && rawAmount > 0) ? rawAmount : null;
+        const durationHours = (rawDurationHours !== null && !isNaN(rawDurationHours) && rawDurationHours > 0)
+            ? rawDurationHours
+            : null;
+        const durationMonths = (rawDurationMonths !== null && !isNaN(rawDurationMonths) && rawDurationMonths > 0)
+            ? rawDurationMonths
+            : null;
+        const autoCompoundMonths = (rawAutoCompoundMonths !== null &&
+                                    [1, 3, 6, 9, 12].includes(rawAutoCompoundMonths))
+            ? rawAutoCompoundMonths
+            : null;
+
+        // Convert months to hours for internal math
+        const requestedDurationHours = durationHours !== null
+            ? durationHours
+            : (durationMonths !== null ? durationMonths * HOURS_PER_MONTH : null);
+
+        // ---- 4. Match the right plan ----
+        let matchedPlan = null;
+        let matchReason = null;
+
+        if (requestedPlanId) {
+            // User explicitly picked a plan
+            matchedPlan = plans.find(p => p._id.toString() === requestedPlanId);
+            if (!matchedPlan) {
+                return res.status(404).json({
+                    status: 'fail',
+                    message: `Plan ${requestedPlanId} not found or inactive.`
+                });
+            }
+            matchReason = 'explicit_plan_selection';
+        } else if (amount !== null) {
+            // Try to find a plan whose investment range fits the amount
+            const fittingPlans = plans.filter(p =>
+                amount >= (p.minAmount || 0) && amount <= (p.maxAmount || 0)
+            );
+
+            if (fittingPlans.length === 1) {
+                matchedPlan = fittingPlans[0];
+                matchReason = 'amount_fits_single_plan';
+            } else if (fittingPlans.length > 1) {
+                // If duration was specified, prefer a plan whose duration matches
+                if (requestedDurationHours !== null) {
+                    const exactDurationMatch = fittingPlans.find(p =>
+                        p.duration === requestedDurationHours
+                    );
+                    matchedPlan = exactDurationMatch || fittingPlans[0];
+                } else {
+                    // Otherwise pick the one with the highest return percentage
+                    matchedPlan = fittingPlans.reduce((best, p) =>
+                        (p.percentage || 0) > (best.percentage || 0) ? p : best
+                    , fittingPlans[0]);
+                }
+                matchReason = 'amount_fits_multiple_plans';
+            } else {
+                // No plan fits this amount. Pick the closest by minAmount or duration.
+                if (requestedDurationHours !== null) {
+                    const sameDuration = plans.filter(p => p.duration === requestedDurationHours);
+                    if (sameDuration.length > 0) {
+                        matchedPlan = sameDuration.reduce((best, p) =>
+                            Math.abs((p.minAmount || 0) - amount) < Math.abs((best.minAmount || 0) - amount) ? p : best
+                        , sameDuration[0]);
+                        matchReason = 'closest_by_duration';
+                    }
+                }
+                if (!matchedPlan) {
+                    matchedPlan = plans.reduce((best, p) =>
+                        Math.abs((p.minAmount || 0) - amount) < Math.abs((best.minAmount || 0) - amount) ? p : best
+                    , plans[0]);
+                    matchReason = 'closest_by_min_amount';
+                }
+            }
+        } else if (requestedDurationHours !== null) {
+            // No amount, but duration specified
+            const durationMatches = plans.filter(p => p.duration === requestedDurationHours);
+            if (durationMatches.length > 0) {
+                matchedPlan = durationMatches.reduce((best, p) =>
+                    (p.percentage || 0) > (best.percentage || 0) ? p : best
+                , durationMatches[0]);
+                matchReason = 'duration_match';
+            } else {
+                // Closest duration
+                matchedPlan = plans.reduce((best, p) =>
+                    Math.abs((p.duration || 0) - requestedDurationHours) < Math.abs((best.duration || 0) - requestedDurationHours) ? p : best
+                , plans[0]);
+                matchReason = 'closest_by_duration';
+            }
+        } else {
+            // Nothing specified — recommend the plan with the best value/ratio
+            matchedPlan = plans.reduce((best, p) => {
+                const bestRatio = (best.percentage || 0) / Math.max(best.minAmount || 1, 1);
+                const pRatio = (p.percentage || 0) / Math.max(p.minAmount || 1, 1);
+                return pRatio > bestRatio ? p : best;
+            }, plans[0]);
+            matchReason = 'best_value_recommendation';
+        }
+
+        if (!matchedPlan) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Could not determine a matching mining contract. Please refine your inputs.'
+            });
+        }
+
+        // ---- 5. Core calculations for the matched plan ----
+        const planReturnPercent = matchedPlan.percentage || 0;
+        const planReturnDecimal = planReturnPercent / 100;
+        const planDuration = matchedPlan.duration || 0;
+        const planMinUSD = matchedPlan.minAmount || 0;
+        const planMaxUSD = matchedPlan.maxAmount || 0;
+
+        // Working amount: user-supplied, clamped inside the plan range
+        let workingAmount = amount;
+        let clamped = false;
+        if (workingAmount === null) {
+            // No amount given — use the plan minimum as a baseline
+            workingAmount = planMinUSD;
+            clamped = true;
+        } else if (workingAmount < planMinUSD) {
+            workingAmount = planMinUSD;
+            clamped = true;
+        } else if (workingAmount > planMaxUSD) {
+            workingAmount = planMaxUSD;
+            clamped = true;
+        }
+
+        // Hashrate range for the whole plan
+        const minHashpower = calculateHashpower(planMinUSD, planReturnPercent, planDuration, btcPrice);
+        const maxHashpower = calculateHashpower(planMaxUSD, planReturnPercent, planDuration, btcPrice);
+        const assignedHashpower = calculateHashpower(workingAmount, planReturnPercent, planDuration, btcPrice);
+
+        // Amount in BTC
+        const workingAmountBTC = workingAmount / btcPrice;
+
+        // ---- One-cycle projection ----
+        const cycleFeeUSD = workingAmount * (CYCLE_FEE_PERCENT / 100);
+        const cyclePrincipalAfterFeeUSD = workingAmount - cycleFeeUSD;
+        const cycleReturnUSD = cyclePrincipalAfterFeeUSD * (1 + planReturnDecimal);
+        const cycleProfitUSD = cycleReturnUSD - workingAmount;
+        const cycleProfitBTC = cycleProfitUSD / btcPrice;
+
+        // ---- Auto-compound projection (if requested or if user picked auto-compound) ----
+        let autoCompoundProjection = null;
+        if (autoCompoundMonths !== null && autoCompoundMonths > 0) {
+            const totalCycles = calculateTotalCycles(autoCompoundMonths, planDuration);
+            const multiplierCap = COMPOUND_MULTIPLIER_CAPS[autoCompoundMonths] || 10;
+
+            // Iteratively simulate the compounding. We do NOT return the formula,
+            // only the final numbers.
+            let principal = workingAmount;
+            let cumulativeUSD = 0;
+            let cyclesRun = 0;
+            let capHit = false;
+
+            for (let i = 0; i < totalCycles; i++) {
+                const currentMultiplier = (cumulativeUSD + principal) / workingAmount;
+                if (currentMultiplier >= multiplierCap) {
+                    capHit = true;
+                    break;
+                }
+                const fee = principal * (CYCLE_FEE_PERCENT / 100);
+                const afterFee = principal - fee;
+                const ret = afterFee * (1 + planReturnDecimal);
+                cumulativeUSD = ret; // Return becomes the new principal
+                principal = ret;
+                cyclesRun++;
+            }
+
+            const finalReturnUSD = cumulativeUSD || workingAmount;
+            const finalReturnBTC = finalReturnUSD / btcPrice;
+            const totalProfitUSD = finalReturnUSD - workingAmount;
+            const totalProfitBTC = totalProfitUSD / btcPrice;
+            const finalMultiplier = finalReturnUSD / workingAmount;
+
+            autoCompoundProjection = {
+                months: autoCompoundMonths,
+                totalCycles: totalCycles,
+                cyclesCompleted: cyclesRun,
+                capReached: capHit,
+                finalReturnUSD: parseFloat(finalReturnUSD.toFixed(2)),
+                finalReturnBTC: parseFloat(finalReturnBTC.toFixed(8)),
+                totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
+                totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+                multiplier: parseFloat(finalMultiplier.toFixed(2))
+            };
+        }
+
+        // ---- Cost per TH/s for the requested duration ----
+        // If the user asked "how much does 1 TH/s cost for N hours", this answers it.
+        let costPerTHForRequestedDuration = null;
+        if (requestedDurationHours !== null && requestedDurationHours > 0) {
+            // Find the plan whose duration is closest, use its return %, then
+            // derive what investment yields exactly 1 TH/s over that period.
+            const planForCost = matchedPlan;
+            const returnDecimal = (planForCost.percentage || 0) / 100;
+            if (returnDecimal > 0) {
+                const btcPerTHForDuration = BTC_PER_TH_PER_HOUR * requestedDurationHours;
+                const usdValueOfBtcProduced = btcPerTHForDuration * btcPrice;
+                const costPerTH = usdValueOfBtcProduced / returnDecimal;
+                costPerTHForRequestedDuration = {
+                    durationHours: requestedDurationHours,
+                    durationMonths: requestedDurationHours / HOURS_PER_MONTH,
+                    costUSD: parseFloat(costPerTH.toFixed(2)),
+                    costBTC: parseFloat((costPerTH / btcPrice).toFixed(8)),
+                    btcProducedPerTH: parseFloat(btcPerTHForDuration.toFixed(8)),
+                    btcValuePerTHUSD: parseFloat(usdValueOfBtcProduced.toFixed(2))
+                };
+            }
+        }
+
+        // ---- Recommendation string (user-friendly) ----
+        const recommendedPlanSummary = {
+            id: matchedPlan._id.toString(),
+            name: matchedPlan.name,
+            durationHours: planDuration,
+            returnPercentage: planReturnPercent,
+            minAmountUSD: planMinUSD,
+            maxAmountUSD: planMaxUSD
+        };
+
+        let recommendationNote = '';
+        if (matchReason === 'explicit_plan_selection') {
+            recommendationNote = `You selected the ${matchedPlan.name}. The figures below reflect this plan.`;
+        } else if (matchReason === 'amount_fits_single_plan') {
+            recommendationNote = `Based on your amount, the ${matchedPlan.name} is the right contract for you.`;
+        } else if (matchReason === 'amount_fits_multiple_plans') {
+            recommendationNote = `Multiple contracts fit your amount. We recommend the ${matchedPlan.name} for the best return.`;
+        } else if (matchReason === 'closest_by_min_amount') {
+            recommendationNote = `Your amount is outside the standard range. The closest match is the ${matchedPlan.name}.`;
+        } else if (matchReason === 'duration_match' || matchReason === 'closest_by_duration') {
+            recommendationNote = `Based on your target duration, the ${matchedPlan.name} is the best fit.`;
+        } else if (matchReason === 'best_value_recommendation') {
+            recommendationNote = `Based on current market conditions, we recommend the ${matchedPlan.name}.`;
+        }
+
+        // ---- All plans breakdown (so the user can compare) ----
+        const allPlansBreakdown = plans.map(p => {
+            const pMinUSD = p.minAmount || 0;
+            const pMaxUSD = p.maxAmount || 0;
+            const pReturn = p.percentage || 0;
+            const pDuration = p.duration || 0;
+            return {
+                id: p._id.toString(),
+                name: p.name,
+                durationHours: pDuration,
+                returnPercentage: pReturn,
+                minAmountUSD: pMinUSD,
+                maxAmountUSD: pMaxUSD,
+                minHashpowerTH: parseFloat(
+                    calculateHashpower(pMinUSD, pReturn, pDuration, btcPrice).toFixed(4)
+                ),
+                maxHashpowerTH: parseFloat(
+                    calculateHashpower(pMaxUSD, pReturn, pDuration, btcPrice).toFixed(4)
+                )
+            };
+        });
+
+        // ---- Final response ----
+        res.status(200).json({
+            status: 'success',
+            data: {
+                // Live market data
+                btcPrice: parseFloat(btcPrice.toFixed(2)),
+                btcPriceTimestamp: new Date().toISOString(),
+
+                // Inputs echo
+                inputs: {
+                    amountUSD: amount,
+                    durationHours: requestedDurationHours,
+                    durationMonths: durationMonths,
+                    autoCompoundMonths: autoCompoundMonths,
+                    requestedPlanId: requestedPlanId
+                },
+
+                // Recommended contract
+                recommendedPlan: recommendedPlanSummary,
+                recommendationNote: recommendationNote,
+
+                // Working figures for the recommended plan
+                projection: {
+                    workingAmountUSD: parseFloat(workingAmount.toFixed(2)),
+                    workingAmountBTC: parseFloat(workingAmountBTC.toFixed(8)),
+                    amountWasClamped: clamped,
+                    cycleDurationHours: planDuration,
+                    returnPercentage: planReturnPercent,
+
+                    // Hashpower for the whole plan
+                    hashrate: {
+                        min: parseFloat(minHashpower.toFixed(4)),
+                        max: parseFloat(maxHashpower.toFixed(4)),
+                        assigned: parseFloat(assignedHashpower.toFixed(4)),
+                        unit: 'TH/s',
+                        display: `${minHashpower.toFixed(1)} - ${maxHashpower.toFixed(1)} TH/s`
+                    },
+
+                    // One cycle
+                    oneCycle: {
+                        durationHours: planDuration,
+                        feeUSD: parseFloat(cycleFeeUSD.toFixed(2)),
+                        netReturnUSD: parseFloat(cycleReturnUSD.toFixed(2)),
+                        netReturnBTC: parseFloat((cycleReturnUSD / btcPrice).toFixed(8)),
+                        profitUSD: parseFloat(cycleProfitUSD.toFixed(2)),
+                        profitBTC: parseFloat(cycleProfitBTC.toFixed(8))
+                    },
+
+                    // Auto-compound (null if not requested)
+                    autoCompound: autoCompoundProjection
+                },
+
+                // Cost per TH/s for the requested duration (null if duration not given)
+                costPerTH: costPerTHForRequestedDuration,
+
+                // Full plan comparison
+                allPlans: allPlansBreakdown
+            }
+        });
+
+    } catch (err) {
+        console.error('[MINING CALCULATOR] Error:', err);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to compute mining projection. Please try again.',
+            error: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
+    }
+});
 
 
 
