@@ -20897,7 +20897,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 // =============================================
 // CLOUD MINING HASHPOWER PLANS ENDPOINT
 // User-facing only. Internal mining economics
@@ -21052,7 +21051,27 @@ app.get('/api/plans', async (req, res) => {
             let isPopular = false;
             let isBestValue = false;
 
-            if (planNameLower.includes('gold') || planNameLower.includes('premium')) {
+            if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
+                tierKey = 'ultimate';
+                badge = 'Ultimate';
+                displayName = 'Ultimate Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
+                tierKey = 'enterprise';
+                badge = 'Enterprise';
+                displayName = 'Enterprise Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            } else if (planNameLower.includes('gold') || planNameLower.includes('premium')) {
                 tierKey = 'gold';
                 badge = 'Gold';
                 displayName = 'Gold Contract';
@@ -21072,26 +21091,6 @@ app.get('/api/plans', async (req, res) => {
                 borderColor = 'rgba(46, 204, 113, 0.3)';
                 isPopular = false;
                 isBestValue = false;
-            } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
-                tierKey = 'enterprise';
-                badge = 'Enterprise';
-                displayName = 'Enterprise Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } else if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
-                tierKey = 'ultimate';
-                badge = 'Ultimate';
-                displayName = 'Ultimate Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
             } else {
                 tierKey = 'standard';
                 badge = 'Standard';
@@ -21104,22 +21103,90 @@ app.get('/api/plans', async (req, res) => {
                 isBestValue = false;
             }
 
-            // ---- Features (user-facing) ----
-            const features = [
-                'SHA-256 ASIC mining',
-                '24/7 performance monitoring',
-                'Automatic cycle payouts',
-                'Auto-compound eligible'
-            ];
+            // ---- Features (tier-differentiated so higher plans are more advantageous) ----
+            // Base tier: essential mining capabilities only.
+            // Each higher tier adds value beyond the previous tier.
+            let features = [];
+            let advantages = [];
 
-            if (tierKey === 'gold' || tierKey === 'enterprise' || tierKey === 'ultimate') {
-                features.push('Priority support');
-            }
-            if (tierKey === 'enterprise' || tierKey === 'ultimate') {
-                features.push('Dedicated mining capacity');
-            }
-            if (tierKey === 'ultimate') {
-                features.push('Exclusive bonuses');
+            if (tierKey === 'starter') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Standard mining pool share',
+                    'Basic performance dashboard'
+                ];
+                advantages = [
+                    'Lowest entry point',
+                    'Ideal for first-time miners'
+                ];
+            } else if (tierKey === 'standard') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Improved mining pool share',
+                    'Real-time performance dashboard',
+                    'Email notifications on cycle events'
+                ];
+                advantages = [
+                    'Better pool share than Basic',
+                    'Suitable for regular miners'
+                ];
+            } else if (tierKey === 'gold') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Priority mining pool share',
+                    'Advanced analytics dashboard',
+                    'Email + in-app cycle notifications',
+                    'Priority email support'
+                ];
+                advantages = [
+                    'Priority pool allocation',
+                    'Faster support response'
+                ];
+            } else if (tierKey === 'enterprise') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Dedicated mining pool capacity',
+                    'Advanced analytics + export tools',
+                    'Email + in-app + SMS notifications',
+                    'Priority email + live chat support',
+                    'Dedicated account manager'
+                ];
+                advantages = [
+                    'Dedicated mining capacity',
+                    'Dedicated account manager',
+                    'Enhanced support channels'
+                ];
+            } else if (tierKey === 'ultimate') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Maximum-priority mining pool capacity',
+                    'Full analytics suite + API access',
+                    'All notification channels (email, in-app, SMS, push)',
+                    '24/7 priority support (email, chat, phone)',
+                    'Dedicated account manager + strategy reviews',
+                    'Exclusive bonuses and early-access features'
+                ];
+                advantages = [
+                    'Highest pool priority',
+                    'Maximum capital efficiency',
+                    'Concierge-level support',
+                    'Exclusive rewards'
+                ];
+            } else {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Standard mining pool share',
+                    'Basic performance dashboard'
+                ];
+                advantages = [
+                    'Reliable standard mining'
+                ];
             }
 
             // BTC range display
@@ -21188,6 +21255,7 @@ app.get('/api/plans', async (req, res) => {
                 maxAmountBTC: maxAmountBTC,
                 btcRange: btcRange,
                 features: features,
+                advantages: advantages,
 
                 // ---- Live hashrate range (fluctuates with BTC price) ----
                 hashrate: {
