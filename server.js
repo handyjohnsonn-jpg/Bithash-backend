@@ -20634,15 +20634,10 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
-
-
-
 // =============================================
-// CLOUD MINING HASHRATE PLANS ENDPOINT
+// CLOUD MINING HASHPOWER PLANS ENDPOINT
 // User-facing only. Internal mining economics
-// (hashpower formula, per-cycle fees, multiplier caps) are NOT exposed.
-// Hashrate range fluctuates in real-time based on live BTC price.
+// (per-cycle fees, multiplier caps, exact formulas) stay in the background.
 // =============================================
 
 app.get('/api/plans', async (req, res) => {
@@ -20663,13 +20658,12 @@ app.get('/api/plans', async (req, res) => {
                         mainBalance: { usd: 0 },
                         maturedBalance: { usd: 0 },
                         totalPortfolio: { usd: 0 }
-                    },
-                    estimatedReturns: {}
+                    }
                 }
             });
         }
 
-        // Get BTC price (used for USD/BTC display and hashrate range calculation)
+        // Get BTC price — used for USD↔BTC display and live hashrate range
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -20737,9 +20731,8 @@ app.get('/api/plans', async (req, res) => {
 
         // =============================================
         // BUILD USER-FACING PLAN CARDS
-        // All colors, badges, tier logic preserved.
-        // Hashrate range is calculated in real-time from the plan's
-        // investment range and live BTC price (internal economics).
+        // Colors, badges, tier logic preserved.
+        // Hashrate range calculated live from investment range + BTC price.
         // =============================================
         const enhancedPlans = plans.map((plan) => {
             const minAmountUSD = plan.minAmount || 0;
@@ -20749,26 +20742,33 @@ app.get('/api/plans', async (req, res) => {
             const planName = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
 
-            // BTC amounts for display
+            // ---- BTC amounts for display ----
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
             const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
 
             const durationDays = durationHours / 24;
 
             // =============================================
-            // REAL-TIME HASHRATE RANGE CALCULATION
-            // Uses the same internal formula as actual contract assignment,
-            // applied to minAmount and maxAmount, so the displayed range
-            // matches what the user will actually be assigned.
-            // Not exposing the formula — only the resulting range.
+            // LIVE HASHPOWER RANGE (TH/s)
+            // Uses the internal mining economics (BTC_PER_TH_PER_HOUR,
+            // plan return %, plan duration) to determine the min and max
+            // hashpower a user could be assigned for this plan at the
+            // current BTC price. Values fluctuate in real time as BTC price changes.
             // =============================================
-            let hashrateMin = 0;
-            let hashrateMax = 0;
-            if (btcPrice > 0 && durationHours > 0 && percentage > 0) {
-                hashrateMin = calculateHashpower(minAmountUSD, percentage, durationHours, btcPrice);
-                hashrateMax = calculateHashpower(maxAmountUSD, percentage, durationHours, btcPrice);
-            }
-            const hashrateRange = hashrateMin.toFixed(2) + ' - ' + hashrateMax.toFixed(2);
+            const minHashpower = calculateHashpower(minAmountUSD, percentage, durationHours, btcPrice);
+            const maxHashpower = calculateHashpower(maxAmountUSD, percentage, durationHours, btcPrice);
+
+            // Format nicely: no decimals for big numbers, 2 decimals for small ones
+            const formatHashpower = (v) => {
+                if (!v || v <= 0) return '0';
+                if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+                if (v >= 1) return v.toFixed(1);
+                return v.toFixed(3);
+            };
+
+            const hashrateRangeDisplay = (minHashpower > 0 && maxHashpower > 0)
+                ? `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} TH/s`
+                : 'Calculating...';
 
             // ---- Tier detection (colors preserved exactly) ----
             const planNameLower = planName.toLowerCase();
@@ -20800,6 +20800,8 @@ app.get('/api/plans', async (req, res) => {
                 lightColor = '#58D68D';
                 bgColor = 'rgba(46, 204, 113, 0.12)';
                 borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
                 tierKey = 'enterprise';
                 badge = 'Enterprise';
@@ -20808,6 +20810,8 @@ app.get('/api/plans', async (req, res) => {
                 lightColor = '#58D68D';
                 bgColor = 'rgba(46, 204, 113, 0.12)';
                 borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
                 tierKey = 'ultimate';
                 badge = 'Ultimate';
@@ -20816,6 +20820,8 @@ app.get('/api/plans', async (req, res) => {
                 lightColor = '#58D68D';
                 bgColor = 'rgba(46, 204, 113, 0.12)';
                 borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             } else {
                 tierKey = 'standard';
                 badge = 'Standard';
@@ -20824,9 +20830,11 @@ app.get('/api/plans', async (req, res) => {
                 lightColor = '#58D68D';
                 bgColor = 'rgba(46, 204, 113, 0.12)';
                 borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
             }
 
-            // ---- Features (user-facing, no internal numbers) ----
+            // ---- Features (user-facing) ----
             const features = [
                 'SHA-256 ASIC mining',
                 '24/7 performance monitoring',
@@ -20846,13 +20854,10 @@ app.get('/api/plans', async (req, res) => {
 
             // BTC range display
             const btcRange = btcPrice > 0
-                ? minAmountBTC.toFixed(5) + ' - ' + maxAmountBTC.toFixed(5) + ' BTC'
-                : minAmountUSD.toFixed(0) + ' - ' + maxAmountUSD.toFixed(0) + ' USD';
+                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
+                : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
-            // Return display — user-facing
-            const returnDisplay = '+' + percentage + '% per ' + durationHours + '-hour cycle';
-
-            // ---- Button state (preserved exactly) ----
+            // ---- Button state ----
             let buttonState = 'login';
             let buttonText = 'Login to Rent Hashpower';
             let buttonTooltip = 'Please login to rent hashpower';
@@ -20873,17 +20878,18 @@ app.get('/api/plans', async (req, res) => {
                         canRent = true;
                         buttonState = 'rent';
                         buttonText = 'Rent Hashpower';
-                        buttonTooltip = 'Rent ' + displayName + ' mining capacity';
+                        buttonTooltip = `Rent ${displayName} mining capacity`;
                     } else {
                         buttonState = 'insufficient';
-                        buttonText = 'Need $' + minAmountUSD.toLocaleString();
-                        buttonTooltip = 'Required balance for this plan: $' + minAmountUSD.toLocaleString();
+                        buttonText = `Need $${minAmountUSD.toLocaleString()}`;
+                        buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}`;
                     }
                 }
             }
 
             // =============================================
             // USER-FACING RESPONSE
+            // Internal economics (per-cycle fee, multiplier cap, formula) NOT exposed.
             // =============================================
             return {
                 id: plan._id.toString(),
@@ -20912,20 +20918,22 @@ app.get('/api/plans', async (req, res) => {
                 maxAmountBTC: maxAmountBTC,
                 btcRange: btcRange,
                 features: features,
-                returnDisplay: returnDisplay,
 
-                // ---- Real-time fluctuating hashrate range ----
-                hashrate: hashrateMax,          // backwards compat: max
-                hashrateMin: hashrateMin,
-                hashrateMax: hashrateMax,
-                hashrateRange: hashrateRange,   // e.g. "9.14 - 365.52"
-                hashrateUnit: 'TH/s',
+                // ---- Live hashrate range (fluctuates with BTC price) ----
+                hashrate: {
+                    min: parseFloat(minHashpower.toFixed(4)),
+                    max: parseFloat(maxHashpower.toFixed(4)),
+                    unit: 'TH/s',
+                    display: hashrateRangeDisplay
+                },
 
+                // ---- Button state ----
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
                 canRent: canRent
-                // Removed: dailyMining, estimatedReturns (leaked internal economics)
+                // REMOVED: dailyMining object, estimatedReturns.daily, returnDisplay
+                // (the percentage and duration fields above already convey the return)
             };
         });
 
@@ -20953,8 +20961,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
 
 
 
