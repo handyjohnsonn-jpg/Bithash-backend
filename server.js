@@ -35946,13 +35946,8 @@ app.get('/api/users/assets', protect, async (req, res) => {
 
 
 
+// server.js snippet
 
-// =============================================
-// GET /api/users/balances - REAL-TIME CRYPTO BALANCES
-// Captures specific crypto balances from the backend database.
-// Used by index.html to check specific crypto balances.
-// Does NOT affect fiat display values.
-// =============================================
 app.get('/api/users/balances', protect, async (req, res) => {
   try {
     const userId = req.user._id;
@@ -35964,10 +35959,7 @@ app.get('/api/users/balances', protect, async (req, res) => {
       return res.status(404).json({ status: 'fail', message: 'User not found' });
     }
     
-    // =============================================
-    // 1. CALCULATE DISPLAY VALUES (USD) - for total wallet holding
-    // These are used ONLY for display of total wallet holding.
-    // =============================================
+    // CALL THE SAME FUNCTION WEBSOCKET USES - NO MODIFICATIONS
     const { mainUSD, activeUSD, maturedUSD, priceErrors, mainBreakdown, maturedBreakdown } = 
       await calculateRealWalletBalances(user);
     
@@ -35980,80 +35972,21 @@ app.get('/api/users/balances', protect, async (req, res) => {
       });
     }
     
-    // Total USD display value
+    // Calculate total - THIS IS THE WEBSOCKET VALUE
     const totalUSD = mainUSD + activeUSD + maturedUSD;
     
-    // =============================================
-    // 2. CAPTURE SPECIFIC CRYPTO BALANCES FROM DATABASE
-    // This is the ONLY source for specific crypto balances.
-    // It does NOT affect the fiat display values above.
-    // =============================================
-    const cryptoTradeBalances = {};
+    console.log(`\n💰 REST endpoint total: $${totalUSD.toFixed(2)}`);
+    console.log(`   MAIN: $${mainUSD.toFixed(2)}`);
+    console.log(`   ACTIVE: $${activeUSD.toFixed(2)}`);
+    console.log(`   MATURED: $${maturedUSD.toFixed(2)}`);
     
-    // Extract crypto balances from main wallet Map
-    if (user.balances && user.balances.main && user.balances.main instanceof Map) {
-      for (const [asset, balance] of user.balances.main.entries()) {
-        if (balance > 0 && asset !== 'usd') {
-          const assetLower = asset.toLowerCase();
-          if (!cryptoTradeBalances[assetLower]) {
-            cryptoTradeBalances[assetLower] = { quantity: 0, mainBalance: 0, maturedBalance: 0 };
-          }
-          cryptoTradeBalances[assetLower].quantity += balance;
-          cryptoTradeBalances[assetLower].mainBalance += balance;
-        }
-      }
-    }
-    
-    // Extract crypto balances from matured wallet Map
-    if (user.balances && user.balances.matured && user.balances.matured instanceof Map) {
-      for (const [asset, balance] of user.balances.matured.entries()) {
-        if (balance > 0 && asset !== 'usd') {
-          const assetLower = asset.toLowerCase();
-          if (!cryptoTradeBalances[assetLower]) {
-            cryptoTradeBalances[assetLower] = { quantity: 0, mainBalance: 0, maturedBalance: 0 };
-          }
-          cryptoTradeBalances[assetLower].quantity += balance;
-          cryptoTradeBalances[assetLower].maturedBalance += balance;
-        }
-      }
-    }
-    
-    // =============================================
-    // 3. BTC BALANCE (for mining contract eligibility)
-    // BTC is the primary currency for mining contracts.
-    // =============================================
-    const mainBTC = user.balances?.main?.get?.('btc') || 0;
-    const maturedBTC = user.balances?.matured?.get?.('btc') || 0;
-    const totalBTC = mainBTC + maturedBTC;
-    
-    // =============================================
-    // 4. RESPONSE
-    // =============================================
-    console.log(`\n💰 GET /api/users/balances for ${user.email}`);
-    console.log(`   MAIN: $${mainUSD.toFixed(2)} | ACTIVE: $${activeUSD.toFixed(2)} | MATURED: $${maturedUSD.toFixed(2)}`);
-    console.log(`   Crypto holdings: ${Object.keys(cryptoTradeBalances).join(', ') || 'none'}`);
-    console.log(`   BTC balance: ${totalBTC.toFixed(8)} BTC (main: ${mainBTC.toFixed(8)}, matured: ${maturedBTC.toFixed(8)})`);
-    
-    // Return response with:
-    // - main, active, matured, total: USD display values (for index.html balance display)
-    // - cryptoBalances: specific crypto balances from database (for trade gating)
-    // - btc: total BTC balance (for mining contract eligibility)
+    // Return the EXACT same values WebSocket broadcasts
     res.status(200).json({
       status: 'success',
-      // USD display values - used for total wallet holding display
       main: mainUSD,
       active: activeUSD,
       matured: maturedUSD,
       total: totalUSD,
-      // Raw crypto balances - used by index.html to check specific crypto balances
-      cryptoBalances: cryptoTradeBalances,
-      // BTC balance specifically - used for mining contract eligibility
-      btc: {
-        total: totalBTC,
-        main: mainBTC,
-        matured: maturedBTC
-      },
-      // Asset breakdown for detailed views
       assets: {
         main: mainBreakdown,
         matured: maturedBreakdown
@@ -36061,13 +35994,10 @@ app.get('/api/users/balances', protect, async (req, res) => {
     });
     
   } catch (err) {
-    console.error('Error in /api/users/balances:', err);
+    console.error('Error:', err);
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
-
-
-
 
 
 
