@@ -3469,136 +3469,24 @@ AdminSchema.index({ role: 1 });
 const Admin = mongoose.model('Admin', AdminSchema);
 
 const PlanSchema = new mongoose.Schema({
-  name: { 
-    type: String, 
-    required: [true, 'Plan name is required'], 
-    unique: true 
-  },
-  description: { 
-    type: String, 
-    required: [true, 'Description is required'] 
-  },
-  percentage: { 
-    type: Number, 
-    required: [true, 'Percentage is required'], 
-    min: [0, 'Percentage cannot be negative'] 
-  },
-  duration: { 
-    type: Number, 
-    required: [true, 'Duration is required'], 
-    min: [1, 'Duration must be at least 1 hour'] 
-  },
-  minAmount: { 
-    type: Number, 
-    required: [true, 'Minimum amount is required'], 
-    min: [0, 'Minimum amount cannot be negative'] 
-  },
-  maxAmount: { 
-    type: Number, 
-    required: [true, 'Maximum amount is required'] 
-  },
-  
-  // =============================================
-  // AUTO-COMPOUND CONFIGURATION
-  // Defines which contract durations (in months) users can choose.
-  // Backend already supports 1, 3, 6, 9, 12 via the Investment schema.
-  // Each month has multiple cycles based on plan.duration.
-  // =============================================
-  autoCompoundOptions: {
-    type: [Number],
-    default: [1, 3, 6, 9, 12],
-    validate: {
-      validator: function (arr) {
-        if (!Array.isArray(arr) || arr.length === 0) return false;
-        // Every option must be one of the supported durations
-        const allowed = [1, 3, 6, 9, 12];
-        return arr.every(v => allowed.includes(v));
-      },
-      message: 'Auto-compound options must be a non-empty subset of [1, 3, 6, 9, 12]'
-    }
-  },
-  defaultAutoCompoundMonths: {
-    type: Number,
-    enum: [1, 3, 6, 9, 12],
-    default: 1
-  },
-
-  // =============================================
-  // TIER / PRESENTATION METADATA
-  // These were previously derived at runtime from plan.name.
-  // Storing them explicitly makes plan cards fully backend-driven
-  // and removes all hardcoded tier logic from the frontend.
-  // =============================================
-  badge: { 
-    type: String, 
-    default: 'Standard' 
-  },
-  tier: {
-    type: String,
-    enum: ['starter', 'standard', 'gold', 'enterprise', 'ultimate'],
-    default: 'standard'
-  },
-  isPopular: { 
-    type: Boolean, 
-    default: false 
-  },
-  isBestValue: { 
-    type: Boolean, 
-    default: false 
-  },
-
-  // =============================================
-  // VISUAL THEME
-  // Single source of truth for card colors.
-  // Frontend reads these directly instead of computing them.
-  // =============================================
-  color: { 
-    type: String, 
-    default: '#2ECC71' 
-  },
-  lightColor: { 
-    type: String, 
-    default: '#58D68D' 
-  },
-  bgColor: { 
-    type: String, 
-    default: 'rgba(46, 204, 113, 0.12)' 
-  },
-  borderColor: { 
-    type: String, 
-    default: 'rgba(46, 204, 113, 0.3)' 
-  },
-
-  // =============================================
-  // FEATURE LIST
-  // Rendered directly on the plan card and on cloudmining.html.
-  // No feature is invented at render time.
-  // =============================================
-  features: {
-    type: [String],
-    default: []
-  },
-
-  isActive: { 
-    type: Boolean, 
-    default: true 
-  },
-  videoUrl: { 
-    type: String, 
-    default: '' 
-  },
-  referralBonus: { 
-    type: Number, 
-    default: 5, 
-    min: [0, 'Bonus cannot be negative'] 
-  }
+  name: { type: String, required: [true, 'Plan name is required'], unique: true },
+  description: { type: String, required: [true, 'Description is required'] },
+  percentage: { type: Number, required: [true, 'Percentage is required'], min: [0, 'Percentage cannot be negative'] },
+  duration: { type: Number, required: [true, 'Duration is required'], min: [1, 'Duration must be at least 1 hour'] },
+  minAmount: { type: Number, required: [true, 'Minimum amount is required'], min: [0, 'Minimum amount cannot be negative'] },
+  maxAmount: { type: Number, required: [true, 'Maximum amount is required'] },
+  // REMOVED: hashrate — now calculated dynamically per investment
+  // Formula (internal only): (principalUSD * return%) / (BTC_price * BTC_PER_TH_PER_HOUR * durationHours)
+  isActive: { type: Boolean, default: true },
+  videoUrl: { type: String, default: '' },
+  referralBonus: { type: Number, default: 5, min: [0, 'Bonus cannot be negative'] }
 }, { timestamps: true });
 
 PlanSchema.index({ name: 1 });
 PlanSchema.index({ isActive: 1 });
-PlanSchema.index({ tier: 1 });
 
 const Plan = mongoose.model('Plan', PlanSchema);
+
 
 
 const UserPreferenceSchema = new mongoose.Schema({
@@ -21852,19 +21740,10 @@ console.log('   - Activity logging for both users and guests');
 
 
 
-
-
-
 // =============================================
 // CLOUD MINING HASHPOWER PLANS ENDPOINT
 // User-facing only. Internal mining economics
 // (per-cycle fees, multiplier caps, exact formulas) stay in the background.
-//
-// ALL display data (badge, tier, colors, features, auto-compound options)
-// comes from the Plan document. Nothing is derived from plan.name.
-// Only two things are computed at request time:
-//   1. Live hashrate range (depends on current BTC price)
-//   2. Button state (depends on the logged-in user)
 // =============================================
 
 app.get('/api/plans', async (req, res) => {
@@ -21890,7 +21769,7 @@ app.get('/api/plans', async (req, res) => {
             });
         }
 
-        // ---- BTC price (used for USD↔BTC display and live hashrate) ----
+        // Get BTC price — used for USD↔BTC display and live hashrate range
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -21919,10 +21798,9 @@ app.get('/api/plans', async (req, res) => {
                     .select('balances kycStatus firstName lastName email isVerified');
 
                 if (user) {
-                    const kycVerified =
-                        user.kycStatus?.identity === 'verified' &&
-                        user.kycStatus?.address === 'verified' &&
-                        user.kycStatus?.facial === 'verified';
+                    const kycVerified = user.kycStatus?.identity === 'verified' &&
+                                     user.kycStatus?.address === 'verified' &&
+                                     user.kycStatus?.facial === 'verified';
 
                     const balances = await calculateRealWalletBalances(user);
                     const mainBalanceUSD = balances.mainUSD || 0;
@@ -21958,34 +21836,33 @@ app.get('/api/plans', async (req, res) => {
         }
 
         // =============================================
-        // HELPERS
-        // =============================================
-        const formatHashpower = (v) => {
-            if (!v || v <= 0) return '0';
-            if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-            if (v >= 1) return v.toFixed(1);
-            return v.toFixed(3);
-        };
-
-        // =============================================
         // BUILD USER-FACING PLAN CARDS
+        // Colors, badges, tier logic preserved.
+        // Hashrate range calculated live from investment range + BTC price.
         // =============================================
         const enhancedPlans = plans.map((plan) => {
-            const minAmountUSD = Number(plan.minAmount) || 0;
-            const maxAmountUSD = Number(plan.maxAmount) || 0;
-            const percentage = Number(plan.percentage) || 0;
-            const durationHours = Number(plan.duration) || 0;
-            const durationDays = durationHours > 0 ? durationHours / 24 : 0;
+            const minAmountUSD = plan.minAmount || 0;
+            const maxAmountUSD = plan.maxAmount || 0;
+            const percentage = plan.percentage || 0;
+            const durationHours = plan.duration || 0;
+            const planName = plan.name || 'Mining Contract';
+            const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
 
             // ---- BTC amounts for display ----
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
             const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
 
+            const durationDays = durationHours / 24;
+
             // =============================================
             // LIVE HASHPOWER RANGE (TH/s)
-            // Hashpower is computed from the NET principal
-            // (incoming balance minus the per-cycle fee), because
-            // that is what actually mines.
+            // Uses the internal mining economics (BTC_PER_TH_PER_HOUR,
+            // plan return %, plan duration) to determine the min and max
+            // hashpower a user could be assigned for this plan at the
+            // current BTC price. Values fluctuate in real time as BTC price changes.
+            //
+            // Hashpower is computed from the NET principal (incoming balance
+            // minus the per-cycle fee), because that is what actually mines.
             // =============================================
             const minNetPrincipal = minAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
             const maxNetPrincipal = maxAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
@@ -21993,44 +21870,142 @@ app.get('/api/plans', async (req, res) => {
             const minHashpower = calculateHashpower(minNetPrincipal, percentage, durationHours, btcPrice);
             const maxHashpower = calculateHashpower(maxNetPrincipal, percentage, durationHours, btcPrice);
 
-            const hashrateRangeDisplay =
-                minHashpower > 0 && maxHashpower > 0
-                    ? `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} TH/s`
-                    : 'Calculating...';
+            // Format nicely: no decimals for big numbers, 2 decimals for small ones
+            const formatHashpower = (v) => {
+                if (!v || v <= 0) return '0';
+                if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+                if (v >= 1) return v.toFixed(1);
+                return v.toFixed(3);
+            };
 
-            // =============================================
-            // ALL DISPLAY DATA COMES FROM THE PLAN DOCUMENT
-            // =============================================
-            const badge = plan.badge || 'Standard';
-            const tier = plan.tier || 'standard';
-            const isPopular = plan.isPopular === true;
-            const isBestValue = plan.isBestValue === true;
-            const color = plan.color || '#2ECC71';
-            const lightColor = plan.lightColor || '#58D68D';
-            const bgColor = plan.bgColor || 'rgba(46, 204, 113, 0.12)';
-            const borderColor = plan.borderColor || 'rgba(46, 204, 113, 0.3)';
-            const features = Array.isArray(plan.features) ? plan.features : [];
+            const hashrateRangeDisplay = (minHashpower > 0 && maxHashpower > 0)
+                ? `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} TH/s`
+                : 'Calculating...';
 
-            // Auto-compound options (with safe fallback)
-            const autoCompoundOptions =
-                Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length > 0
-                    ? plan.autoCompoundOptions
-                    : [1, 3, 6, 9, 12];
-            const defaultAutoCompoundMonths =
-                typeof plan.defaultAutoCompoundMonths === 'number' &&
-                autoCompoundOptions.includes(plan.defaultAutoCompoundMonths)
-                    ? plan.defaultAutoCompoundMonths
-                    : autoCompoundOptions[0];
+            // ---- Tier detection (colors preserved exactly) ----
+            const planNameLower = planName.toLowerCase();
+            let tierKey = 'standard';
+            let badge = 'Standard';
+            let displayName = planName;
+            let color = '#2ECC71';
+            let lightColor = '#58D68D';
+            let bgColor = 'rgba(46, 204, 113, 0.12)';
+            let borderColor = 'rgba(46, 204, 113, 0.3)';
+            let isPopular = false;
+            let isBestValue = false;
+
+            if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
+                tierKey = 'ultimate';
+                badge = 'Ultimate';
+                displayName = 'Ultimate Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
+                tierKey = 'enterprise';
+                badge = 'Enterprise';
+                displayName = 'Enterprise Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            } else if (planNameLower.includes('gold') || planNameLower.includes('premium')) {
+                tierKey = 'gold';
+                badge = 'Gold';
+                displayName = 'Gold Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = true;
+                isBestValue = true;
+            } else if (planNameLower.includes('starter') || planNameLower.includes('basic')) {
+                tierKey = 'starter';
+                badge = 'Basic';
+                displayName = 'Basic Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            } else {
+                tierKey = 'standard';
+                badge = 'Standard';
+                displayName = 'Standard Contract';
+                color = '#2ECC71';
+                lightColor = '#58D68D';
+                bgColor = 'rgba(46, 204, 113, 0.12)';
+                borderColor = 'rgba(46, 204, 113, 0.3)';
+                isPopular = false;
+                isBestValue = false;
+            }
+
+            // ---- Features (tier-differentiated, capped at 6 per tier) ----
+            // Cheaper plans have fewer features; higher plans add more value,
+            // up to the 6-item ceiling. Each tier inherits the tier below
+            // and adds one or two new perks.
+            let features = [];
+
+            if (tierKey === 'starter') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Basic performance dashboard'
+                ];
+            } else if (tierKey === 'standard') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Real-time performance dashboard',
+                    'Email cycle notifications'
+                ];
+            } else if (tierKey === 'gold') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Advanced analytics dashboard',
+                    'Email + in-app notifications',
+                    'Priority pool allocation',
+                    'Priority email support'
+                ];
+            } else if (tierKey === 'enterprise') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Dedicated mining capacity',
+                    'Advanced analytics + export tools',
+                    'Priority email + live chat support',
+                    'Dedicated account manager'
+                ];
+            } else if (tierKey === 'ultimate') {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Maximum-priority mining capacity',
+                    'Full analytics suite + API access',
+                    '24/7 priority support (email, chat, phone)',
+                    'Exclusive bonuses + early access'
+                ];
+            } else {
+                features = [
+                    'SHA-256 ASIC mining',
+                    'Automated cycle payouts',
+                    'Basic performance dashboard'
+                ];
+            }
 
             // BTC range display
-            const btcRange =
-                btcPrice > 0
-                    ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
-                    : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
+            const btcRange = btcPrice > 0
+                ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
+                : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
-            // =============================================
-            // BUTTON STATE (depends on logged-in user)
-            // =============================================
+            // ---- Button state ----
             let buttonState = 'login';
             let buttonText = 'Login to Rent Hashpower';
             let buttonTooltip = 'Please login to rent hashpower';
@@ -22046,13 +22021,12 @@ app.get('/api/plans', async (req, res) => {
                     buttonText = 'Make a Deposit';
                     buttonTooltip = 'A recent deposit or withdrawal is required';
                 } else {
-                    const totalUserBalance =
-                        userContext.mainBalance.usd + userContext.maturedBalance.usd;
+                    const totalUserBalance = userContext.mainBalance.usd + userContext.maturedBalance.usd;
                     if (totalUserBalance >= minAmountUSD) {
                         canRent = true;
                         buttonState = 'rent';
                         buttonText = 'Rent Hashpower';
-                        buttonTooltip = `Rent ${plan.name || 'mining'} capacity`;
+                        buttonTooltip = `Rent ${displayName} mining capacity`;
                     } else {
                         buttonState = 'insufficient';
                         buttonText = `Need $${minAmountUSD.toLocaleString()}`;
@@ -22066,41 +22040,33 @@ app.get('/api/plans', async (req, res) => {
             // Internal economics (per-cycle fee, multiplier cap, formula) NOT exposed.
             // =============================================
             return {
-                // Identity
-                _id: plan._id,
-                name: plan.name || 'Mining Contract',
+                name: displayName,
                 badge: badge,
-                description: plan.description || '',
-                tier: tier,
-
-                // Presentation (from DB, no derivation)
+                description: planDescription,
+                tier: tierKey,
                 isPopular: isPopular,
                 isBestValue: isBestValue,
                 bgColor: bgColor,
                 color: color,
                 borderColor: borderColor,
                 lightColor: lightColor,
-                features: features,
-
-                // Auto-compound configuration
-                autoCompound: {
-                    options: autoCompoundOptions,
-                    default: defaultAutoCompoundMonths
-                },
-
-                // Economics
                 percentage: percentage,
                 duration: {
                     hours: durationHours,
                     days: durationDays
                 },
-                minAmount: { usd: minAmountUSD },
-                maxAmount: { usd: maxAmountUSD },
+                minAmount: {
+                    usd: minAmountUSD
+                },
+                maxAmount: {
+                    usd: maxAmountUSD
+                },
                 minAmountBTC: minAmountBTC,
                 maxAmountBTC: maxAmountBTC,
                 btcRange: btcRange,
+                features: features,
 
-                // Live hashrate range (fluctuates with BTC price)
+                // ---- Live hashrate range (fluctuates with BTC price) ----
                 minHashpower: formatHashpower(minHashpower) + ' TH/s',
                 maxHashpower: formatHashpower(maxHashpower) + ' TH/s',
                 hashrate: {
@@ -22110,14 +22076,11 @@ app.get('/api/plans', async (req, res) => {
                     display: hashrateRangeDisplay
                 },
 
-                // Button state
+                // ---- Button state ----
                 buttonState: buttonState,
                 buttonText: buttonText,
                 buttonTooltip: buttonTooltip,
-                canRent: canRent,
-
-                // Referral metadata
-                referralBonus: Number(plan.referralBonus) || 0
+                canRent: canRent
             };
         });
 
@@ -22145,6 +22108,11 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
+
+
+
+
+
 
 
 
