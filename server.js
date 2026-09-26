@@ -35946,8 +35946,12 @@ app.get('/api/users/assets', protect, async (req, res) => {
 
 
 
-// server.js snippet
 
+
+// =============================================
+// REWRITTEN: /api/users/balances - Captures specific crypto balances
+// and returns them alongside the total USD holding value.
+// =============================================
 app.get('/api/users/balances', protect, async (req, res) => {
   try {
     const userId = req.user._id;
@@ -35959,11 +35963,18 @@ app.get('/api/users/balances', protect, async (req, res) => {
       return res.status(404).json({ status: 'fail', message: 'User not found' });
     }
     
-    // CALL THE SAME FUNCTION WEBSOCKET USES - NO MODIFICATIONS
-    const { mainUSD, activeUSD, maturedUSD, priceErrors, mainBreakdown, maturedBreakdown } = 
-      await calculateRealWalletBalances(user);
+    // Use the single source of truth for real wallet balances.
+    // This function now returns a more detailed breakdown.
+    const { 
+      mainUSD, 
+      activeUSD, 
+      maturedUSD, 
+      priceErrors, 
+      mainBreakdown, 
+      maturedBreakdown 
+    } = await calculateRealWalletBalances(user);
     
-    // If any price fetch failed, return error
+    // If any price fetch failed, return a specific error.
     if (priceErrors.length > 0) {
       return res.status(503).json({
         status: 'error',
@@ -35972,15 +35983,9 @@ app.get('/api/users/balances', protect, async (req, res) => {
       });
     }
     
-    // Calculate total - THIS IS THE WEBSOCKET VALUE
     const totalUSD = mainUSD + activeUSD + maturedUSD;
     
-    console.log(`\n💰 REST endpoint total: $${totalUSD.toFixed(2)}`);
-    console.log(`   MAIN: $${mainUSD.toFixed(2)}`);
-    console.log(`   ACTIVE: $${activeUSD.toFixed(2)}`);
-    console.log(`   MATURED: $${maturedUSD.toFixed(2)}`);
-    
-    // Return the EXACT same values WebSocket broadcasts
+    // The 'assets' object now contains the detailed breakdown needed by the frontend.
     res.status(200).json({
       status: 'success',
       main: mainUSD,
@@ -35994,13 +35999,10 @@ app.get('/api/users/balances', protect, async (req, res) => {
     });
     
   } catch (err) {
-    console.error('Error:', err);
+    console.error('Error in /api/users/balances:', err);
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
-
-
-
 
 
 
