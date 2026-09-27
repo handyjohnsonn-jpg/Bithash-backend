@@ -19363,24 +19363,29 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
-
-
-
 // =============================================
 // MINING CALCULATOR ENDPOINT
-// PUBLIC - No authentication required for guests
+// PUBLIC — no authentication required for guests.
 //
-// Any authenticated user (via Bearer token or jwt cookie) is recorded as
-// the log's performedBy. Guests are recorded with a synthetic identity so
-// admins can still see "Guest User <guest@bithash.com>" in the activity feed.
+// Logging rules (SystemLog is the single source of truth):
+//   - Logged-in user  → action: 'calculator_used'
+//                       performedBy: <userId>,  performedByModel: 'User'
+//                       performedByName / performedByEmail from the User doc
+//   - Guest           → action: 'calculator_used_guest'
+//                       performedBy: null,      performedByModel: 'System'
+//                       performedByName: 'Guest User'
+//                       performedByEmail: 'guest@bithash.com'
 //
-// Every successful calculation is written to SystemLog with the full set of
-// inputs, market context, and the recommended plan/projection so admins can
-// audit exactly what was calculated.
+// A logged-in user is NEVER labelled as a guest, even if the calculator
+// is invoked without a token on a page that also has a session cookie
+// for some other reason. The token is the sole source of "am I logged in".
+//
+// The endpoint itself never fails because logging failed. If logging
+// fails we log the reason server-side and still return the calculation.
 // =============================================
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
+  const userAgentHeader = req.headers['user-agent'] || 'Unknown';
 
   try {
     // =============================================
@@ -19391,7 +19396,7 @@ app.post('/api/mining/calculator', async (req, res) => {
       durationMonths,        // Duration in months (1, 3, 6, 9, 12)
       hashrateTH,            // Optional: desired TH/s to see cost
       calculationType        // 'investment' | 'hashrate' | 'duration'
-    } = req.body;
+    } = req.body || {};
 
     // =============================================
     // VALIDATE INPUTS
@@ -19402,7 +19407,7 @@ app.post('/api/mining/calculator', async (req, res) => {
       errors.push('Invalid calculation type. Must be: investment, hashrate, or duration');
     }
 
-    if (investmentAmount !== undefined) {
+    if (investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== '') {
       const amount = parseFloat(investmentAmount);
       if (isNaN(amount) || amount < 50) {
         errors.push('Minimum investment amount is $50');
@@ -19412,14 +19417,14 @@ app.post('/api/mining/calculator', async (req, res) => {
       }
     }
 
-    if (durationMonths !== undefined) {
+    if (durationMonths !== undefined && durationMonths !== null && durationMonths !== '') {
       const months = parseInt(durationMonths);
       if (isNaN(months) || ![1, 3, 6, 9, 12].includes(months)) {
         errors.push('Duration must be 1, 3, 6, 9, or 12 months');
       }
     }
 
-    if (hashrateTH !== undefined) {
+    if (hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '') {
       const th = parseFloat(hashrateTH);
       if (isNaN(th) || th <= 0) {
         errors.push('Hashrate must be a positive number');
@@ -19474,27 +19479,79 @@ app.post('/api/mining/calculator', async (req, res) => {
     }
 
     // =============================================
-    // DETECT USER FOR ACTIVITY LOGGING
+    // RESOLVE THE ACTOR (LOGGED-IN USER vs GUEST)
+    //
+    // The Authorization header is the ONLY signal we trust to decide
+    // whether the caller is authenticated. A stale/invalid token is
+    // treated as an unauthenticated guest — never as a logged-in user.
+    //
+    // We deliberately fetch the full user document (not just name/email)
+    // so we can compute balance context for the projection and also
+    // have a stable, verifiable identity for the audit trail.
     // =============================================
-    let userId = null;
-    let user = null;
-    let isLoggedIn = false;
+    const resolveCalculatorActor = async (req) => {
+      const actor = {
+        isLoggedIn: false,
+        userId: null,
+        user: null,
+        performedBy: null,
+        performedByModel: 'System',
+        performedByName: 'Guest User',
+        performedByEmail: 'guest@bithash.com'
+      };
 
-    const token = req.headers.authorization?.split(' ')[1] || req.cookies?.jwt;
+      const authHeader = req.headers.authorization;
+      const headerToken = authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.split(' ')[1]
+        : null;
+      const cookieToken = req.cookies && req.cookies.jwt ? req.cookies.jwt : null;
+      const token = headerToken || cookieToken;
 
-    if (token) {
+      if (!token) {
+        return actor;
+      }
+
       try {
         const decoded = verifyJWT(token);
-        user = await User.findById(decoded.id).select('firstName lastName email');
-        if (user) {
-          userId = user._id;
-          isLoggedIn = true;
+        if (!decoded || !decoded.id) {
+          return actor;
         }
+
+        const dbUser = await User.findById(decoded.id)
+          .select('firstName lastName email balances status isVerified')
+          .lean();
+
+        // If the account no longer exists, treat as guest rather than
+        // attributing the calculation to a phantom user.
+        if (!dbUser) {
+          return actor;
+        }
+
+        const fullName = [dbUser.firstName, dbUser.lastName]
+          .filter(Boolean)
+          .join(' ')
+          .trim();
+
+        actor.isLoggedIn = true;
+        actor.userId = dbUser._id;
+        actor.user = dbUser;
+        actor.performedBy = dbUser._id;
+        actor.performedByModel = 'User';
+        actor.performedByName = fullName || dbUser.email || 'User';
+        actor.performedByEmail = dbUser.email || 'unknown@bithash.com';
+
+        return actor;
       } catch (authErr) {
-        // Token invalid - continue as guest
-        isLoggedIn = false;
+        // Invalid / expired token → treat as guest. We do NOT flip
+        // this to "User" just because a cookie exists.
+        return actor;
       }
-    }
+    };
+
+    const actor = await resolveCalculatorActor(req);
+    const isLoggedIn = actor.isLoggedIn;
+    const userId = actor.userId;
+    const user = actor.user; // full user doc or null
 
     // =============================================
     // HELPER FUNCTIONS FOR CALCULATIONS
@@ -20093,6 +20150,10 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     // =============================================
     // ADD USER CONTEXT IF LOGGED IN
+    //
+    // Reuses the actor's user doc (already fetched) to avoid an extra
+    // DB round-trip. Only the `balances` map is needed, which the actor
+    // resolver already included in its projection.
     // =============================================
     if (isLoggedIn && user) {
       // Calculate user's total available balance
@@ -20100,10 +20161,9 @@ app.post('/api/mining/calculator', async (req, res) => {
       let userMaturedBalanceUSD = 0;
 
       try {
-        const fullUser = await User.findById(userId).select('balances');
-        if (fullUser && fullUser.balances) {
-          if (fullUser.balances.main) {
-            for (const [asset, balance] of fullUser.balances.main.entries()) {
+        if (user.balances) {
+          if (user.balances.main) {
+            for (const [asset, balance] of user.balances.main.entries()) {
               if (balance > 0 && asset !== 'usd') {
                 const price = await getCryptoPrice(asset.toUpperCase());
                 if (price && price > 0) {
@@ -20112,8 +20172,8 @@ app.post('/api/mining/calculator', async (req, res) => {
               }
             }
           }
-          if (fullUser.balances.matured) {
-            for (const [asset, balance] of fullUser.balances.matured.entries()) {
+          if (user.balances.matured) {
+            for (const [asset, balance] of user.balances.matured.entries()) {
               if (balance > 0 && asset !== 'usd') {
                 const price = await getCryptoPrice(asset.toUpperCase());
                 if (price && price > 0) {
@@ -20124,12 +20184,13 @@ app.post('/api/mining/calculator', async (req, res) => {
           }
         }
       } catch (balErr) {
-        console.warn('Could not fetch user balance for calculator:', balErr.message);
+        console.warn('Could not compute user balance for calculator:', balErr.message);
       }
 
       result.userContext = {
         isLoggedIn: true,
-        firstName: user.firstName,
+        firstName: user.firstName || null,
+        lastName: user.lastName || null,
         totalAvailableUSD: parseFloat((userMainBalanceUSD + userMaturedBalanceUSD).toFixed(2)),
         mainBalanceUSD: parseFloat(userMainBalanceUSD.toFixed(2)),
         maturedBalanceUSD: parseFloat(userMaturedBalanceUSD.toFixed(2))
@@ -20141,157 +20202,203 @@ app.post('/api/mining/calculator', async (req, res) => {
     }
 
     // =============================================
-    // BUILD CALCULATION SUMMARY FOR LOGGING
-    // Single object reused by both the DB write and (implicitly) the admin UI
-    // =============================================
-    let calculationSummary = null;
-
-    if (calculationType === 'hashrate' && result.hashrateCalculation) {
-      calculationSummary = {
-        requestedTH: result.hashrateCalculation.requestedTH,
-        optionsCount: result.hashrateCalculation.options?.length || 0,
-        recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
-        recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
-        recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
-        hasProjection: !!result.hashrateCalculation.projection
-      };
-    } else if (calculationType === 'investment' && result.investmentCalculation) {
-      calculationSummary = {
-        investmentAmount: result.investmentCalculation.investmentAmount,
-        eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
-        projectionsCount: result.investmentCalculation.projections?.length || 0,
-        recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
-        recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
-        recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
-        recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
-      };
-    } else if (calculationType === 'duration' && result.durationCalculation) {
-      calculationSummary = {
-        durationMonths: result.durationCalculation.durationMonths,
-        optionsCount: result.durationCalculation.options?.length || 0,
-        recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
-        recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
-        recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
-      };
-    } else if (result.overview) {
-      calculationSummary = {
-        totalPlans: result.overview.totalPlans,
-        mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
-        costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
-        minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
-      };
-    }
-
-    // =============================================
-    // ACTIVITY LOGGING - SYSTEMLOG IS THE SINGLE SOURCE OF TRUTH
+    // LOG ACTIVITY TO SYSTEMLOG
     //
-    // Fixes applied:
-    //   - entity: 'system'          (was 'System', which failed enum validation
-    //                                and caused every log write to silently throw)
-    //   - actionCategory: 'system'  (explicit; matches admin feed's filter key)
-    //   - performedByModel: 'User'  for both guests and registered users
-    //                                (a guest is still a person, not the system)
-    //   - metadata.isGuest          lets admin UI badge guest activity
-    //   - entityId: null            explicit
+    // Fixes in this version:
+    //   1. entity is 'system' (lowercase) so the enum passes.
+    //   2. action correctly separates user vs guest.
+    //   3. Logged-in users are ALWAYS attributed to their real account:
+    //      performedBy / performedByModel / performedByName / performedByEmail
+    //      are all populated from the User doc.
+    //   4. Guests use performedBy: null + performedByModel: 'System' and
+    //      a stable "Guest User / guest@bithash.com" identity so the admin
+    //      feed's `else if (performedByName || performedByEmail)` branch fires.
+    //   5. metadata is structured so the admin activity feed can render:
+    //        - WHO calculated (email, name, userId)
+    //        - WHAT they calculated (type, amount, duration, hashrate)
+    //        - WITH WHAT RESULT (recommended plan, profit, ROI, hashrate)
+    //        - UNDER WHAT MARKET (btc price, timestamp, plans available)
+    //   6. Flattened headline fields (amount, asset, description) live at the
+    //      top level of metadata so the admin formatter can show them without
+    //      special-casing the calculator.
+    //
+    // This call NEVER throws outward. Any failure is logged server-side only.
     // =============================================
-    let deviceInfo = null;
-
     try {
-      deviceInfo = await getUserDeviceInfo(req);
+      const deviceInfo = await getUserDeviceInfo(req);
 
-      const isGuest = !isLoggedIn || !userId;
+      const calculationTypeResolved = calculationType || 'overview';
 
-      // Identity of the actor. For guests we still record a synthetic identity
-      // so the admin feed's "who" column is populated, and we tag the record
-      // with isGuest so the UI can badge it distinctly.
-      const performedBy = isGuest ? null : userId;
-      const performedByModel = 'User'; // "User" covers both guest and registered person
-      const performedByEmail = isGuest
-        ? 'guest@bithash.com'
-        : (user?.email || 'unknown@bithash.com');
-      const performedByName = isGuest
-        ? 'Guest User'
-        : `${user?.firstName || ''} ${user?.lastName || ''}`.trim() || 'User';
+      // ---- Build a rich, structured calculation summary ----
+      let calculationSummary = null;
+      let recommendedPlanName = null;
+      let recommendedPlanId = null;
+      let recommendedProfitUSD = null;
+      let recommendedROIPercent = null;
+      let recommendedHashpower = null;
+      let recommendedInvestmentUSD = null;
 
-      const action = isGuest ? 'calculator_used_guest' : 'calculator_used';
+      if (calculationType === 'hashrate' && result.hashrateCalculation) {
+        calculationSummary = {
+          requestedTH: result.hashrateCalculation.requestedTH,
+          optionsCount: result.hashrateCalculation.options?.length || 0,
+          recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
+          recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
+          recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
+          hasProjection: !!result.hashrateCalculation.projection
+        };
+        recommendedPlanName = result.hashrateCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.hashrateCalculation.recommendedPlan?.planId || null;
+        recommendedInvestmentUSD = result.hashrateCalculation.recommendedPlan?.investmentUSD || null;
+        recommendedHashpower = result.hashrateCalculation.recommendedPlan?.hashpower || null;
+      } else if (calculationType === 'investment' && result.investmentCalculation) {
+        calculationSummary = {
+          investmentAmount: result.investmentCalculation.investmentAmount,
+          eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
+          projectionsCount: result.investmentCalculation.projections?.length || 0,
+          recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
+          recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
+          recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
+          recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
+        };
+        recommendedPlanName = result.investmentCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.investmentCalculation.recommendedPlan?.planId || null;
+        recommendedProfitUSD = result.investmentCalculation.recommendedPlan?.totalProfitUSD || null;
+        recommendedROIPercent = result.investmentCalculation.recommendedPlan?.roiPercent || null;
+        recommendedHashpower = result.investmentCalculation.recommendedPlan?.hashpower || null;
+        recommendedInvestmentUSD = result.investmentCalculation.recommendedPlan?.investmentUSD || null;
+      } else if (calculationType === 'duration' && result.durationCalculation) {
+        calculationSummary = {
+          durationMonths: result.durationCalculation.durationMonths,
+          optionsCount: result.durationCalculation.options?.length || 0,
+          recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
+          recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
+          recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
+        };
+        recommendedPlanName = result.durationCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.durationCalculation.recommendedPlan?.planId || null;
+        recommendedProfitUSD = result.durationCalculation.recommendedPlan?.totalProfitUSD || null;
+        recommendedROIPercent = result.durationCalculation.recommendedPlan?.roiPercent || null;
+        recommendedHashpower = result.durationCalculation.recommendedPlan?.hashpower || null;
+        recommendedInvestmentUSD = result.durationCalculation.recommendedPlan?.minInvestmentUSD || null;
+      } else if (result.overview) {
+        calculationSummary = {
+          totalPlans: result.overview.totalPlans,
+          mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
+          costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
+          minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
+        };
+        recommendedPlanName = result.overview.mostCostEffectivePlan?.planName || null;
+        recommendedPlanId = result.overview.mostCostEffectivePlan?.planId || null;
+        recommendedInvestmentUSD = result.overview.mostCostEffectivePlan?.minInvestment || null;
+      }
+
+      // ---- Headline numbers so the admin feed can render without deep digging ----
+      const parsedInvestmentAmount = investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== ''
+        ? parseFloat(investmentAmount)
+        : null;
+      const parsedDurationMonths = durationMonths !== undefined && durationMonths !== null && durationMonths !== ''
+        ? parseInt(durationMonths)
+        : null;
+      const parsedHashrateTH = hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== ''
+        ? parseFloat(hashrateTH)
+        : null;
+
+      // A human-readable one-liner describing what was calculated.
+      let description = 'Mining calculator used';
+      if (calculationType === 'investment' && parsedInvestmentAmount !== null) {
+        description = `Calculated investment projection for $${parsedInvestmentAmount.toLocaleString('en-US')}${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
+      } else if (calculationType === 'hashrate' && parsedHashrateTH !== null) {
+        description = `Calculated cost for ${parsedHashrateTH.toLocaleString('en-US')} TH/s${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
+      } else if (calculationType === 'duration' && parsedDurationMonths !== null) {
+        description = `Compared all plans over ${parsedDurationMonths} month(s)`;
+      } else {
+        description = 'Viewed mining calculator overview';
+      }
 
       await SystemLog.create({
-        action,
-        actionCategory: 'system',   // explicit so admin filters find it
-        entity: 'system',           // FIXED: lowercase enum value
+        // --- Core identity of the event ---
+        action: isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest',
+        entity: 'system', // must match the SystemLogSchema enum (lowercase)
         entityId: null,
 
-        performedBy,
-        performedByModel,
-        performedByEmail,
-        performedByName,
+        // --- WHO performed the action ---
+        performedBy: actor.performedBy,               // ObjectId for users, null for guests
+        performedByModel: actor.performedByModel,     // 'User' or 'System'
+        performedByEmail: actor.performedByEmail,
+        performedByName: actor.performedByName,
 
+        // --- Outcome ---
         status: 'success',
-        riskLevel: 'low',
 
-        // Request / network context
+        // --- Network / device context ---
         ip: deviceInfo.ip,
-        userAgent: req.headers['user-agent'] || 'Unknown',
+        userAgent: userAgentHeader,
         location: deviceInfo.location || 'Unknown',
         deviceType: getDeviceType(req),
-        os: getOSFromUserAgent(req.headers['user-agent']),
-        browser: getBrowserFromUserAgent(req.headers['user-agent']),
+        os: getOSFromUserAgent(userAgentHeader),
+        browser: getBrowserFromUserAgent(userAgentHeader),
         countryCode: deviceInfo.locationDetails?.country_code || 'Unknown',
         city: deviceInfo.locationDetails?.city || 'Unknown',
         region: deviceInfo.locationDetails?.region || 'Unknown',
         latitude: deviceInfo.locationDetails?.latitude || null,
         longitude: deviceInfo.locationDetails?.longitude || null,
 
+        // --- Rich, admin-readable payload ---
         metadata: {
-          // ---- Calculation inputs ----
-          calculationType: calculationType || 'overview',
-          investmentAmount: investmentAmount || null,
-          investmentAmountUSD: investmentAmount ? parseFloat(investmentAmount) : null,
-          durationMonths: durationMonths || null,
-          hashrateTH: hashrateTH || null,
+          // Headline fields the admin activity formatter already understands.
+          description: description,
+          amount: parsedInvestmentAmount,                    // USD the user typed (if any)
+          asset: 'USD',
+          calculationType: calculationTypeResolved,
 
-          // ---- Market context at time of calculation ----
-          btcPriceAtCalculation: btcPrice,
-          btcPriceTimestamp: new Date().toISOString(),
+          // Raw request inputs
+          inputs: {
+            investmentAmount: parsedInvestmentAmount,
+            durationMonths: parsedDurationMonths,
+            hashrateTH: parsedHashrateTH
+          },
 
-          // ---- Plans context ----
-          plansAvailable: plans.length,
-          plansAvailableCount: plans.length,
+          // Market context at the moment of the calculation
+          market: {
+            btcPriceAtCalculation: btcPrice,
+            btcPriceTimestamp: new Date().toISOString(),
+            plansAvailable: plans.length
+          },
 
-          // ---- Structured summary of what was returned ----
-          calculationSummary,
+          // Result summary — the "what did they actually get back"
+          calculationSummary: calculationSummary,
+          recommendedPlanName: recommendedPlanName,
+          recommendedPlanId: recommendedPlanId,
+          recommendedInvestmentUSD: recommendedInvestmentUSD,
+          recommendedProfitUSD: recommendedProfitUSD,
+          recommendedROIPercent: recommendedROIPercent,
+          recommendedHashpower: recommendedHashpower,
 
-          // ---- Actor context (helps admin UI render even if performer fields change) ----
-          isGuest,
-          isLoggedIn,
-          userFirstName: isGuest ? null : (user?.firstName || null),
-          userLastName: isGuest ? null : (user?.lastName || null),
-          userEmail: isGuest ? null : (user?.email || null),
-          userId: isGuest ? null : userId.toString(),
+          // Actor context — resolved from the User doc when logged in
+          isLoggedIn: isLoggedIn,
+          userFirstName: isLoggedIn && user ? (user.firstName || null) : null,
+          userLastName: isLoggedIn && user ? (user.lastName || null) : null,
+          userEmail: isLoggedIn && user ? (user.email || null) : null,
+          userId: isLoggedIn && userId ? userId.toString() : null,
 
-          // ---- Logged-in user's wallet snapshot at calculation time ----
+          // Balance context for logged-in users
           userMainBalanceUSD: result.userContext?.mainBalanceUSD ?? null,
           userMaturedBalanceUSD: result.userContext?.maturedBalanceUSD ?? null,
           userTotalAvailableUSD: result.userContext?.totalAvailableUSD ?? null,
 
-          // ---- Result metadata ----
+          // Operational
           resultProvided: true,
-          processingTimeMs: Date.now() - startTime,
-
-          // ---- Request tracing ----
-          requestId: req.headers['x-request-id'] || null
+          processingTimeMs: Date.now() - startTime
         }
       });
     } catch (logError) {
-      // Logging must never break the calculator response, but we now log the
-      // full error (including stack) so future schema/enum regressions surface
-      // immediately instead of being silently swallowed.
-      console.error('❌ Failed to log calculator activity to SystemLog');
-      console.error('   action:', isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest');
-      console.error('   message:', logError.message);
-      console.error('   stack:', logError.stack);
-      if (deviceInfo) {
-        console.error('   deviceInfo.ip:', deviceInfo.ip);
+      // Logging is best-effort: never break the calculation response because
+      // the audit write failed. We DO surface the reason in the server log
+      // so schema / enum regressions are easy to spot during development.
+      console.error('Failed to log calculator activity:', logError.message);
+      if (logError.errors) {
+        console.error('Validation errors:', JSON.stringify(logError.errors, null, 2));
       }
     }
 
@@ -20310,6 +20417,39 @@ app.post('/api/mining/calculator', async (req, res) => {
   } catch (err) {
     console.error('Mining calculator error:', err);
 
+    // Best-effort: also record fatal calculator errors in the audit trail so
+    // admins can distinguish "no one is using the calculator" from
+    // "everyone who uses the calculator is hitting an error".
+    try {
+      const deviceInfo = await getUserDeviceInfo(req);
+      await SystemLog.create({
+        action: 'calculator_error',
+        entity: 'system',
+        entityId: null,
+        performedBy: null,
+        performedByModel: 'System',
+        performedByEmail: 'system@bithash.com',
+        performedByName: 'System',
+        status: 'failed',
+        errorMessage: err.message || 'Unknown calculator error',
+        errorStack: err.stack,
+        ip: deviceInfo.ip,
+        userAgent: userAgentHeader,
+        location: deviceInfo.location || 'Unknown',
+        deviceType: getDeviceType(req),
+        os: getOSFromUserAgent(userAgentHeader),
+        browser: getBrowserFromUserAgent(userAgentHeader),
+        metadata: {
+          description: 'Mining calculator threw an unhandled error',
+          body: req.body || {},
+          url: req.originalUrl,
+          method: req.method
+        }
+      });
+    } catch (logError) {
+      console.error('Failed to log calculator error to SystemLog:', logError.message);
+    }
+
     res.status(500).json({
       status: 'error',
       success: false,
@@ -20324,11 +20464,9 @@ console.log('   - POST /api/mining/calculator');
 console.log('   - Public access (no authentication required)');
 console.log('   - Supports: investment, hashrate, and duration calculations');
 console.log('   - Real-time BTC price (not displayed)');
-console.log('   - Activity logging for both users and guests to SystemLog');
-console.log('   - Action: calculator_used | calculator_used_guest');
-console.log('   - Category: system');
-
-
+console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
+console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
+console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
 
 
 
