@@ -48221,11 +48221,6 @@ app.post('/api/admin/wallet-management/treasury/transfer', adminProtect, restric
 
 
 
-
-
-
-
-
 // =============================================
 // MINING STATISTICS - SINGLE SOURCE OF TRUTH (REDIS)
 // =============================================
@@ -48251,6 +48246,21 @@ app.post('/api/admin/wallet-management/treasury/transfer', adminProtect, restric
 // Redis keys for mining stats (single source of truth)
 const REDIS_MINING_KEY = 'mining_stats';
 const REDIS_MINING_LAST_UPDATE_KEY = 'mining_stats_last_update';
+
+// =============================================
+// NUMBER FORMATTING HELPER
+// =============================================
+//
+// Declared as a hoisted `function` (not a const arrow) so boot-time
+// logging can safely call it before the rest of the module is evaluated.
+// Using `const` here would put the helper in the temporal dead zone and
+// throw: ReferenceError: Cannot access 'formatNumberWithCommas' before
+// initialization.
+//
+function formatNumberWithCommas(num) {
+    if (num === undefined || num === null || Number.isNaN(Number(num))) return '--';
+    return Number(num).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
 
 // =============================================
 // CLEAR REDIS - FORCE FRESH START
@@ -48354,13 +48364,6 @@ const getCurrentInvestorCount = async () => {
         console.error('Error getting investor count:', err);
         return INITIAL_INVESTOR_COUNT;
     }
-};
-
-/**
- * Format number with commas (e.g., 1,000,000)
- */
-const formatNumberWithCommas = (num) => {
-    return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 };
 
 /**
@@ -48531,7 +48534,7 @@ const updateMiningStats = async () => {
         // with a slight upward drift and small bounded noise.
         // =============================================
         const range = MINING_CONFIG.btcRewards.max - MINING_CONFIG.btcRewards.min;
-        const drift = range * 0.001;                       // 0.1% of range per update
+        const drift = range * 0.001;                        // 0.1% of range per update
         const noise = (Math.random() - 0.5) * range * 0.02; // ±1% of range
 
         let newBtcRewards = currentStats.btcRewards + drift + noise;
