@@ -19361,13 +19361,27 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
+
+
+
+
+
+
 // =============================================
 // MINING CALCULATOR ENDPOINT
 // PUBLIC - No authentication required for guests
+//
+// Any authenticated user (via Bearer token or jwt cookie) is recorded as
+// the log's performedBy. Guests are recorded with a synthetic identity so
+// admins can still see "Guest User <guest@bithash.com>" in the activity feed.
+//
+// Every successful calculation is written to SystemLog with the full set of
+// inputs, market context, and the recommended plan/projection so admins can
+// audit exactly what was calculated.
 // =============================================
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
-  
+
   try {
     // =============================================
     // EXTRACT INPUTS
@@ -19383,7 +19397,7 @@ app.post('/api/mining/calculator', async (req, res) => {
     // VALIDATE INPUTS
     // =============================================
     const errors = [];
-    
+
     if (calculationType && !['investment', 'hashrate', 'duration'].includes(calculationType)) {
       errors.push('Invalid calculation type. Must be: investment, hashrate, or duration');
     }
@@ -19467,7 +19481,7 @@ app.post('/api/mining/calculator', async (req, res) => {
     let isLoggedIn = false;
 
     const token = req.headers.authorization?.split(' ')[1] || req.cookies?.jwt;
-    
+
     if (token) {
       try {
         const decoded = verifyJWT(token);
@@ -19544,17 +19558,17 @@ app.post('/api/mining/calculator', async (req, res) => {
       const durationHours = plan.duration;
       const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
       const totalMonths = months;
-      
+
       // Initial incoming balance
       const initialIncomingUSD = principalUSD;
       const initialIncomingBTC = principalUSD / currentBtcPrice;
-      
+
       // First cycle fee calculation
       const firstCycleFeeUSD = initialIncomingUSD * (CYCLE_FEE_PERCENT / 100);
       const firstCycleFeeBTC = initialIncomingBTC * (CYCLE_FEE_PERCENT / 100);
       const firstNetPrincipalUSD = initialIncomingUSD - firstCycleFeeUSD;
       const firstNetPrincipalBTC = initialIncomingBTC - firstCycleFeeBTC;
-      
+
       // Calculate hashpower based on first cycle net principal
       const initialHashpower = calculateHashpower(
         firstNetPrincipalUSD,
@@ -19562,7 +19576,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         durationHours,
         currentBtcPrice
       );
-      
+
       // Monthly reset model tracking
       let currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
       let currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
@@ -19570,10 +19584,10 @@ app.post('/api/mining/calculator', async (req, res) => {
       let totalReturnBTC = 0;
       let totalFeesUSD = 0;
       let totalFeesBTC = 0;
-      
+
       // Track cycle-by-cycle within each month
       const monthlyBreakdown = [];
-      
+
       for (let month = 1; month <= totalMonths; month++) {
         let monthIncomingUSD = currentMonthStartingPrincipalUSD;
         let monthIncomingBTC = currentMonthStartingPrincipalBTC;
@@ -19581,44 +19595,44 @@ app.post('/api/mining/calculator', async (req, res) => {
         let monthReturnBTC = 0;
         let monthFeesUSD = 0;
         let monthFeesBTC = 0;
-        
+
         // Process each cycle in the month
         for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
           // Apply 3% fee at start of EVERY cycle
           const cycleFeeUSD = monthIncomingUSD * (CYCLE_FEE_PERCENT / 100);
           const cycleFeeBTC = monthIncomingBTC * (CYCLE_FEE_PERCENT / 100);
-          
+
           monthFeesUSD += cycleFeeUSD;
           monthFeesBTC += cycleFeeBTC;
-          
+
           // Net principal after fee
           const netPrincipalUSD = monthIncomingUSD - cycleFeeUSD;
           const netPrincipalBTC = monthIncomingBTC - cycleFeeBTC;
-          
+
           // Apply plan return percentage
           const cycleReturnUSD = netPrincipalUSD * (1 + planPercentage);
           const cycleReturnBTC = netPrincipalBTC * (1 + planPercentage);
-          
+
           // For next cycle in same month, use the return as incoming
           monthIncomingUSD = cycleReturnUSD;
           monthIncomingBTC = cycleReturnBTC;
-          
+
           // Track last cycle return for this month
           monthReturnUSD = cycleReturnUSD;
           monthReturnBTC = cycleReturnBTC;
         }
-        
+
         // After all cycles in month, this is the month's total return
         // At month boundary: sweep the COMPOUNDED result to matured
         // and RESET principal to original net starting value
         const monthProfitUSD = monthReturnUSD - currentMonthStartingPrincipalUSD;
         const monthProfitBTC = monthReturnBTC - currentMonthStartingPrincipalBTC;
-        
+
         totalReturnUSD += monthReturnUSD;
         totalReturnBTC += monthReturnBTC;
         totalFeesUSD += monthFeesUSD;
         totalFeesBTC += monthFeesBTC;
-        
+
         monthlyBreakdown.push({
           month: month,
           startingPrincipalUSD: parseFloat(currentMonthStartingPrincipalUSD.toFixed(2)),
@@ -19631,25 +19645,25 @@ app.post('/api/mining/calculator', async (req, res) => {
           feesPaidUSD: parseFloat(monthFeesUSD.toFixed(2)),
           feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
         });
-        
+
         // Principal resets to original net starting value for next month
         // (this is the key to LINEAR month-over-month growth)
         currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
         currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
       }
-      
+
       // Final payout is the last month's ending value
       const finalPayoutUSD = monthlyBreakdown[monthlyBreakdown.length - 1].endingValueUSD;
       const finalPayoutBTC = monthlyBreakdown[monthlyBreakdown.length - 1].endingValueBTC;
-      
+
       // Total profit is sum of monthly profits
       const totalProfitUSD = monthlyBreakdown.reduce((sum, m) => sum + m.profitUSD, 0);
       const totalProfitBTC = monthlyBreakdown.reduce((sum, m) => sum + m.profitBTC, 0);
-      
+
       // Total fees paid
       const totalFeesPaidUSD = monthlyBreakdown.reduce((sum, m) => sum + m.feesPaidUSD, 0);
       const totalFeesPaidBTC = monthlyBreakdown.reduce((sum, m) => sum + m.feesPaidBTC, 0);
-      
+
       return {
         // Core metrics
         principalUSD: parseFloat(principalUSD.toFixed(2)),
@@ -19659,7 +19673,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         netPrincipalUSD: parseFloat(firstNetPrincipalUSD.toFixed(2)),
         netPrincipalBTC: parseFloat(firstNetPrincipalBTC.toFixed(8)),
         hashpower: initialHashpower,
-        
+
         // Return metrics
         totalReturnUSD: parseFloat(totalReturnUSD.toFixed(2)),
         totalReturnBTC: parseFloat(totalReturnBTC.toFixed(8)),
@@ -19667,22 +19681,22 @@ app.post('/api/mining/calculator', async (req, res) => {
         totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
         finalPayoutUSD: parseFloat(finalPayoutUSD.toFixed(2)),
         finalPayoutBTC: parseFloat(finalPayoutBTC.toFixed(8)),
-        
+
         // Fee metrics
         totalFeesUSD: parseFloat(totalFeesPaidUSD.toFixed(2)),
         totalFeesBTC: parseFloat(totalFeesPaidBTC.toFixed(8)),
-        
+
         // Cycle metrics
         cyclesPerMonth: cyclesPerMonth,
         totalCycles: cyclesPerMonth * totalMonths,
         durationMonths: totalMonths,
         durationHours: durationHours,
         cycleDurationHours: durationHours,
-        
+
         // ROI
         roiPercent: parseFloat(((totalProfitUSD / principalUSD) * 100).toFixed(2)),
         roiPerMonth: parseFloat(((totalProfitUSD / principalUSD / totalMonths) * 100).toFixed(2)),
-        
+
         // Monthly breakdown
         monthlyBreakdown: monthlyBreakdown
       };
@@ -19694,11 +19708,11 @@ app.post('/api/mining/calculator', async (req, res) => {
     const calculateCostPerTH = (plan, currentBtcPrice) => {
       // Use minimum investment to establish base hashpower
       const minInvestment = plan.minAmount;
-      
+
       // Calculate net principal for min investment
       const feeUSD = minInvestment * (CYCLE_FEE_PERCENT / 100);
       const netPrincipalUSD = minInvestment - feeUSD;
-      
+
       // Calculate hashpower for min investment
       const hashpower = calculateHashpower(
         netPrincipalUSD,
@@ -19706,12 +19720,12 @@ app.post('/api/mining/calculator', async (req, res) => {
         plan.duration,
         currentBtcPrice
       );
-      
+
       if (hashpower <= 0) return null;
-      
+
       // Cost per TH/s = investment / hashpower
       const costPerTHUSD = minInvestment / hashpower;
-      
+
       return {
         minInvestment: minInvestment,
         hashpowerAtMin: hashpower,
@@ -19726,7 +19740,7 @@ app.post('/api/mining/calculator', async (req, res) => {
     const planMetrics = plans.map(plan => {
       const costData = calculateCostPerTH(plan, btcPrice);
       const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
-      
+
       return {
         planId: plan._id.toString(),
         name: plan.name,
@@ -19759,7 +19773,7 @@ app.post('/api/mining/calculator', async (req, res) => {
     // =============================================
     if (calculationType === 'hashrate' && hashrateTH !== undefined) {
       const requestedTH = parseFloat(hashrateTH);
-      
+
       // Find best plan based on duration preference
       let targetPlans = planMetrics;
       if (durationMonths) {
@@ -19769,26 +19783,26 @@ app.post('/api/mining/calculator', async (req, res) => {
           return maxCycles >= 1;
         });
       }
-      
+
       // Calculate required investment for each plan to achieve requested TH/s
       const hashrateOptions = targetPlans.map(plan => {
         // Reverse engineer: hashpower = (netPrincipal * (percentage/100) / btcPrice) / (BTC_PER_TH_PER_HOUR * durationHours)
         // netPrincipal = hashpower * (BTC_PER_TH_PER_HOUR * durationHours) * btcPrice / (percentage/100)
-        
+
         const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.durationHours;
         const btcReturnNeeded = requestedTH * btcMinedPerTH;
         const usdReturnNeeded = btcReturnNeeded * btcPrice;
         const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
-        
+
         // Add back the 3% fee to get gross investment
         const grossInvestment = netPrincipalNeeded / (1 - CYCLE_FEE_PERCENT / 100);
-        
+
         // Check if this investment falls within plan range
         const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
-        
+
         // If below minimum, use minimum investment
         const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
-        
+
         // Recalculate hashpower for effective investment
         const effectiveFee = effectiveInvestment * (CYCLE_FEE_PERCENT / 100);
         const effectiveNet = effectiveInvestment - effectiveFee;
@@ -19798,7 +19812,7 @@ app.post('/api/mining/calculator', async (req, res) => {
           plan.durationHours,
           btcPrice
         );
-        
+
         return {
           planId: plan.planId,
           planName: plan.name,
@@ -19812,7 +19826,7 @@ app.post('/api/mining/calculator', async (req, res) => {
           costPerTHUSD: parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2)),
           costPerTHBTC: parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8)),
           isWithinRange: isWithinRange,
-          rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum' : 
+          rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum' :
                        grossInvestment > plan.maxAmount ? 'above_maximum' : 'within_range',
           minAmount: plan.minAmount,
           maxAmount: plan.maxAmount,
@@ -19820,13 +19834,13 @@ app.post('/api/mining/calculator', async (req, res) => {
           planPercentage: plan.percentage
         };
       });
-      
+
       // Sort by cost per TH (lowest first)
       hashrateOptions.sort((a, b) => a.costPerTHUSD - b.costPerTHUSD);
-      
+
       // Find the best option that's within range
       const bestOption = hashrateOptions.find(o => o.isWithinRange) || hashrateOptions[0];
-      
+
       result.hashrateCalculation = {
         requestedTH: requestedTH,
         options: hashrateOptions,
@@ -19841,7 +19855,7 @@ app.post('/api/mining/calculator', async (req, res) => {
           reason: `Best cost efficiency at $${bestOption.costPerTHUSD}/TH/s`
         } : null
       };
-      
+
       // Calculate projection for recommended plan
       if (bestOption && durationMonths) {
         const plan = plans.find(p => p._id.toString() === bestOption.planId);
@@ -19862,12 +19876,12 @@ app.post('/api/mining/calculator', async (req, res) => {
     // =============================================
     else if (calculationType === 'investment' && investmentAmount !== undefined) {
       const amount = parseFloat(investmentAmount);
-      
+
       // Find all plans where the investment amount fits within range
-      const eligiblePlans = plans.filter(plan => 
+      const eligiblePlans = plans.filter(plan =>
         amount >= plan.minAmount && amount <= plan.maxAmount
       );
-      
+
       if (eligiblePlans.length === 0) {
         // Investment doesn't fit any plan - find closest alternatives
         const plansByRange = [...plans].sort((a, b) => {
@@ -19875,17 +19889,17 @@ app.post('/api/mining/calculator', async (req, res) => {
           const bDist = Math.min(Math.abs(amount - b.minAmount), Math.abs(amount - b.maxAmount));
           return aDist - bDist;
         });
-        
+
         const closestPlan = plansByRange[0];
         const isBelowMin = amount < closestPlan.minAmount;
-        
+
         result.investmentCalculation = {
           investmentAmount: amount,
           investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
           eligiblePlans: [],
           recommendation: {
             type: isBelowMin ? 'increase_investment' : 'reduce_investment',
-            message: isBelowMin 
+            message: isBelowMin
               ? `Minimum investment for ${closestPlan.name} is $${closestPlan.minAmount.toLocaleString()}. You need $${(closestPlan.minAmount - amount).toLocaleString()} more.`
               : `Maximum investment for ${closestPlan.name} is $${closestPlan.maxAmount.toLocaleString()}. Consider reducing by $${(amount - closestPlan.maxAmount).toLocaleString()}.`,
             closestPlan: {
@@ -19906,7 +19920,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             durationMonths || 1,
             btcPrice
           );
-          
+
           return {
             planId: plan._id.toString(),
             planName: plan.name,
@@ -19918,13 +19932,13 @@ app.post('/api/mining/calculator', async (req, res) => {
             ...projection
           };
         });
-        
+
         // Sort by total profit (highest first)
         planProjections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
-        
+
         // Best plan is highest profit
         const bestPlan = planProjections[0];
-        
+
         result.investmentCalculation = {
           investmentAmount: amount,
           investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
@@ -19962,7 +19976,7 @@ app.post('/api/mining/calculator', async (req, res) => {
     // =============================================
     else if (calculationType === 'duration' && durationMonths !== undefined) {
       const months = parseInt(durationMonths);
-      
+
       // Calculate projections for ALL plans using minimum investment
       const durationOptions = planMetrics.map(plan => {
         const projection = calculateContractProjection(
@@ -19971,7 +19985,7 @@ app.post('/api/mining/calculator', async (req, res) => {
           months,
           btcPrice
         );
-        
+
         return {
           planId: plan.planId,
           planName: plan.name,
@@ -19984,13 +19998,13 @@ app.post('/api/mining/calculator', async (req, res) => {
           ...projection
         };
       });
-      
+
       // Sort by ROI per month (highest first)
       durationOptions.sort((a, b) => b.roiPerMonth - a.roiPerMonth);
-      
+
       // Best plan is highest ROI per month
       const bestPlan = durationOptions[0];
-      
+
       result.durationCalculation = {
         durationMonths: months,
         options: durationOptions,
@@ -20033,7 +20047,7 @@ app.post('/api/mining/calculator', async (req, res) => {
           1,
           btcPrice
         );
-        
+
         return {
           planId: plan.planId,
           planName: plan.name,
@@ -20052,16 +20066,16 @@ app.post('/api/mining/calculator', async (req, res) => {
           minInvestmentMonthlyROI: projection.roiPercent
         };
       });
-      
+
       // Sort by cost per TH (lowest first)
       planComparisons.sort((a, b) => {
         if (!a.costPerTH || !b.costPerTH) return 0;
         return a.costPerTH.costPerTHUSD - b.costPerTH.costPerTHUSD;
       });
-      
+
       // Find most cost-effective plan
       const mostCostEffective = planComparisons[0];
-      
+
       result.overview = {
         totalPlans: planComparisons.length,
         plans: planComparisons,
@@ -20084,7 +20098,7 @@ app.post('/api/mining/calculator', async (req, res) => {
       // Calculate user's total available balance
       let userMainBalanceUSD = 0;
       let userMaturedBalanceUSD = 0;
-      
+
       try {
         const fullUser = await User.findById(userId).select('balances');
         if (fullUser && fullUser.balances) {
@@ -20112,7 +20126,7 @@ app.post('/api/mining/calculator', async (req, res) => {
       } catch (balErr) {
         console.warn('Could not fetch user balance for calculator:', balErr.message);
       }
-      
+
       result.userContext = {
         isLoggedIn: true,
         firstName: user.firstName,
@@ -20127,63 +20141,95 @@ app.post('/api/mining/calculator', async (req, res) => {
     }
 
     // =============================================
-    // LOG ACTIVITY TO SYSTEMLOG (ENHANCED FOR DETAILED TRACKING)
+    // BUILD CALCULATION SUMMARY FOR LOGGING
+    // Single object reused by both the DB write and (implicitly) the admin UI
     // =============================================
+    let calculationSummary = null;
+
+    if (calculationType === 'hashrate' && result.hashrateCalculation) {
+      calculationSummary = {
+        requestedTH: result.hashrateCalculation.requestedTH,
+        optionsCount: result.hashrateCalculation.options?.length || 0,
+        recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
+        recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
+        recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
+        hasProjection: !!result.hashrateCalculation.projection
+      };
+    } else if (calculationType === 'investment' && result.investmentCalculation) {
+      calculationSummary = {
+        investmentAmount: result.investmentCalculation.investmentAmount,
+        eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
+        projectionsCount: result.investmentCalculation.projections?.length || 0,
+        recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
+        recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
+        recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
+        recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
+      };
+    } else if (calculationType === 'duration' && result.durationCalculation) {
+      calculationSummary = {
+        durationMonths: result.durationCalculation.durationMonths,
+        optionsCount: result.durationCalculation.options?.length || 0,
+        recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
+        recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
+        recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
+      };
+    } else if (result.overview) {
+      calculationSummary = {
+        totalPlans: result.overview.totalPlans,
+        mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
+        costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
+        minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
+      };
+    }
+
+    // =============================================
+    // ACTIVITY LOGGING - SYSTEMLOG IS THE SINGLE SOURCE OF TRUTH
+    //
+    // Fixes applied:
+    //   - entity: 'system'          (was 'System', which failed enum validation
+    //                                and caused every log write to silently throw)
+    //   - actionCategory: 'system'  (explicit; matches admin feed's filter key)
+    //   - performedByModel: 'User'  for both guests and registered users
+    //                                (a guest is still a person, not the system)
+    //   - metadata.isGuest          lets admin UI badge guest activity
+    //   - entityId: null            explicit
+    // =============================================
+    let deviceInfo = null;
+
     try {
-      const deviceInfo = await getUserDeviceInfo(req);
+      deviceInfo = await getUserDeviceInfo(req);
 
-      // Build calculation summary for logging
-      let calculationSummary = null;
-      if (calculationType === 'hashrate' && result.hashrateCalculation) {
-        calculationSummary = {
-          requestedTH: result.hashrateCalculation.requestedTH,
-          optionsCount: result.hashrateCalculation.options?.length || 0,
-          recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
-          recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
-          recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
-          hasProjection: !!result.hashrateCalculation.projection
-        };
-      } else if (calculationType === 'investment' && result.investmentCalculation) {
-        calculationSummary = {
-          investmentAmount: result.investmentCalculation.investmentAmount,
-          eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
-          projectionsCount: result.investmentCalculation.projections?.length || 0,
-          recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
-          recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
-          recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
-          recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
-        };
-      } else if (calculationType === 'duration' && result.durationCalculation) {
-        calculationSummary = {
-          durationMonths: result.durationCalculation.durationMonths,
-          optionsCount: result.durationCalculation.options?.length || 0,
-          recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
-          recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
-          recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
-        };
-      } else if (result.overview) {
-        calculationSummary = {
-          totalPlans: result.overview.totalPlans,
-          mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
-          costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
-          minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
-        };
-      }
+      const isGuest = !isLoggedIn || !userId;
 
-      // Determine user context for logging
-      const performedBy = isLoggedIn && userId ? userId : null;
-      const performedByModel = isLoggedIn && userId ? 'User' : 'System';
-      const performedByEmail = isLoggedIn && user ? user.email : 'guest@bithash.com';
-      const performedByName = isLoggedIn && user ? `${user.firstName} ${user.lastName}` : 'Guest User';
+      // Identity of the actor. For guests we still record a synthetic identity
+      // so the admin feed's "who" column is populated, and we tag the record
+      // with isGuest so the UI can badge it distinctly.
+      const performedBy = isGuest ? null : userId;
+      const performedByModel = 'User'; // "User" covers both guest and registered person
+      const performedByEmail = isGuest
+        ? 'guest@bithash.com'
+        : (user?.email || 'unknown@bithash.com');
+      const performedByName = isGuest
+        ? 'Guest User'
+        : `${user?.firstName || ''} ${user?.lastName || ''}`.trim() || 'User';
+
+      const action = isGuest ? 'calculator_used_guest' : 'calculator_used';
 
       await SystemLog.create({
-        action: isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest',
-        entity: 'System',
-        performedBy: performedBy,
-        performedByModel: performedByModel,
-        performedByEmail: performedByEmail,
-        performedByName: performedByName,
+        action,
+        actionCategory: 'system',   // explicit so admin filters find it
+        entity: 'system',           // FIXED: lowercase enum value
+        entityId: null,
+
+        performedBy,
+        performedByModel,
+        performedByEmail,
+        performedByName,
+
         status: 'success',
+        riskLevel: 'low',
+
+        // Request / network context
         ip: deviceInfo.ip,
         userAgent: req.headers['user-agent'] || 'Unknown',
         location: deviceInfo.location || 'Unknown',
@@ -20195,52 +20241,65 @@ app.post('/api/mining/calculator', async (req, res) => {
         region: deviceInfo.locationDetails?.region || 'Unknown',
         latitude: deviceInfo.locationDetails?.latitude || null,
         longitude: deviceInfo.locationDetails?.longitude || null,
+
         metadata: {
-          // Calculation details
+          // ---- Calculation inputs ----
           calculationType: calculationType || 'overview',
           investmentAmount: investmentAmount || null,
           investmentAmountUSD: investmentAmount ? parseFloat(investmentAmount) : null,
           durationMonths: durationMonths || null,
           hashrateTH: hashrateTH || null,
 
-          // Market context at time of calculation
+          // ---- Market context at time of calculation ----
           btcPriceAtCalculation: btcPrice,
           btcPriceTimestamp: new Date().toISOString(),
 
-          // Plans context
+          // ---- Plans context ----
           plansAvailable: plans.length,
-          plansCount: plans.length,
+          plansAvailableCount: plans.length,
 
-          // Detailed calculation summary
-          calculationSummary: calculationSummary,
+          // ---- Structured summary of what was returned ----
+          calculationSummary,
 
-          // User context
-          isLoggedIn: isLoggedIn,
-          userFirstName: isLoggedIn && user ? user.firstName : null,
-          userLastName: isLoggedIn && user ? user.lastName : null,
-          userEmail: isLoggedIn && user ? user.email : null,
-          userId: isLoggedIn && userId ? userId.toString() : null,
+          // ---- Actor context (helps admin UI render even if performer fields change) ----
+          isGuest,
+          isLoggedIn,
+          userFirstName: isGuest ? null : (user?.firstName || null),
+          userLastName: isGuest ? null : (user?.lastName || null),
+          userEmail: isGuest ? null : (user?.email || null),
+          userId: isGuest ? null : userId.toString(),
 
-          // User balance context (if logged in)
-          userMainBalanceUSD: result.userContext?.mainBalanceUSD || null,
-          userMaturedBalanceUSD: result.userContext?.maturedBalanceUSD || null,
-          userTotalAvailableUSD: result.userContext?.totalAvailableUSD || null,
+          // ---- Logged-in user's wallet snapshot at calculation time ----
+          userMainBalanceUSD: result.userContext?.mainBalanceUSD ?? null,
+          userMaturedBalanceUSD: result.userContext?.maturedBalanceUSD ?? null,
+          userTotalAvailableUSD: result.userContext?.totalAvailableUSD ?? null,
 
-          // Result summary
+          // ---- Result metadata ----
           resultProvided: true,
-          processingTimeMs: Date.now() - startTime
+          processingTimeMs: Date.now() - startTime,
+
+          // ---- Request tracing ----
+          requestId: req.headers['x-request-id'] || null
         }
       });
     } catch (logError) {
-      // Don't fail the request if logging fails
-      console.error('Failed to log calculator activity:', logError.message);
+      // Logging must never break the calculator response, but we now log the
+      // full error (including stack) so future schema/enum regressions surface
+      // immediately instead of being silently swallowed.
+      console.error('❌ Failed to log calculator activity to SystemLog');
+      console.error('   action:', isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest');
+      console.error('   message:', logError.message);
+      console.error('   stack:', logError.stack);
+      if (deviceInfo) {
+        console.error('   deviceInfo.ip:', deviceInfo.ip);
+      }
     }
 
     // =============================================
     // RETURN RESPONSE
     // =============================================
     const processingTime = Date.now() - startTime;
-    
+
     res.status(200).json({
       status: 'success',
       success: true,
@@ -20250,7 +20309,7 @@ app.post('/api/mining/calculator', async (req, res) => {
 
   } catch (err) {
     console.error('Mining calculator error:', err);
-    
+
     res.status(500).json({
       status: 'error',
       success: false,
@@ -20266,6 +20325,17 @@ console.log('   - Public access (no authentication required)');
 console.log('   - Supports: investment, hashrate, and duration calculations');
 console.log('   - Real-time BTC price (not displayed)');
 console.log('   - Activity logging for both users and guests to SystemLog');
+console.log('   - Action: calculator_used | calculator_used_guest');
+console.log('   - Category: system');
+
+
+
+
+
+
+
+
+
 
 
 
