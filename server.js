@@ -3468,24 +3468,289 @@ AdminSchema.index({ role: 1 });
 
 const Admin = mongoose.model('Admin', AdminSchema);
 
+// =============================================
+// PLAN SCHEMA
+// Every display + behavioral field lives on the document.
+// GET /api/plans reads these directly — no name-matching.
+// =============================================
 const PlanSchema = new mongoose.Schema({
-  name: { type: String, required: [true, 'Plan name is required'], unique: true },
-  description: { type: String, required: [true, 'Description is required'] },
+  // --- Core identity ---
+  name:        { type: String, required: [true, 'Plan name is required'], unique: true, trim: true },
+  description: { type: String, required: [true, 'Description is required'], trim: true },
+  badge:       { type: String, default: 'Standard', trim: true },   // e.g. "Basic", "Gold"
+  tier: {
+    type: String,
+    enum: ['starter', 'standard', 'gold', 'enterprise', 'ultimate'],
+    default: 'standard'
+  },
+
+  // --- Economics (hours-based) ---
   percentage: { type: Number, required: [true, 'Percentage is required'], min: [0, 'Percentage cannot be negative'] },
-  duration: { type: Number, required: [true, 'Duration is required'], min: [1, 'Duration must be at least 1 hour'] },
-  minAmount: { type: Number, required: [true, 'Minimum amount is required'], min: [0, 'Minimum amount cannot be negative'] },
-  maxAmount: { type: Number, required: [true, 'Maximum amount is required'] },
-  // REMOVED: hashrate — now calculated dynamically per investment
-  // Formula (internal only): (principalUSD * return%) / (BTC_price * BTC_PER_TH_PER_HOUR * durationHours)
-  isActive: { type: Boolean, default: true },
-  videoUrl: { type: String, default: '' },
-  referralBonus: { type: Number, default: 5, min: [0, 'Bonus cannot be negative'] }
+  duration:   { type: Number, required: [true, 'Duration is required'], min: [1, 'Duration must be at least 1 hour'] }, // hours per cycle
+  minAmount:  { type: Number, required: [true, 'Minimum amount is required'], min: [0, 'Minimum amount cannot be negative'] },
+  maxAmount:  { type: Number, required: [true, 'Maximum amount is required'] },
+
+  // --- Display flags ---
+  isActive:    { type: Boolean, default: true },
+  isPopular:   { type: Boolean, default: false },
+  isBestValue: { type: Boolean, default: false },
+  sortOrder:   { type: Number, default: 0 },
+
+  // --- Display theme (read directly by GET /api/plans) ---
+  color:       { type: String, default: '#2ECC71' },
+  lightColor:  { type: String, default: '#58D68D' },
+  bgColor:     { type: String, default: 'rgba(46, 204, 113, 0.12)' },
+  borderColor: { type: String, default: 'rgba(46, 204, 113, 0.3)' },
+
+  // --- Features rendered on the card (read directly, no tier logic) ---
+  features: { type: [String], default: [] },
+
+  // --- Auto-compound / long-term config ---
+  allowAutoCompound:       { type: Boolean, default: true },
+  autoCompoundOptions:     { type: [Number], default: [1, 3, 6, 9, 12] },
+  defaultAutoCompoundMonths: { type: Number, default: 1 },
+  minAutoCompoundMonths:   { type: Number, default: 1 },
+  maxAutoCompoundMonths:   { type: Number, default: 12 },
+
+  // --- Per-plan cycle fee override (null → falls back to global CYCLE_FEE_PERCENT) ---
+  cycleFeePercent: { type: Number, default: null, min: 0, max: 100 },
+
+  // --- Hashrate display hints (backend still computes live min/max) ---
+  hashrateUnit:            { type: String, default: 'TH/s' },
+  hashrateDisplayOverride: { type: String, default: null },
+
+  // --- Legacy fields preserved ---
+  videoUrl:       { type: String, default: '' },
+  referralBonus:  { type: Number, default: 5, min: [0, 'Bonus cannot be negative'] }
 }, { timestamps: true });
 
 PlanSchema.index({ name: 1 });
 PlanSchema.index({ isActive: 1 });
+PlanSchema.index({ sortOrder: 1 });
 
 const Plan = mongoose.model('Plan', PlanSchema);
+
+// =============================================
+// SEED PLANS
+// Values match exactly what the current endpoint hardcodes by name.
+// =============================================
+const initializePlans = async () => {
+  try {
+    const colorBlock = {
+      color:       '#2ECC71',
+      lightColor:  '#58D68D',
+      bgColor:     'rgba(46, 204, 113, 0.12)',
+      borderColor: 'rgba(46, 204, 113, 0.3)'
+    };
+
+    const plans = [
+      {
+        name: 'Basic Contract',
+        description: '6.731% After 12 hours',
+        badge: 'Basic',
+        tier: 'starter',
+        percentage: 6.731,
+        duration: 24,
+        minAmount: 50,
+        maxAmount: 499,
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 10,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Basic performance dashboard'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
+        referralBonus: 5,
+        ...colorBlock
+      },
+      {
+        name: 'Standard Contract',
+        description: '8.682% After 24 hours',
+        badge: 'Standard',
+        tier: 'standard',
+        percentage: 8.682,
+        duration: 48,
+        minAmount: 500,
+        maxAmount: 1999,
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 20,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Real-time performance dashboard',
+          'Email cycle notifications'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
+        referralBonus: 5,
+        ...colorBlock
+      },
+      {
+        name: 'Gold Contract',
+        description: '11.564% After 48 hours',
+        badge: 'Gold',
+        tier: 'gold',
+        percentage: 11.564,
+        duration: 72,
+        minAmount: 2000,
+        maxAmount: 9999,
+        isPopular: true,
+        isBestValue: true,
+        sortOrder: 30,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Advanced analytics dashboard',
+          'Email + in-app notifications',
+          'Priority pool allocation',
+          'Priority email support'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
+        referralBonus: 5,
+        ...colorBlock
+      },
+      {
+        name: 'Enterprise Contract',
+        description: '16.711% After 72 hours',
+        badge: 'Enterprise',
+        tier: 'enterprise',
+        percentage: 16.711,
+        duration: 120,
+        minAmount: 10000,
+        maxAmount: 49999,
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 40,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Dedicated mining capacity',
+          'Advanced analytics + export tools',
+          'Priority email + live chat support',
+          'Dedicated account manager'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
+        referralBonus: 5,
+        ...colorBlock
+      },
+      {
+        name: 'Ultimate Contract',
+        description: '24.927% After 96 hours',
+        badge: 'Ultimate',
+        tier: 'ultimate',
+        percentage: 24.927,
+        duration: 144,
+        minAmount: 50000,
+        maxAmount: 1000000,
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 50,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Maximum-priority mining capacity',
+          'Full analytics suite + API access',
+          '24/7 priority support (email, chat, phone)',
+          'Exclusive bonuses + early access'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
+        referralBonus: 5,
+        ...colorBlock
+      }
+    ];
+
+    for (const planData of plans) {
+      const existing = await Plan.findOne({ name: planData.name });
+
+      if (!existing) {
+        // First-time seed
+        await Plan.create(planData);
+        console.log(`✅ Plan seeded: ${planData.name}`);
+      } else {
+        // Upgrade legacy docs: fill in any new fields that are missing
+        // WITHOUT overwriting admin-edited values.
+        const patch = {};
+        const fillIfMissing = (key, value) => {
+          if (existing[key] === undefined || existing[key] === null) {
+            patch[key] = value;
+          }
+        };
+
+        fillIfMissing('badge', planData.badge);
+        fillIfMissing('tier', planData.tier);
+        fillIfMissing('isPopular', planData.isPopular);
+        fillIfMissing('isBestValue', planData.isBestValue);
+        fillIfMissing('sortOrder', planData.sortOrder);
+        fillIfMissing('color', planData.color);
+        fillIfMissing('lightColor', planData.lightColor);
+        fillIfMissing('bgColor', planData.bgColor);
+        fillIfMissing('borderColor', planData.borderColor);
+
+        if (!Array.isArray(existing.features) || existing.features.length === 0) {
+          patch.features = planData.features;
+        }
+        if (existing.allowAutoCompound === undefined) {
+          patch.allowAutoCompound = planData.allowAutoCompound;
+        }
+        if (!Array.isArray(existing.autoCompoundOptions) || existing.autoCompoundOptions.length === 0) {
+          patch.autoCompoundOptions = planData.autoCompoundOptions;
+        }
+        if (existing.defaultAutoCompoundMonths === undefined || existing.defaultAutoCompoundMonths === null) {
+          patch.defaultAutoCompoundMonths = planData.defaultAutoCompoundMonths;
+        }
+        if (existing.minAutoCompoundMonths === undefined || existing.minAutoCompoundMonths === null) {
+          patch.minAutoCompoundMonths = planData.minAutoCompoundMonths;
+        }
+        if (existing.maxAutoCompoundMonths === undefined || existing.maxAutoCompoundMonths === null) {
+          patch.defaultAutoCompoundMonths = planData.defaultAutoCompoundMonths;
+          patch.maxAutoCompoundMonths = planData.maxAutoCompoundMonths;
+        }
+        if (existing.hashrateUnit === undefined || existing.hashrateUnit === null) {
+          patch.hashrateUnit = planData.hashrateUnit || 'TH/s';
+        }
+        if (existing.cycleFeePercent === undefined) {
+          patch.cycleFeePercent = null; // fall back to global
+        }
+
+        if (Object.keys(patch).length > 0) {
+          await Plan.updateOne({ _id: existing._id }, { $set: patch });
+          console.log(`🔧 Plan upgraded with new fields: ${planData.name}`);
+        } else {
+          console.log(`↩️  Plan already up-to-date: ${planData.name}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error initializing plans:', err);
+  }
+};
 
 
 
@@ -7074,70 +7339,241 @@ const initializeAdmin = async () => {
   }
 };
 
+// =============================================
+// SEED PLANS
+// All display + behavioral fields are stored per plan.
+// GET /api/plans reads these directly — no name-matching.
+//
+// Upgrades legacy documents in place: fills in any new field
+// that is missing, WITHOUT overwriting admin-edited values.
+// =============================================
 const initializePlans = async () => {
   try {
+    // Shared visual theme — every tier uses the same green block today
+    // (matches what GET /api/plans currently hardcodes for all plans)
+    const colorBlock = {
+      color:       '#2ECC71',
+      lightColor:  '#58D68D',
+      bgColor:     'rgba(46, 204, 113, 0.12)',
+      borderColor: 'rgba(46, 204, 113, 0.3)'
+    };
+
+    const videoUrl = 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4';
+
     const plans = [
       {
         name: 'Basic Contract',
         description: '6.731% After 12 hours',
+        badge: 'Basic',
+        tier: 'starter',
         percentage: 6.731,
-        duration: 24,
+        duration: 24,          // hours per cycle
         minAmount: 50,
         maxAmount: 499,
-        hashrate: 25513,
-        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
-        referralBonus: 5
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 10,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Basic performance dashboard'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        hashrateUnit: 'TH/s',
+        cycleFeePercent: null,  // null → use global CYCLE_FEE_PERCENT (3)
+        videoUrl,
+        referralBonus: 5,
+        ...colorBlock
       },
       {
         name: 'Standard Contract',
         description: '8.682% After 24 hours',
+        badge: 'Standard',
+        tier: 'standard',
         percentage: 8.682,
         duration: 48,
         minAmount: 500,
         maxAmount: 1999,
-        hashrate: 78719,
-        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
-        referralBonus: 5
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 20,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Real-time performance dashboard',
+          'Email cycle notifications'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        hashrateUnit: 'TH/s',
+        cycleFeePercent: null,
+        videoUrl,
+        referralBonus: 5,
+        ...colorBlock
       },
       {
         name: 'Gold Contract',
         description: '11.564% After 48 hours',
+        badge: 'Gold',
+        tier: 'gold',
         percentage: 11.564,
         duration: 72,
         minAmount: 2000,
         maxAmount: 9999,
-        hashrate: 192191,
-        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
-        referralBonus: 5
+        isPopular: true,
+        isBestValue: true,
+        sortOrder: 30,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Advanced analytics dashboard',
+          'Email + in-app notifications',
+          'Priority pool allocation',
+          'Priority email support'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        hashrateUnit: 'TH/s',
+        cycleFeePercent: null,
+        videoUrl,
+        referralBonus: 5,
+        ...colorBlock
       },
       {
         name: 'Enterprise Contract',
         description: '16.711% After 72 hours',
+        badge: 'Enterprise',
+        tier: 'enterprise',
         percentage: 16.711,
         duration: 120,
         minAmount: 10000,
         maxAmount: 49999,
-        hashrate: 416219,
-        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
-        referralBonus: 5
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 40,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Dedicated mining capacity',
+          'Advanced analytics + export tools',
+          'Priority email + live chat support',
+          'Dedicated account manager'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        hashrateUnit: 'TH/s',
+        cycleFeePercent: null,
+        videoUrl,
+        referralBonus: 5,
+        ...colorBlock
       },
       {
         name: 'Ultimate Contract',
         description: '24.927% After 96 hours',
+        badge: 'Ultimate',
+        tier: 'ultimate',
         percentage: 24.927,
         duration: 144,
         minAmount: 50000,
         maxAmount: 1000000,
-        hashrate: 987592,
-        videoUrl: 'https://media.bithashcapital.live/Cryptocurrency%20Bitcoins%20mining%20in%204K%20UHD%20flat%20animation%20(1).mp4',
-        referralBonus: 5
+        isPopular: false,
+        isBestValue: false,
+        sortOrder: 50,
+        features: [
+          'SHA-256 ASIC mining',
+          'Automated cycle payouts',
+          'Maximum-priority mining capacity',
+          'Full analytics suite + API access',
+          '24/7 priority support (email, chat, phone)',
+          'Exclusive bonuses + early access'
+        ],
+        allowAutoCompound: true,
+        autoCompoundOptions: [1, 3, 6, 9, 12],
+        defaultAutoCompoundMonths: 1,
+        minAutoCompoundMonths: 1,
+        maxAutoCompoundMonths: 12,
+        hashrateUnit: 'TH/s',
+        cycleFeePercent: null,
+        videoUrl,
+        referralBonus: 5,
+        ...colorBlock
       }
     ];
 
-    for (const plan of plans) {
-      const existingPlan = await Plan.findOne({ name: plan.name });
+    for (const planData of plans) {
+      const existingPlan = await Plan.findOne({ name: planData.name });
+
       if (!existingPlan) {
-        await Plan.create(plan);
+        // First-time seed
+        await Plan.create(planData);
+        console.log(`✅ Plan seeded: ${planData.name}`);
+        continue;
+      }
+
+      // Upgrade legacy document: patch only the fields that are missing
+      // or null, so any admin-edited value already on the document wins.
+      const patch = {};
+      const fillIfMissing = (key, value) => {
+        const current = existingPlan[key];
+        if (current === undefined || current === null) {
+          patch[key] = value;
+        }
+      };
+
+      // Identity / display
+      fillIfMissing('badge', planData.badge);
+      fillIfMissing('tier', planData.tier);
+      fillIfMissing('isPopular', planData.isPopular);
+      fillIfMissing('isBestValue', planData.isBestValue);
+      fillIfMissing('sortOrder', planData.sortOrder);
+      fillIfMissing('color', planData.color);
+      fillIfMissing('lightColor', planData.lightColor);
+      fillIfMissing('bgColor', planData.bgColor);
+      fillIfMissing('borderColor', planData.borderColor);
+
+      // Features — only seed if the array is missing or empty
+      if (!Array.isArray(existingPlan.features) || existingPlan.features.length === 0) {
+        patch.features = planData.features;
+      }
+
+      // Auto-compound config
+      if (existingPlan.allowAutoCompound === undefined) {
+        patch.allowAutoCompound = planData.allowAutoCompound;
+      }
+      if (!Array.isArray(existingPlan.autoCompoundOptions) || existingPlan.autoCompoundOptions.length === 0) {
+        patch.autoCompoundOptions = planData.autoCompoundOptions;
+      }
+      fillIfMissing('defaultAutoCompoundMonths', planData.defaultAutoCompoundMonths);
+      fillIfMissing('minAutoCompoundMonths', planData.minAutoCompoundMonths);
+      fillIfMissing('maxAutoCompoundMonths', planData.maxAutoCompoundMonths);
+
+      // Hashrate display hints
+      fillIfMissing('hashrateUnit', planData.hashrateUnit);
+
+      // Cycle fee override — explicit null means "use global"; only seed if the
+      // field has never been set on the document.
+      if (existingPlan.cycleFeePercent === undefined) {
+        patch.cycleFeePercent = planData.cycleFeePercent;
+      }
+
+      if (Object.keys(patch).length > 0) {
+        await Plan.updateOne({ _id: existingPlan._id }, { $set: patch });
+        console.log(`🔧 Plan upgraded: ${planData.name} (${Object.keys(patch).join(', ')})`);
+      } else {
+        console.log(`↩️  Plan already current: ${planData.name}`);
       }
     }
   } catch (err) {
@@ -7147,8 +7583,6 @@ const initializePlans = async () => {
 
 initializeAdmin();
 initializePlans();
-
-
 
 
 
@@ -16118,17 +16552,20 @@ app.post('/api/auth/reset-password', [
 });
 
 
-
-
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
+//
+// Fee is read from plan.cycleFeePercent (falls back to global CYCLE_FEE_PERCENT).
+// autoCompoundMonths is validated against plan.autoCompoundOptions and plan.allowAutoCompound.
 // =============================================
 app.post('/api/investments', protect, [
   body('planId').notEmpty().withMessage('Plan ID is required').isMongoId().withMessage('Invalid Plan ID'),
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be a positive number'),
   body('balanceType').isIn(['main', 'matured']).withMessage('Balance type must be either "main" or "matured"'),
-  body('autoCompoundMonths').optional({ nullable: true }).isIn([1, 3, 6, 9, 12]).withMessage('Auto-compound months must be 1, 3, 6, 9, or 12')
+  // autoCompoundMonths is validated against the plan's own allowed options below.
+  body('autoCompoundMonths').optional({ nullable: true }).isInt({ min: 1, max: 12 })
+    .withMessage('Auto-compound months must be an integer between 1 and 12')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -16208,8 +16645,48 @@ app.post('/api/investments', protect, [
     }
 
     // =============================================
+    // AUTO-COMPOUND VALIDATION (per-plan)
+    // =============================================
+    const planAutoCompoundOptions = Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length > 0
+      ? plan.autoCompoundOptions
+      : [1, 3, 6, 9, 12];
+    const planAllowAutoCompound = plan.allowAutoCompound !== false;
+
+    // Normalize input: null/undefined/0/1 → normal hourly mode (1 month, single cycle)
+    let requestedMonths = (autoCompoundMonths === null || autoCompoundMonths === undefined)
+      ? 1
+      : Number(autoCompoundMonths);
+
+    if (!Number.isInteger(requestedMonths) || requestedMonths < 1) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Invalid auto-compound duration'
+      });
+    }
+
+    if (requestedMonths > 1 && !planAllowAutoCompound) {
+      return res.status(400).json({
+        status: 'fail',
+        message: `Long-term auto-compound is not available for the ${plan.name} plan. Please use the normal hourly rental.`
+      });
+    }
+
+    if (requestedMonths > 1 && !planAutoCompoundOptions.includes(requestedMonths)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: `Auto-compound duration must be one of: ${planAutoCompoundOptions.join(', ')} months`
+      });
+    }
+
+    // =============================================
+    // PER-PLAN CYCLE FEE (falls back to global)
+    // =============================================
+    const cycleFeePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+      ? plan.cycleFeePercent
+      : CYCLE_FEE_PERCENT;
+
+    // =============================================
     // LOCK-IN CHECK: no active investment in the same plan
-    // (auto-compound means the contract stays active across all cycles)
     // =============================================
     const existingActiveInvestment = await Investment.hasActiveInPlan(userId, planId);
 
@@ -16250,18 +16727,18 @@ app.post('/api/investments', protect, [
     // =============================================
     // CALCULATE CYCLES & DYNAMIC HASHPOWER (INTERNAL)
     // =============================================
-    const totalCycles = calculateTotalCycles(autoCompoundMonths, plan.duration);
+    const totalCycles = calculateTotalCycles(requestedMonths, plan.duration);
     const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
 
     const amountInBTC = amount / btcPrice;
 
     // ---- CYCLE 1 SETUP ----
-    // The 3% fee is deducted at the START of cycle 1, just like every other cycle.
+    // Fee is charged at the START of EVERY cycle (including cycle 1).
     // Net principal is what actually mines; return % is applied to net principal.
     const incomingBalanceUSD = amount;
     const incomingBalanceBTC = amountInBTC;
-    const firstCycleFeeUSD = incomingBalanceUSD * (CYCLE_FEE_PERCENT / 100);
-    const firstCycleFeeBTC = incomingBalanceBTC * (CYCLE_FEE_PERCENT / 100);
+    const firstCycleFeeUSD = incomingBalanceUSD * (cycleFeePercent / 100);
+    const firstCycleFeeBTC = incomingBalanceBTC * (cycleFeePercent / 100);
     const netPrincipalUSD = incomingBalanceUSD - firstCycleFeeUSD;
     const netPrincipalBTC = incomingBalanceBTC - firstCycleFeeBTC;
     const firstCycleReturnUSD = netPrincipalUSD * (1 + plan.percentage / 100);
@@ -16299,9 +16776,10 @@ app.post('/api/investments', protect, [
     console.log(`   Matured Wallet BTC: ${maturedBitcoinBalance}`);
     console.log(`   Investment: $${amount} USD = ${amountInBTC.toFixed(8)} BTC`);
     console.log(`   BTC Price from API: $${btcPrice}`);
-    console.log(`   Auto-compound: ${autoCompoundMonths ? autoCompoundMonths + ' month(s)' : 'single cycle'}`);
+    console.log(`   Auto-compound: ${requestedMonths > 1 ? requestedMonths + ' month(s)' : 'single cycle (normal hourly rental)'}`);
     console.log(`   Total Cycles: ${totalCycles}`);
     console.log(`   Cycles per Month: ${cyclesPerMonth}`);
+    console.log(`   Cycle Fee: ${cycleFeePercent}% (source: ${typeof plan.cycleFeePercent === 'number' ? 'plan' : 'global'})`);
     console.log(`   Assigned Hashpower: ${initialHashpower} TH/s`);
 
     let selectedBitcoinBalance = 0;
@@ -16397,7 +16875,7 @@ app.post('/api/investments', protect, [
       // =============================================
       // MONTHLY-RESET / AUTO-COMPOUND FIELDS
       // =============================================
-      autoCompoundMonths: autoCompoundMonths || 1,
+      autoCompoundMonths: requestedMonths,
       totalCycles: totalCycles,
       cyclesPerMonth: cyclesPerMonth,
       currentCycle: 1,
@@ -16455,9 +16933,10 @@ app.post('/api/investments', protect, [
         totalCycles: totalCycles,
         cyclesPerMonth: cyclesPerMonth,
         balanceType: balanceType,
-        autoCompoundMonths: autoCompoundMonths || 1,
+        autoCompoundMonths: requestedMonths,
         investmentFeeUSD: firstCycleFeeUSD,
         investmentFeeBTC: firstCycleFeeBTC,
+        cycleFeePercent: cycleFeePercent,
         incomingBalanceUSD: incomingBalanceUSD,
         incomingBalanceBTC: incomingBalanceBTC,
         netPrincipalUSD: netPrincipalUSD,
@@ -16467,7 +16946,7 @@ app.post('/api/investments', protect, [
         expectedReturnUSD: firstCycleReturnUSD,
         assignedHashrate: initialHashpower,
         transactionType: 'debit',
-        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${autoCompoundMonths ? ` for ${autoCompoundMonths} month(s) (${cyclesPerMonth} cycles/month)` : ''}. 3% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net principal: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
+        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${requestedMonths > 1 ? ` for ${requestedMonths} month(s) (${cyclesPerMonth} cycles/month)` : ' (single cycle, normal hourly rental)'}. ${cycleFeePercent}% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net principal: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
       },
       fee: firstCycleFeeUSD,
       netAmount: netPrincipalUSD
@@ -16484,19 +16963,20 @@ app.post('/api/investments', protect, [
       transactionId: transaction._id,
       investmentId: investment._id,
       userId: userId,
-      description: `3% initiation fee for cycle 1 (month 1) of ${plan.name} investment`,
+      description: `${cycleFeePercent}% initiation fee for cycle 1 (month 1) of ${plan.name} investment`,
       metadata: {
         planName: plan.name,
         cycle: 1,
         month: 1,
         totalCycles: totalCycles,
         cyclesPerMonth: cyclesPerMonth,
-        autoCompoundMonths: autoCompoundMonths || 1,
+        autoCompoundMonths: requestedMonths,
         incomingBalanceUSD: incomingBalanceUSD,
         incomingBalanceBTC: incomingBalanceBTC,
         netPrincipalUSD: netPrincipalUSD,
         netPrincipalBTC: netPrincipalBTC,
-        feePercentage: CYCLE_FEE_PERCENT,
+        feePercentage: cycleFeePercent,
+        feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
         btcPrice: btcPrice,
         assignedHashrate: initialHashpower
       }
@@ -16558,6 +17038,7 @@ app.post('/api/investments', protect, [
         netPrincipalBTC: netPrincipalBTC,
         investmentFeeUSD: firstCycleFeeUSD,
         investmentFeeBTC: firstCycleFeeBTC,
+        cycleFeePercent: cycleFeePercent,
         expectedReturnUSD: firstCycleReturnUSD,
         expectedReturnBTC: firstCycleReturnBTC,
         btcPriceAtInvestment: btcPrice,
@@ -16565,7 +17046,7 @@ app.post('/api/investments', protect, [
         roiPercentage: plan.percentage,
         endDate: firstCycleEndDate,
         balanceTypeUsed: balanceType,
-        autoCompoundMonths: autoCompoundMonths || 1,
+        autoCompoundMonths: requestedMonths,
         totalCycles: totalCycles,
         cyclesPerMonth: cyclesPerMonth,
         assignedHashrate: initialHashpower
@@ -16646,12 +17127,14 @@ app.post('/api/investments', protect, [
       const formattedNewActiveBTC = newActiveBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedNewActiveUSD = newActiveUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+      const isLongTerm = requestedMonths > 1 && totalCycles > 1;
+
       // Build the auto-compound block for the email (only if applicable)
-      const autoCompoundEmailBlock = (autoCompoundMonths && totalCycles > 1)
+      const autoCompoundEmailBlock = isLongTerm
         ? `
           <tr style="border-top: 1px solid #E2E8F0;">
             <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-            <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${autoCompoundMonths} month(s)</td>
+            <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${requestedMonths} month(s)</td>
           </tr>
           <tr style="border-top: 1px solid #E2E8F0;">
             <td style="padding: 8px 0;"><strong>Cycles per Month:</strong></td>
@@ -16659,7 +17142,7 @@ app.post('/api/investments', protect, [
           </tr>
           <tr style="border-top: 1px solid #E2E8F0;">
             <td style="padding: 8px 0;"><strong>Per-Cycle Fee:</strong></td>
-            <td style="padding: 8px 0; text-align: right; color: #EF4444;">${CYCLE_FEE_PERCENT}% deducted at start of each cycle</td>
+            <td style="padding: 8px 0; text-align: right; color: #EF4444;">${cycleFeePercent}% deducted at start of each cycle</td>
           </tr>
           <tr style="border-top: 1px solid #E2E8F0;">
             <td style="padding: 8px 0;"><strong>Monthly Reset:</strong></td>
@@ -16688,7 +17171,7 @@ app.post('/api/investments', protect, [
                 </svg>
               </div>
               <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
-              <p style="color: #065F46; font-size: 13px; margin: 0;">${autoCompoundMonths ? `${autoCompoundMonths} month(s) contract - ${cyclesPerMonth} cycles/month` : 'Your mining contract is now active'}</p>
+              <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `${requestedMonths} month(s) contract - ${cyclesPerMonth} cycles/month` : 'Your mining contract is now active'}</p>
             </div>
 
             <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
@@ -16713,7 +17196,7 @@ app.post('/api/investments', protect, [
                   <td style="padding: 8px 0; text-align: right;">${formattedOriginalBTC} BTC (≈ $${formattedAmount} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Cycle 1 Fee (${CYCLE_FEE_PERCENT}%):</strong></td>
+                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Cycle 1 Fee (${cycleFeePercent}%):</strong></td>
                   <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
@@ -16770,9 +17253,9 @@ app.post('/api/investments', protect, [
 
             <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
               <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Mining Information</p>
-              ${autoCompoundMonths && totalCycles > 1
-                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract runs for <strong>${autoCompoundMonths} month(s)</strong>, with <strong>${cyclesPerMonth} cycles</strong> per month. At the start of <strong>every cycle</strong>, a ${CYCLE_FEE_PERCENT}% fee is deducted from the incoming balance, and the net amount mines at the plan's return percentage. At each month boundary, the compounded growth is swept to your Matured Wallet and the principal resets, producing linear month-over-month growth. The final payout lands in your Matured Wallet at the end of the last month.</p>`
-                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet.</p>`
+              ${isLongTerm
+                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract runs for <strong>${requestedMonths} month(s)</strong>, with <strong>${cyclesPerMonth} cycles</strong> per month. At the start of <strong>every cycle</strong>, a ${cycleFeePercent}% fee is deducted from the incoming balance, and the net amount mines at the plan's return percentage. At each month boundary, the compounded growth is swept to your Matured Wallet and the principal resets, producing linear month-over-month growth. The final payout lands in your Matured Wallet at the end of the last month.</p>`
+                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can then rent again normally or activate a long-term auto-compound contract.</p>`
               }
             </div>
 
@@ -16797,7 +17280,7 @@ app.post('/api/investments', protect, [
       await mailTransporter.sendMail({
         from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
         to: user.email,
-        subject: `✅ Mining Contract Activated${autoCompoundMonths ? ` (${autoCompoundMonths}-Month Contract)` : ''} - ₿itHash Capital`,
+        subject: `✅ Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month Contract)` : ''} - ₿itHash Capital`,
         html: emailHtml
       });
 
@@ -16823,6 +17306,7 @@ app.post('/api/investments', protect, [
           originalAmountBTC: investmentBTCAmount,
           investmentFeeUSD: firstCycleFeeUSD,
           investmentFeeBTC: firstCycleFeeBTC,
+          cycleFeePercent: cycleFeePercent,
           expectedReturnUSD: investment.expectedReturn,
           expectedReturnBTC: investment.expectedReturnBTC,
           currentHashrate: initialHashpower,
@@ -16830,7 +17314,7 @@ app.post('/api/investments', protect, [
           currentMonth: 1,
           totalCycles: totalCycles,
           cyclesPerMonth: cyclesPerMonth,
-          autoCompoundMonths: autoCompoundMonths || 1,
+          autoCompoundMonths: requestedMonths,
           isAutoCompoundActive: investment.isAutoCompoundActive,
           cycleDurationHours: plan.duration,
           firstCycleEndDate: investment.endDate,
@@ -16855,6 +17339,7 @@ app.post('/api/investments', protect, [
 // =============================================
 // REAL-TIME BITCOIN PRICE WITH MULTIPLE API FALLBACKS
 // ALL FALLBACKS FETCH FROM ONLINE APIs - NO HARDCODED VALUES
+// (Unchanged — pure data fetcher.)
 // =============================================
 async function getRealTimeBitcoinPrice() {
   const errors = [];
@@ -17079,8 +17564,14 @@ async function getRealTimeBitcoinPrice() {
 
 // =============================================
 // INVESTMENT MATURITY CRON
-// Handles: per-cycle fee, in-month cycle advance, month-boundary
-// sweep + principal reset, and final payout (LINEAR month-over-month).
+// Handles: per-cycle fee (plan-driven), in-month cycle advance,
+// month-boundary sweep + principal reset, and final payout
+// (LINEAR month-over-month).
+//
+// The cycle fee is read from the parent plan on every cycle:
+//   cycleFeePercent = plan.cycleFeePercent ?? CYCLE_FEE_PERCENT
+// so per-plan overrides are respected from investment creation
+// through maturity.
 // =============================================
 const completeMaturedInvestmentsCron = async () => {
   const startTime = Date.now();
@@ -17124,6 +17615,13 @@ const completeMaturedInvestmentsCron = async () => {
           throw new Error('Plan not found');
         }
 
+        // =============================================
+        // RESOLVE CYCLE FEE (plan override → global fallback)
+        // =============================================
+        const cycleFeePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+          ? plan.cycleFeePercent
+          : CYCLE_FEE_PERCENT;
+
         // Fetch fresh BTC price (internal only)
         let currentBTCPrice;
         try {
@@ -17148,14 +17646,14 @@ const completeMaturedInvestmentsCron = async () => {
         const planReturnDecimal = plan.percentage / 100;
 
         // ===================================================
-        // APPLY 3% FEE TO THE INCOMING BALANCE OF THIS CYCLE
+        // APPLY CYCLE FEE TO THE INCOMING BALANCE OF THIS CYCLE
         // Every cycle pays its own fee, on its own incoming balance.
         // ===================================================
         const incomingBalanceUSD = currentCycle.incomingBalanceUSD;
         const incomingBalanceBTC = currentCycle.incomingBalanceBTC;
 
-        const cycleFeeUSD = incomingBalanceUSD * (CYCLE_FEE_PERCENT / 100);
-        const cycleFeeBTC = incomingBalanceBTC * (CYCLE_FEE_PERCENT / 100);
+        const cycleFeeUSD = incomingBalanceUSD * (cycleFeePercent / 100);
+        const cycleFeeBTC = incomingBalanceBTC * (cycleFeePercent / 100);
         const netPrincipalUSD = incomingBalanceUSD - cycleFeeUSD;
         const netPrincipalBTC = incomingBalanceBTC - cycleFeeBTC;
 
@@ -17180,13 +17678,13 @@ const completeMaturedInvestmentsCron = async () => {
 
         console.log(`📊 [CRON] Investment ${investment._id} month ${investment.currentMonth} cycle ${investment.currentCycle}/${investment.cyclesPerMonth}:`);
         console.log(`   Incoming: ${incomingBalanceBTC.toFixed(8)} BTC ($${incomingBalanceUSD.toFixed(2)})`);
-        console.log(`   Fee (${CYCLE_FEE_PERCENT}%): ${cycleFeeBTC.toFixed(8)} BTC ($${cycleFeeUSD.toFixed(2)})`);
+        console.log(`   Fee (${cycleFeePercent}%): ${cycleFeeBTC.toFixed(8)} BTC ($${cycleFeeUSD.toFixed(2)})`);
         console.log(`   Net Principal: ${netPrincipalBTC.toFixed(8)} BTC ($${netPrincipalUSD.toFixed(2)})`);
         console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
         console.log(`   Month-to-date: ${investment.monthToDateReturnBTC.toFixed(8)} BTC ($${investment.monthToDateReturnUSD.toFixed(2)})`);
 
         // ===================================================
-        // ROUTE THE 3% FEE TO PLATFORM REVENUE (every cycle)
+        // ROUTE THE FEE TO PLATFORM REVENUE (every cycle)
         // ===================================================
         const feeTxRef = `CYCLE-FEE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
         const [feeTx] = await Transaction.create([{
@@ -17204,7 +17702,8 @@ const completeMaturedInvestmentsCron = async () => {
             cycle: investment.currentCycle,
             month: investment.currentMonth,
             transactionType: 'fee',
-            description: `Cycle ${investment.currentCycle} (month ${investment.currentMonth}) ${CYCLE_FEE_PERCENT}% fee`
+            cycleFeePercent: cycleFeePercent,
+            description: `Cycle ${investment.currentCycle} (month ${investment.currentMonth}) ${cycleFeePercent}% fee`
           },
           fee: 0,
           netAmount: cycleFeeUSD
@@ -17218,14 +17717,15 @@ const completeMaturedInvestmentsCron = async () => {
           transactionId: feeTx._id,
           investmentId: investment._id,
           userId: userId,
-          description: `3% cycle fee (month ${investment.currentMonth}, cycle ${investment.currentCycle}) for ${plan.name} investment`,
+          description: `${cycleFeePercent}% cycle fee (month ${investment.currentMonth}, cycle ${investment.currentCycle}) for ${plan.name} investment`,
           metadata: {
             planName: plan.name,
             cycle: investment.currentCycle,
             month: investment.currentMonth,
             totalCycles: investment.totalCycles,
             cyclesPerMonth: investment.cyclesPerMonth,
-            feePercentage: CYCLE_FEE_PERCENT,
+            feePercentage: cycleFeePercent,
+            feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
             btcPrice: currentBTCPrice
           }
         }], { session });
@@ -17342,6 +17842,7 @@ const completeMaturedInvestmentsCron = async () => {
               finalReturnUSD: cycleReturnUSD,
               cumulativeReturnBTC: investment.cumulativeReturnBTC,
               cumulativeReturnUSD: investment.cumulativeReturnUSD,
+              cycleFeePercent: cycleFeePercent,
               btcPriceAtStart: investment.btcPriceAtInvestment,
               btcPriceAtCompletion: currentBTCPrice,
               startDate: investment.startDate,
@@ -17392,8 +17893,10 @@ const completeMaturedInvestmentsCron = async () => {
             const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
             const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
 
+            const isLongTerm = (investment.autoCompoundMonths && investment.totalCycles > 1);
+
             // Auto-compound summary block (only if applicable)
-            const compoundSummaryBlock = (investment.autoCompoundMonths && investment.totalCycles > 1)
+            const compoundSummaryBlock = isLongTerm
               ? `
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
@@ -17461,6 +17964,10 @@ const completeMaturedInvestmentsCron = async () => {
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>ROI Per Cycle:</strong></td>
                         <td style="padding: 8px 0; text-align: right; color: #10B981;">+${investment.returnPercentage || 0}%</td>
+                      </tr>
+                      <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Per-Cycle Fee:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">${cycleFeePercent}%</td>
                       </tr>
                       ${compoundSummaryBlock}
                       <tr style="border-top: 1px solid #E2E8F0;">
@@ -17799,8 +18306,7 @@ cron.schedule('*/10 * * * * *', async () => {
 
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
-console.log('⏰ Handles single-cycle contracts, per-cycle 3% fee, month-boundary sweep+reset, and final payout\n');
-
+console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
 
 
 
@@ -21740,15 +22246,20 @@ console.log('   - Activity logging for both users and guests');
 
 
 
-// =============================================
-// CLOUD MINING HASHPOWER PLANS ENDPOINT
-// User-facing only. Internal mining economics
-// (per-cycle fees, multiplier caps, exact formulas) stay in the background.
-// =============================================
 
+// =============================================
+// GET /api/plans
+// Public endpoint — no auth required.
+// Returns all active plans with live BTC price, live hashrate range,
+// per-plan display theme, features, and auto-compound config.
+// All display fields are read directly from the Plan document.
+// =============================================
 app.get('/api/plans', async (req, res) => {
     try {
-        const plans = await Plan.find({ isActive: true }).lean();
+        // Deterministic ordering: sortOrder asc, then minAmount asc
+        const plans = await Plan.find({ isActive: true })
+            .sort({ sortOrder: 1, minAmount: 1 })
+            .lean();
 
         if (!plans || plans.length === 0) {
             return res.status(200).json({
@@ -21769,7 +22280,7 @@ app.get('/api/plans', async (req, res) => {
             });
         }
 
-        // Get BTC price — used for USD↔BTC display and live hashrate range
+        // ---- BTC price (live) ----
         let btcPrice = 0;
         try {
             const btcPriceResult = await getRealTimeBitcoinPrice();
@@ -21778,7 +22289,7 @@ app.get('/api/plans', async (req, res) => {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
 
-        // ---- User context ----
+        // ---- User context (optional auth) ----
         let userContext = {
             isLoggedIn: false,
             canRent: false,
@@ -21798,9 +22309,10 @@ app.get('/api/plans', async (req, res) => {
                     .select('balances kycStatus firstName lastName email isVerified');
 
                 if (user) {
-                    const kycVerified = user.kycStatus?.identity === 'verified' &&
-                                     user.kycStatus?.address === 'verified' &&
-                                     user.kycStatus?.facial === 'verified';
+                    const kycVerified =
+                        user.kycStatus?.identity === 'verified' &&
+                        user.kycStatus?.address === 'verified' &&
+                        user.kycStatus?.facial === 'verified';
 
                     const balances = await calculateRealWalletBalances(user);
                     const mainBalanceUSD = balances.mainUSD || 0;
@@ -21808,6 +22320,7 @@ app.get('/api/plans', async (req, res) => {
 
                     const thirtyDaysAgo = new Date();
                     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
                     const recentTx = await Transaction.findOne({
                         user: user._id,
                         type: { $in: ['deposit', 'withdrawal'] },
@@ -21822,11 +22335,11 @@ app.get('/api/plans', async (req, res) => {
                         lastName: user.lastName,
                         email: user.email,
                         isVerified: user.isVerified || false,
-                        kycVerified: kycVerified,
+                        kycVerified,
                         mainBalance: { usd: mainBalanceUSD },
                         maturedBalance: { usd: maturedBalanceUSD },
                         totalPortfolio: { usd: mainBalanceUSD + maturedBalanceUSD },
-                        hasRecentTransaction: hasRecentTransaction,
+                        hasRecentTransaction,
                         canRent: kycVerified && hasRecentTransaction
                     };
                 }
@@ -21837,199 +22350,129 @@ app.get('/api/plans', async (req, res) => {
 
         // =============================================
         // BUILD USER-FACING PLAN CARDS
-        // Colors, badges, tier logic preserved.
-        // Hashrate range calculated live from investment range + BTC price.
+        // Every display field is read from the plan document.
+        // Only hashrate range and BTC conversions are computed live.
         // =============================================
         const enhancedPlans = plans.map((plan) => {
-            const minAmountUSD = plan.minAmount || 0;
-            const maxAmountUSD = plan.maxAmount || 0;
-            const percentage = plan.percentage || 0;
-            const durationHours = plan.duration || 0;
-            const planName = plan.name || 'Mining Contract';
+            // ---- Identity (from schema) ----
+            const planId         = plan._id.toString();
+            const planName       = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
+            const planBadge      = plan.badge || 'Standard';
+            const planTier       = plan.tier || 'standard';
+            const isPopular      = !!plan.isPopular;
+            const isBestValue    = !!plan.isBestValue;
+
+            // ---- Display theme (from schema, fallback to shared green block) ----
+            const color       = plan.color       || '#2ECC71';
+            const lightColor  = plan.lightColor  || '#58D68D';
+            const bgColor     = plan.bgColor     || 'rgba(46, 204, 113, 0.12)';
+            const borderColor = plan.borderColor || 'rgba(46, 204, 113, 0.3)';
+
+            // ---- Economics (from schema) ----
+            const minAmountUSD  = Number(plan.minAmount) || 0;
+            const maxAmountUSD  = Number(plan.maxAmount) || 0;
+            const percentage    = Number(plan.percentage) || 0;
+            const durationHours = Number(plan.duration) || 0;
+            const durationDays  = durationHours / 24;
+
+            // ---- Cycle fee (per-plan override, fallback to global) ----
+            const cycleFeePercent =
+                (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+                    ? plan.cycleFeePercent
+                    : CYCLE_FEE_PERCENT;
+
+            // ---- Auto-compound config (from schema, with safe fallbacks) ----
+            const autoCompoundOptions =
+                Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length > 0
+                    ? plan.autoCompoundOptions
+                    : [1, 3, 6, 9, 12];
+
+            const defaultAutoCompoundMonths =
+                typeof plan.defaultAutoCompoundMonths === 'number'
+                    ? plan.defaultAutoCompoundMonths
+                    : (autoCompoundOptions[0] || 1);
+
+            const minAutoCompoundMonths =
+                typeof plan.minAutoCompoundMonths === 'number'
+                    ? plan.minAutoCompoundMonths
+                    : (autoCompoundOptions[0] || 1);
+
+            const maxAutoCompoundMonths =
+                typeof plan.maxAutoCompoundMonths === 'number'
+                    ? plan.maxAutoCompoundMonths
+                    : (autoCompoundOptions[autoCompoundOptions.length - 1] || 12);
+
+            const allowAutoCompound = plan.allowAutoCompound !== false; // default true
 
             // ---- BTC amounts for display ----
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
             const maxAmountBTC = btcPrice > 0 ? maxAmountUSD / btcPrice : 0;
 
-            const durationDays = durationHours / 24;
-
             // =============================================
             // LIVE HASHPOWER RANGE (TH/s)
-            // Uses the internal mining economics (BTC_PER_TH_PER_HOUR,
-            // plan return %, plan duration) to determine the min and max
-            // hashpower a user could be assigned for this plan at the
-            // current BTC price. Values fluctuate in real time as BTC price changes.
-            //
-            // Hashpower is computed from the NET principal (incoming balance
-            // minus the per-cycle fee), because that is what actually mines.
+            // Computed from the NET principal that actually mines:
+            //   netPrincipal = grossAmount × (1 − cycleFeePercent/100)
+            // Then calculateHashpower() applies the plan's own
+            // percentage, duration, and the current BTC price.
+            // Values fluctuate in real time as BTC price changes.
             // =============================================
-            const minNetPrincipal = minAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
-            const maxNetPrincipal = maxAmountUSD * (1 - CYCLE_FEE_PERCENT / 100);
+            const minNetPrincipal = minAmountUSD * (1 - cycleFeePercent / 100);
+            const maxNetPrincipal = maxAmountUSD * (1 - cycleFeePercent / 100);
 
             const minHashpower = calculateHashpower(minNetPrincipal, percentage, durationHours, btcPrice);
             const maxHashpower = calculateHashpower(maxNetPrincipal, percentage, durationHours, btcPrice);
 
-            // Format nicely: no decimals for big numbers, 2 decimals for small ones
             const formatHashpower = (v) => {
                 if (!v || v <= 0) return '0';
                 if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-                if (v >= 1) return v.toFixed(1);
+                if (v >= 1)    return v.toFixed(1);
                 return v.toFixed(3);
             };
 
-            const hashrateRangeDisplay = (minHashpower > 0 && maxHashpower > 0)
-                ? `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} TH/s`
-                : 'Calculating...';
+            const hashrateUnit = plan.hashrateUnit || 'TH/s';
 
-            // ---- Tier detection (colors preserved exactly) ----
-            const planNameLower = planName.toLowerCase();
-            let tierKey = 'standard';
-            let badge = 'Standard';
-            let displayName = planName;
-            let color = '#2ECC71';
-            let lightColor = '#58D68D';
-            let bgColor = 'rgba(46, 204, 113, 0.12)';
-            let borderColor = 'rgba(46, 204, 113, 0.3)';
-            let isPopular = false;
-            let isBestValue = false;
+            const hashrateRangeDisplay =
+                (minHashpower > 0 && maxHashpower > 0)
+                    ? (plan.hashrateDisplayOverride ||
+                       `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} ${hashrateUnit}`)
+                    : (plan.hashrateDisplayOverride || 'Calculating...');
 
-            if (planNameLower.includes('ultimate') || planNameLower.includes('max')) {
-                tierKey = 'ultimate';
-                badge = 'Ultimate';
-                displayName = 'Ultimate Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } else if (planNameLower.includes('enterprise') || planNameLower.includes('business')) {
-                tierKey = 'enterprise';
-                badge = 'Enterprise';
-                displayName = 'Enterprise Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } else if (planNameLower.includes('gold') || planNameLower.includes('premium')) {
-                tierKey = 'gold';
-                badge = 'Gold';
-                displayName = 'Gold Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = true;
-                isBestValue = true;
-            } else if (planNameLower.includes('starter') || planNameLower.includes('basic')) {
-                tierKey = 'starter';
-                badge = 'Basic';
-                displayName = 'Basic Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            } else {
-                tierKey = 'standard';
-                badge = 'Standard';
-                displayName = 'Standard Contract';
-                color = '#2ECC71';
-                lightColor = '#58D68D';
-                bgColor = 'rgba(46, 204, 113, 0.12)';
-                borderColor = 'rgba(46, 204, 113, 0.3)';
-                isPopular = false;
-                isBestValue = false;
-            }
+            // ---- Features (from schema, no tier derivation) ----
+            const features = Array.isArray(plan.features) ? plan.features : [];
 
-            // ---- Features (tier-differentiated, capped at 6 per tier) ----
-            // Cheaper plans have fewer features; higher plans add more value,
-            // up to the 6-item ceiling. Each tier inherits the tier below
-            // and adds one or two new perks.
-            let features = [];
-
-            if (tierKey === 'starter') {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Basic performance dashboard'
-                ];
-            } else if (tierKey === 'standard') {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Real-time performance dashboard',
-                    'Email cycle notifications'
-                ];
-            } else if (tierKey === 'gold') {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Advanced analytics dashboard',
-                    'Email + in-app notifications',
-                    'Priority pool allocation',
-                    'Priority email support'
-                ];
-            } else if (tierKey === 'enterprise') {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Dedicated mining capacity',
-                    'Advanced analytics + export tools',
-                    'Priority email + live chat support',
-                    'Dedicated account manager'
-                ];
-            } else if (tierKey === 'ultimate') {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Maximum-priority mining capacity',
-                    'Full analytics suite + API access',
-                    '24/7 priority support (email, chat, phone)',
-                    'Exclusive bonuses + early access'
-                ];
-            } else {
-                features = [
-                    'SHA-256 ASIC mining',
-                    'Automated cycle payouts',
-                    'Basic performance dashboard'
-                ];
-            }
-
-            // BTC range display
+            // ---- BTC range display ----
             const btcRange = btcPrice > 0
                 ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
                 : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
-            // ---- Button state ----
-            let buttonState = 'login';
-            let buttonText = 'Login to Rent Hashpower';
+            // =============================================
+            // BUTTON STATE
+            // =============================================
+            let buttonState   = 'login';
+            let buttonText    = 'Login to Rent Hashpower';
             let buttonTooltip = 'Please login to rent hashpower';
-            let canRent = false;
+            let canRent       = false;
 
             if (userContext.isLoggedIn) {
                 if (!userContext.kycVerified) {
-                    buttonState = 'kyc_required';
-                    buttonText = 'Complete KYC';
+                    buttonState   = 'kyc_required';
+                    buttonText    = 'Complete KYC';
                     buttonTooltip = 'KYC verification required to rent hashpower';
                 } else if (!userContext.hasRecentTransaction) {
-                    buttonState = 'transaction_required';
-                    buttonText = 'Make a Deposit';
+                    buttonState   = 'transaction_required';
+                    buttonText    = 'Make a Deposit';
                     buttonTooltip = 'A recent deposit or withdrawal is required';
                 } else {
                     const totalUserBalance = userContext.mainBalance.usd + userContext.maturedBalance.usd;
                     if (totalUserBalance >= minAmountUSD) {
-                        canRent = true;
-                        buttonState = 'rent';
-                        buttonText = 'Rent Hashpower';
-                        buttonTooltip = `Rent ${displayName} mining capacity`;
+                        canRent       = true;
+                        buttonState   = 'rent';
+                        buttonText    = 'Rent Hashpower';
+                        buttonTooltip = `Rent ${planName} mining capacity`;
                     } else {
-                        buttonState = 'insufficient';
-                        buttonText = `Need $${minAmountUSD.toLocaleString()}`;
+                        buttonState   = 'insufficient';
+                        buttonText    = `Need $${minAmountUSD.toLocaleString()}`;
                         buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}`;
                     }
                 }
@@ -22037,50 +22480,75 @@ app.get('/api/plans', async (req, res) => {
 
             // =============================================
             // USER-FACING RESPONSE
-            // Internal economics (per-cycle fee, multiplier cap, formula) NOT exposed.
+            // Internal economics (per-cycle fee math, formula) is not exposed,
+            // but cycleFeePercent and autoCompound options are, because the
+            // cloudmining page needs them to build the Normal/Long-term toggle
+            // and the projection preview.
             // =============================================
             return {
-                name: displayName,
-                badge: badge,
+                // ---- Identity (REQUIRED for cloudmining.html routing) ----
+                id: planId,
+                _id: planId,
+
+                // ---- Card content ----
+                name: planName,
+                badge: planBadge,
                 description: planDescription,
-                tier: tierKey,
-                isPopular: isPopular,
-                isBestValue: isBestValue,
-                bgColor: bgColor,
-                color: color,
-                borderColor: borderColor,
-                lightColor: lightColor,
-                percentage: percentage,
+                tier: planTier,
+
+                // ---- Flags ----
+                isPopular,
+                isBestValue,
+
+                // ---- Display theme ----
+                bgColor,
+                color,
+                borderColor,
+                lightColor,
+
+                // ---- Economics ----
+                percentage,
                 duration: {
                     hours: durationHours,
                     days: durationDays
                 },
-                minAmount: {
-                    usd: minAmountUSD
-                },
-                maxAmount: {
-                    usd: maxAmountUSD
-                },
-                minAmountBTC: minAmountBTC,
-                maxAmountBTC: maxAmountBTC,
-                btcRange: btcRange,
-                features: features,
+                minAmount: { usd: minAmountUSD },
+                maxAmount: { usd: maxAmountUSD },
+                minAmountBTC,
+                maxAmountBTC,
+                btcRange,
 
-                // ---- Live hashrate range (fluctuates with BTC price) ----
-                minHashpower: formatHashpower(minHashpower) + ' TH/s',
-                maxHashpower: formatHashpower(maxHashpower) + ' TH/s',
+                // ---- Features ----
+                features,
+
+                // ---- Live hashrate range ----
+                minHashpower: formatHashpower(minHashpower) + ' ' + hashrateUnit,
+                maxHashpower: formatHashpower(maxHashpower) + ' ' + hashrateUnit,
                 hashrate: {
                     min: parseFloat(minHashpower.toFixed(4)),
                     max: parseFloat(maxHashpower.toFixed(4)),
-                    unit: 'TH/s',
+                    unit: hashrateUnit,
                     display: hashrateRangeDisplay
                 },
 
+                // ---- Auto-compound / long-term config ----
+                // cloudmining.html uses these to build the Normal/Long-term toggle.
+                autoCompound: {
+                    allow: allowAutoCompound,
+                    options: autoCompoundOptions,
+                    defaultMonths: defaultAutoCompoundMonths,
+                    minMonths: minAutoCompoundMonths,
+                    maxMonths: maxAutoCompoundMonths
+                },
+
+                // ---- Per-cycle fee (plan override or global) ----
+                cycleFeePercent,
+
                 // ---- Button state ----
-                buttonState: buttonState,
-                buttonText: buttonText,
-                buttonTooltip: buttonTooltip,
-                canRent: canRent
+                buttonState,
+                buttonText,
+                buttonTooltip,
+                canRent
             };
         });
 
@@ -22089,10 +22557,10 @@ app.get('/api/plans', async (req, res) => {
             data: {
                 plans: enhancedPlans,
                 marketContext: {
-                    btcPrice: btcPrice,
+                    btcPrice,
                     timestamp: new Date().toISOString()
                 },
-                userContext: userContext
+                userContext
             }
         };
 
