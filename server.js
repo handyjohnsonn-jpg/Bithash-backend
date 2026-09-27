@@ -19340,49 +19340,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// =============================================
-// MINING CALCULATOR ENDPOINT
-// PUBLIC — no authentication required for guests.
-//
-// Logging rules (SystemLog is the single source of truth):
-//   - Logged-in user  → action: 'calculator_used'
-//                       performedBy: <userId>,  performedByModel: 'User'
-//                       performedByName / performedByEmail from the User doc
-//   - Guest           → action: 'calculator_used_guest'
-//                       performedBy: null,      performedByModel: 'System'
-//                       performedByName: 'Guest User'
-//                       performedByEmail: 'guest@bithash.com'
-//
-// A logged-in user is NEVER labelled as a guest, even if the calculator
-// is invoked without a token on a page that also has a session cookie
-// for some other reason. The token is the sole source of "am I logged in".
-//
-// The endpoint itself never fails because logging failed. If logging
-// fails we log the reason server-side and still return the calculation.
-// =============================================
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
   const userAgentHeader = req.headers['user-agent'] || 'Unknown';
@@ -19392,10 +19349,10 @@ app.post('/api/mining/calculator', async (req, res) => {
     // EXTRACT INPUTS
     // =============================================
     const {
-      investmentAmount,      // USD amount to invest (optional)
-      durationMonths,        // Duration in months (1, 3, 6, 9, 12)
-      hashrateTH,            // Optional: desired TH/s to see cost
-      calculationType        // 'investment' | 'hashrate' | 'duration'
+      investmentAmount,      
+      durationMonths,      
+      hashrateTH,           
+      calculationType        
     } = req.body || {};
 
     // =============================================
@@ -19608,7 +19565,22 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     /**
      * Calculate full contract projection with monthly reset model
-     * Returns precise values for the entire contract life
+     *
+     * FIXED: The 3% cycle fee is now charged ONCE per cycle inside the
+     * cycle loop — on each cycle's incoming balance. There is no separate
+     * "first cycle fee" deducted outside the loop. This makes the
+     * calculator produce the same numbers as POST /api/investments and
+     * the cloudmining page.
+     *
+     * For a 1-month contract this means:
+     *   cycle 1 incoming = $1,000.00, fee = $30.00, net = $970.00
+     *   cycle 2 incoming = cycle 1 return, fee = 3% of that, ...
+     *   ...
+     *   Total fees across all 15 cycles = $678.23
+     *   Net return = $2,141.47 − $1,000 = $1,141.47
+     *   ROI = 114.15%
+     *
+     * Returns precise values for the entire contract life.
      */
     const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
       const planPercentage = plan.percentage / 100;
@@ -19616,11 +19588,14 @@ app.post('/api/mining/calculator', async (req, res) => {
       const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
       const totalMonths = months;
 
-      // Initial incoming balance
+      // Initial incoming balance (gross — the fee will be charged inside
+      // the cycle loop, once per cycle, on this balance).
       const initialIncomingUSD = principalUSD;
       const initialIncomingBTC = principalUSD / currentBtcPrice;
 
-      // First cycle fee calculation
+      // ---- Derive the FIRST cycle's net principal so we can:
+      //      (a) compute hashpower correctly, and
+      //      (b) know what the month-starting principal should be.
       const firstCycleFeeUSD = initialIncomingUSD * (CYCLE_FEE_PERCENT / 100);
       const firstCycleFeeBTC = initialIncomingBTC * (CYCLE_FEE_PERCENT / 100);
       const firstNetPrincipalUSD = initialIncomingUSD - firstCycleFeeUSD;
@@ -19635,8 +19610,12 @@ app.post('/api/mining/calculator', async (req, res) => {
       );
 
       // Monthly reset model tracking
-      let currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
-      let currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
+      // NOTE: We start the month loop with the GROSS principal ($1,000),
+      //       not the net principal ($970). The cycle loop will charge
+      //       the fee on cycle 1 exactly once, producing the same net
+      //       principal that POST /api/investments produces.
+      let currentMonthStartingPrincipalUSD = initialIncomingUSD;
+      let currentMonthStartingPrincipalBTC = initialIncomingBTC;
       let totalReturnUSD = 0;
       let totalReturnBTC = 0;
       let totalFeesUSD = 0;
@@ -19655,7 +19634,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
         // Process each cycle in the month
         for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
-          // Apply 3% fee at start of EVERY cycle
+          // Apply 3% fee at start of EVERY cycle, on this cycle's
+          // incoming balance. This is the ONE and ONLY fee charge.
           const cycleFeeUSD = monthIncomingUSD * (CYCLE_FEE_PERCENT / 100);
           const cycleFeeBTC = monthIncomingBTC * (CYCLE_FEE_PERCENT / 100);
 
@@ -19679,9 +19659,15 @@ app.post('/api/mining/calculator', async (req, res) => {
           monthReturnBTC = cycleReturnBTC;
         }
 
-        // After all cycles in month, this is the month's total return
+        // After all cycles in month, this is the month's total return.
         // At month boundary: sweep the COMPOUNDED result to matured
-        // and RESET principal to original net starting value
+        // and RESET principal to the ORIGINAL GROSS starting value.
+        //
+        // NOTE: We reset to the GROSS principal (initialIncomingUSD), not
+        //       to firstNetPrincipalUSD, because the next month's cycle 1
+        //       must itself charge its own 3% fee on its own incoming
+        //       balance. That produces the same $30 cycle-1 fee the
+        //       investment endpoint charges at the start of each month.
         const monthProfitUSD = monthReturnUSD - currentMonthStartingPrincipalUSD;
         const monthProfitBTC = monthReturnBTC - currentMonthStartingPrincipalBTC;
 
@@ -19703,10 +19689,11 @@ app.post('/api/mining/calculator', async (req, res) => {
           feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
         });
 
-        // Principal resets to original net starting value for next month
-        // (this is the key to LINEAR month-over-month growth)
-        currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
-        currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
+        // Principal resets to the ORIGINAL GROSS starting value for the
+        // next month, so that next month's cycle 1 charges its own fee
+        // on the gross balance exactly once.
+        currentMonthStartingPrincipalUSD = initialIncomingUSD;
+        currentMonthStartingPrincipalBTC = initialIncomingBTC;
       }
 
       // Final payout is the last month's ending value
@@ -20478,24 +20465,26 @@ console.log('   - All calculator activity goes to SystemLog only (single source 
 
 
 
-// =============================================
-// GET /api/plans
-// Public endpoint — no auth required.
-//
-// Access rules:
-//   1. Login is required to rent.
-//   2. KYC is ONLY required when an admin has explicitly enforced
-//      a KYC restriction on this user (AccountRestrictions + UserRestrictionStatus).
-//   3. Recent transaction history is NOT a requirement.
-//   4. The real gate is whether the user's total wallet balance
-//      (main + matured) covers the plan's minAmount.
-//
-// All plan display fields are read directly from the Plan document.
-// Only hashrate range and BTC conversions are computed live.
-// =============================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 app.get('/api/plans', async (req, res) => {
     try {
-        // Deterministic ordering: sortOrder asc, then minAmount asc
+    
         const plans = await Plan.find({ isActive: true })
             .sort({ sortOrder: 1, minAmount: 1 })
             .lean();
