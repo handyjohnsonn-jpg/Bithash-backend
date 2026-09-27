@@ -22025,13 +22025,20 @@ console.log('   - Activity logging for both users and guests');
 
 
 
-
 // =============================================
 // GET /api/plans
 // Public endpoint — no auth required.
-// Returns all active plans with live BTC price, live hashrate range,
-// per-plan display theme, features, and auto-compound config.
-// All display fields are read directly from the Plan document.
+//
+// Access rules:
+//   1. Login is required to rent.
+//   2. KYC is ONLY required when an admin has explicitly enforced
+//      a KYC restriction on this user (AccountRestrictions + UserRestrictionStatus).
+//   3. Recent transaction history is NOT a requirement.
+//   4. The real gate is whether the user's total wallet balance
+//      (main + matured) covers the plan's minAmount.
+//
+// All plan display fields are read directly from the Plan document.
+// Only hashrate range and BTC conversions are computed live.
 // =============================================
 app.get('/api/plans', async (req, res) => {
     try {
@@ -22050,7 +22057,9 @@ app.get('/api/plans', async (req, res) => {
                         isLoggedIn: false,
                         canRent: false,
                         kycVerified: false,
-                        hasRecentTransaction: false,
+                        kycRestricted: false,
+                        adminKycRestricted: false,
+                        adminTransactionRestricted: false,
                         mainBalance: { usd: 0 },
                         maturedBalance: { usd: 0 },
                         totalPortfolio: { usd: 0 }
@@ -22068,12 +22077,16 @@ app.get('/api/plans', async (req, res) => {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
 
-        // ---- User context (optional auth) ----
+        // =============================================
+        // DEFAULT USER CONTEXT (guest)
+        // =============================================
         let userContext = {
             isLoggedIn: false,
             canRent: false,
             kycVerified: false,
-            hasRecentTransaction: false,
+            kycRestricted: false,
+            adminKycRestricted: false,
+            adminTransactionRestricted: false,
             mainBalance: { usd: 0 },
             maturedBalance: { usd: 0 },
             totalPortfolio: { usd: 0 }
@@ -22088,38 +22101,86 @@ app.get('/api/plans', async (req, res) => {
                     .select('balances kycStatus firstName lastName email isVerified');
 
                 if (user) {
+                    // =============================================
+                    // KYC STATUS — informational only
+                    // Having verified KYC is nice, but it is NOT a hard gate.
+                    // The hard gate is only applied when an admin has
+                    // explicitly restricted this user.
+                    // =============================================
                     const kycVerified =
                         user.kycStatus?.identity === 'verified' &&
                         user.kycStatus?.address === 'verified' &&
                         user.kycStatus?.facial === 'verified';
 
+                    // =============================================
+                    // ADMIN-ENFORCED RESTRICTIONS
+                    // This is the ONLY place where KYC / transaction
+                    // restrictions should block renting.
+                    //
+                    // - AccountRestrictions holds the admin's global policy
+                    //   (limits + whether they apply at all).
+                    // - UserRestrictionStatus holds the per-user state,
+                    //   which is updated by the admin (or by the
+                    //   checkAndUpdateRestrictions helper when an admin
+                    //   has enabled the corresponding policy).
+                    // =============================================
+                    const restrictions = await AccountRestrictions.getInstance();
+                    const userRestrictionStatus = await UserRestrictionStatus.findOne({ user: user._id }).lean();
+
+                    // Whether the admin has enforced a KYC restriction on this user
+                    const adminKycRestricted = !!(userRestrictionStatus && userRestrictionStatus.kyc_restricted);
+                    // Whether the admin has enforced a transaction restriction on this user
+                    const adminTransactionRestricted = !!(userRestrictionStatus && userRestrictionStatus.transaction_restricted);
+
+                    // Whether the admin has configured a KYC limit policy at all
+                    // (even if this specific user is not currently restricted, we
+                    // want to be able to surface a warning when the user is
+                    // approaching the limit).
+                    const adminHasKycPolicy =
+                        restrictions.withdraw_limit_no_kyc !== null ||
+                        restrictions.invest_limit_no_kyc !== null;
+
+                    const adminHasTransactionPolicy =
+                        restrictions.withdraw_limit_no_txn !== null ||
+                        restrictions.invest_limit_no_txn !== null;
+
+                    // =============================================
+                    // REAL-TIME WALLET BALANCES
+                    // =============================================
                     const balances = await calculateRealWalletBalances(user);
                     const mainBalanceUSD = balances.mainUSD || 0;
                     const maturedBalanceUSD = balances.maturedUSD || 0;
+                    const totalBalanceUSD = mainBalanceUSD + maturedBalanceUSD;
 
-                    const thirtyDaysAgo = new Date();
-                    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-                    const recentTx = await Transaction.findOne({
-                        user: user._id,
-                        type: { $in: ['deposit', 'withdrawal'] },
-                        status: 'completed',
-                        createdAt: { $gte: thirtyDaysAgo }
-                    });
-                    const hasRecentTransaction = !!recentTx;
-
+                    // =============================================
+                    // USER CONTEXT FOR THE FRONTEND
+                    // =============================================
                     userContext = {
                         isLoggedIn: true,
                         firstName: user.firstName,
                         lastName: user.lastName,
                         email: user.email,
                         isVerified: user.isVerified || false,
+
+                        // KYC — informational
                         kycVerified,
+
+                        // Admin-enforced restriction flags
+                        kycRestricted: adminKycRestricted,
+                        adminKycRestricted,
+                        adminTransactionRestricted,
+                        adminHasKycPolicy,
+                        adminHasTransactionPolicy,
+
+                        // Wallet balances (the real gate for renting)
                         mainBalance: { usd: mainBalanceUSD },
                         maturedBalance: { usd: maturedBalanceUSD },
-                        totalPortfolio: { usd: mainBalanceUSD + maturedBalanceUSD },
-                        hasRecentTransaction,
-                        canRent: kycVerified && hasRecentTransaction
+                        totalPortfolio: { usd: totalBalanceUSD },
+
+                        // canRent is refined per-plan below. Default here
+                        // is the highest-privilege state; we only ever
+                        // downgrade it based on admin-enforced restrictions.
+                        canRent: !adminKycRestricted && !adminTransactionRestricted
                     };
                 }
             } catch (authErr) {
@@ -22182,7 +22243,7 @@ app.get('/api/plans', async (req, res) => {
                     ? plan.maxAutoCompoundMonths
                     : (autoCompoundOptions[autoCompoundOptions.length - 1] || 12);
 
-            const allowAutoCompound = plan.allowAutoCompound !== false; // default true
+            const allowAutoCompound = plan.allowAutoCompound !== false;
 
             // ---- BTC amounts for display ----
             const minAmountBTC = btcPrice > 0 ? minAmountUSD / btcPrice : 0;
@@ -22190,11 +22251,6 @@ app.get('/api/plans', async (req, res) => {
 
             // =============================================
             // LIVE HASHPOWER RANGE (TH/s)
-            // Computed from the NET principal that actually mines:
-            //   netPrincipal = grossAmount × (1 − cycleFeePercent/100)
-            // Then calculateHashpower() applies the plan's own
-            // percentage, duration, and the current BTC price.
-            // Values fluctuate in real time as BTC price changes.
             // =============================================
             const minNetPrincipal = minAmountUSD * (1 - cycleFeePercent / 100);
             const maxNetPrincipal = maxAmountUSD * (1 - cycleFeePercent / 100);
@@ -22217,7 +22273,7 @@ app.get('/api/plans', async (req, res) => {
                        `${formatHashpower(minHashpower)} - ${formatHashpower(maxHashpower)} ${hashrateUnit}`)
                     : (plan.hashrateDisplayOverride || 'Calculating...');
 
-            // ---- Features (from schema, no tier derivation) ----
+            // ---- Features ----
             const features = Array.isArray(plan.features) ? plan.features : [];
 
             // ---- BTC range display ----
@@ -22226,7 +22282,16 @@ app.get('/api/plans', async (req, res) => {
                 : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
             // =============================================
-            // BUTTON STATE
+            // BUTTON STATE — REWRITTEN
+            //
+            // Priority order:
+            //   1. Not logged in            → login
+            //   2. Admin-enforced KYC       → kyc_required (only when admin enforced)
+            //   3. Admin-enforced txn       → transaction_required (only when admin enforced)
+            //   4. Balance < plan.minAmount → insufficient
+            //   5. Otherwise                → rent
+            //
+            // NO recent-transaction check. NO implicit KYC check.
             // =============================================
             let buttonState   = 'login';
             let buttonText    = 'Login to Rent Hashpower';
@@ -22234,16 +22299,22 @@ app.get('/api/plans', async (req, res) => {
             let canRent       = false;
 
             if (userContext.isLoggedIn) {
-                if (!userContext.kycVerified) {
+                // -------- Gate 1: Admin-enforced KYC restriction --------
+                if (userContext.adminKycRestricted) {
                     buttonState   = 'kyc_required';
                     buttonText    = 'Complete KYC';
-                    buttonTooltip = 'KYC verification required to rent hashpower';
-                } else if (!userContext.hasRecentTransaction) {
+                    buttonTooltip = 'KYC verification is required to rent hashpower (admin-enforced restriction)';
+                }
+                // -------- Gate 2: Admin-enforced transaction restriction --------
+                else if (userContext.adminTransactionRestricted) {
                     buttonState   = 'transaction_required';
-                    buttonText    = 'Make a Deposit';
-                    buttonTooltip = 'A recent deposit or withdrawal is required';
-                } else {
-                    const totalUserBalance = userContext.mainBalance.usd + userContext.maturedBalance.usd;
+                    buttonText    = 'Complete a Transaction';
+                    buttonTooltip = 'An admin-enforced transaction restriction is active on your account';
+                }
+                // -------- Gate 3: Balance check (the real gate) --------
+                else {
+                    const totalUserBalance = (userContext.mainBalance?.usd || 0) + (userContext.maturedBalance?.usd || 0);
+
                     if (totalUserBalance >= minAmountUSD) {
                         canRent       = true;
                         buttonState   = 'rent';
@@ -22252,20 +22323,16 @@ app.get('/api/plans', async (req, res) => {
                     } else {
                         buttonState   = 'insufficient';
                         buttonText    = `Need $${minAmountUSD.toLocaleString()}`;
-                        buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}`;
+                        buttonTooltip = `Required balance for this plan: $${minAmountUSD.toLocaleString()}. Your balance: $${totalUserBalance.toLocaleString()}`;
                     }
                 }
             }
 
             // =============================================
             // USER-FACING RESPONSE
-            // Internal economics (per-cycle fee math, formula) is not exposed,
-            // but cycleFeePercent and autoCompound options are, because the
-            // cloudmining page needs them to build the Normal/Long-term toggle
-            // and the projection preview.
             // =============================================
             return {
-                // ---- Identity (REQUIRED for cloudmining.html routing) ----
+                // ---- Identity ----
                 id: planId,
                 _id: planId,
 
@@ -22311,7 +22378,6 @@ app.get('/api/plans', async (req, res) => {
                 },
 
                 // ---- Auto-compound / long-term config ----
-                // cloudmining.html uses these to build the Normal/Long-term toggle.
                 autoCompound: {
                     allow: allowAutoCompound,
                     options: autoCompoundOptions,
@@ -22320,7 +22386,7 @@ app.get('/api/plans', async (req, res) => {
                     maxMonths: maxAutoCompoundMonths
                 },
 
-                // ---- Per-cycle fee (plan override or global) ----
+                // ---- Per-cycle fee ----
                 cycleFeePercent,
 
                 // ---- Button state ----
@@ -22355,9 +22421,6 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
-
-
-
 
 
 
