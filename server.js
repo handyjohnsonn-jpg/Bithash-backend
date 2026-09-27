@@ -16331,6 +16331,12 @@ app.post('/api/auth/reset-password', [
 });
 
 
+
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -16864,31 +16870,27 @@ app.post('/api/investments', protect, [
     // SEND CONFIRMATION EMAIL
     // =============================================
     try {
-      const getCryptoLogoUrl = (asset) => {
-        const logoMap = {
-          'BTC': 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png',
-          'ETH': 'https://assets.coingecko.com/coins/images/279/large/ethereum.png',
-          'USDT': 'https://assets.coingecko.com/coins/images/325/large/Tether.png'
-        };
-        return logoMap[asset.toUpperCase()] || 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
-      };
+      const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
 
-      const cryptoLogoUrl = getCryptoLogoUrl('BTC');
-      const formattedAmount = amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedInvestmentBTC = netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedOriginalBTC = investmentBTCAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const formattedGrossInvestmentUSD = amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedGrossInvestmentBTC = investmentBTCAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedFeeUSD = firstCycleFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const formattedFeeBTC = firstCycleFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedExpectedReturnUSD = firstCycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedExpectedReturnBTC = firstCycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-      const formattedBtcPrice = btcPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedNetPrincipalUSD = netPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedNetPrincipalBTC = netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const formattedGrossReturnUSD = firstCycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedGrossReturnBTC = firstCycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+      const netReturnUSDValue = firstCycleReturnUSD - netPrincipalUSD;
+      const netReturnBTCValue = firstCycleReturnBTC - netPrincipalBTC;
+      const formattedNetReturnUSD = netReturnUSDValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const formattedNetReturnBTC = netReturnBTCValue.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
       const formattedStartDate = firstCycleStartDate.toLocaleString('en-US', {
         year: 'numeric',
         month: 'long',
         day: 'numeric',
         hour: '2-digit',
         minute: '2-digit',
-        second: '2-digit',
         timeZoneName: 'short'
       });
       const formattedEndDate = firstCycleEndDate.toLocaleString('en-US', {
@@ -16897,7 +16899,6 @@ app.post('/api/investments', protect, [
         day: 'numeric',
         hour: '2-digit',
         minute: '2-digit',
-        second: '2-digit',
         timeZoneName: 'short'
       });
 
@@ -16907,28 +16908,6 @@ app.post('/api/investments', protect, [
       const formattedNewActiveUSD = newActiveUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
       const isLongTerm = requestedMonths > 1 && totalCycles > 1;
-
-      // Build the auto-compound block for the email (only if applicable)
-      const autoCompoundEmailBlock = isLongTerm
-        ? `
-          <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-            <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${requestedMonths} month(s)</td>
-          </tr>
-          <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0;"><strong>Cycles per Month:</strong></td>
-            <td style="padding: 8px 0; text-align: right; font-weight: bold;">${cyclesPerMonth} cycles</td>
-          </tr>
-          <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0;"><strong>Per-Cycle Fee:</strong></td>
-            <td style="padding: 8px 0; text-align: right; color: #EF4444;">${cycleFeePercent}% deducted at start of each cycle</td>
-          </tr>
-          <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0;"><strong>Monthly Reset:</strong></td>
-            <td style="padding: 8px 0; text-align: right; color: #3B82F6;">Growth swept at month end; principal resets</td>
-          </tr>
-        `
-        : '';
 
       const mailTransporter = infoTransporter;
 
@@ -16950,18 +16929,18 @@ app.post('/api/investments', protect, [
                 </svg>
               </div>
               <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
-              <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `${requestedMonths} month(s) contract - ${cyclesPerMonth} cycles/month` : 'Your mining contract is now active'}</p>
+              <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `${requestedMonths}-month contract (${cyclesPerMonth} cycles/month)` : 'Your mining contract is now active'}</p>
             </div>
 
             <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-            <p style="color: #333333; line-height: 1.6;">Great news! Your Mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
+            <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
 
             <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
               <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
                 <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                 <div>
-                  <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedInvestmentBTC} BTC</div>
-                  <div style="color: #64748B; font-size: 12px;">≈ $${netPrincipalUSD.toLocaleString()} USD in active mining</div>
+                  <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedNetPrincipalBTC} BTC</div>
+                  <div style="color: #64748B; font-size: 12px;">≈ $${formattedNetPrincipalUSD} USD deployed to mining</div>
                 </div>
               </div>
 
@@ -16971,44 +16950,35 @@ app.post('/api/investments', protect, [
                   <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>BTC Invested (Gross):</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${formattedOriginalBTC} BTC (≈ $${formattedAmount} USD)</td>
+                  <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${formattedGrossInvestmentBTC} BTC (≈ $${formattedGrossInvestmentUSD} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Cycle 1 Fee (${cycleFeePercent}%):</strong></td>
+                  <td style="padding: 8px 0;"><strong style="color: #EF4444;">Cycle Fee (${cycleFeePercent}%):</strong></td>
                   <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Net BTC in Mining:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${formattedInvestmentBTC} BTC (≈ $${netPrincipalUSD.toLocaleString()} USD)</td>
+                  <td style="padding: 8px 0;"><strong>Net Principal Deployed:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNetPrincipalBTC} BTC (≈ $${formattedNetPrincipalUSD} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Expected Cycle 1 Return:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedExpectedReturnBTC} BTC (≈ $${formattedExpectedReturnUSD} USD)</td>
+                  <td style="padding: 8px 0;"><strong style="color: #10B981;">Gross Return at Cycle End:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Return Per Cycle:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; color: #10B981;">+${plan.percentage}%</td>
+                  <td style="padding: 8px 0;"><strong style="color: #10B981;">Net Return at Cycle End:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
                 </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Cycle Duration:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${plan.duration} hours</td>
-                </tr>
-                ${autoCompoundEmailBlock}
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
                   <td style="padding: 8px 0; text-align: right; font-weight: bold;">${initialHashpower} TH/s</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Mining Type:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">SHA-256 ASIC mining</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Cycle 1 Start:</strong></td>
+                  <td style="padding: 8px 0;"><strong>Cycle Start:</strong></td>
                   <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Cycle 1 End:</strong></td>
+                  <td style="padding: 8px 0;"><strong>Cycle End:</strong></td>
                   <td style="padding: 8px 0; text-align: right; color: #F7A600;">${formattedEndDate}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
@@ -17016,12 +16986,8 @@ app.post('/api/investments', protect, [
                   <td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">${walletName} Wallet</span></td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>New Active Wallet:</strong></td>
+                  <td style="padding: 8px 0;"><strong>New Active Wallet Balance:</strong></td>
                   <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewActiveBTC} BTC (≈ $${formattedNewActiveUSD} USD)</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Exchange Rate (BTC/USD):</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">1 BTC = $${formattedBtcPrice}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
@@ -17031,10 +16997,10 @@ app.post('/api/investments', protect, [
             </div>
 
             <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-              <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Mining Information</p>
+              <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Mining Information</p>
               ${isLongTerm
-                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract runs for <strong>${requestedMonths} month(s)</strong>, with <strong>${cyclesPerMonth} cycles</strong> per month. At the start of <strong>every cycle</strong>, a ${cycleFeePercent}% fee is deducted from the incoming balance, and the net amount mines at the plan's return percentage. At each month boundary, the compounded growth is swept to your Matured Wallet and the principal resets, producing linear month-over-month growth. The final payout lands in your Matured Wallet at the end of the last month.</p>`
-                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can then rent again normally or activate a long-term auto-compound contract.</p>`
+                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract runs for <strong>${requestedMonths} month(s)</strong>, with <strong>${cyclesPerMonth} cycles</strong> per month. At each month boundary, the compounded growth is swept to your Matured Wallet and the principal resets, producing linear month-over-month growth. Final payout lands in your Matured Wallet at the end of month ${requestedMonths}.</p>`
+                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can then rent again or activate a multi-month contract.</p>`
               }
             </div>
 
@@ -17059,7 +17025,7 @@ app.post('/api/investments', protect, [
       await mailTransporter.sendMail({
         from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
         to: user.email,
-        subject: `✅ Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month Contract)` : ''} - ₿itHash Capital`,
+        subject: `Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month Contract)` : ''} - ₿itHash Capital`,
         html: emailHtml
       });
 
@@ -17643,38 +17609,38 @@ const completeMaturedInvestmentsCron = async () => {
           // SEND MATURITY EMAIL
           // =============================================
           try {
-            const getCryptoLogoUrl = (asset) => {
-              const logoMap = {
-                'BTC': 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png',
-                'ETH': 'https://assets.coingecko.com/coins/images/279/large/ethereum.png',
-                'USDT': 'https://assets.coingecko.com/coins/images/325/large/Tether.png'
-              };
-              return logoMap[asset.toUpperCase()] || 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
-            };
+            const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
 
-            const cryptoLogoUrl = getCryptoLogoUrl('BTC');
             const formattedPrincipalUSD = netPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const formattedPrincipalBTC = netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedReturnUSD = cycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedReturnBTC = cycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedStartPrice = (investment.btcPriceAtInvestment || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedEndPrice = currentBTCPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+            const formattedFinalFeeUSD = cycleFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedFinalFeeBTC = cycleFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
+            const formattedGrossReturnUSD = cycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedGrossReturnBTC = cycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
+            const netReturnUSDValue = cycleReturnUSD - netPrincipalUSD;
+            const netReturnBTCValue = cycleReturnBTC - netPrincipalBTC;
+            const formattedNetReturnUSD = netReturnUSDValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedNetReturnBTC = netReturnBTCValue.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
             const formattedCompletionDate = now.toLocaleString('en-US', {
               year: 'numeric',
               month: 'long',
               day: 'numeric',
               hour: '2-digit',
               minute: '2-digit',
-              second: '2-digit',
               timeZoneName: 'short'
             });
 
             const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
+            const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
             const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+            const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
             const isLongTerm = (investment.autoCompoundMonths && investment.totalCycles > 1);
 
-            // Auto-compound summary block (only if applicable)
             const compoundSummaryBlock = isLongTerm
               ? `
                 <tr style="border-top: 1px solid #E2E8F0;">
@@ -17722,8 +17688,8 @@ const completeMaturedInvestmentsCron = async () => {
                     <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
                       <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                       <div>
-                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedReturnBTC} BTC</div>
-                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedReturnUSD} USD credited to Matured Wallet</div>
+                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
+                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
                       </div>
                     </div>
 
@@ -17733,37 +17699,29 @@ const completeMaturedInvestmentsCron = async () => {
                         <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
+                        <td style="padding: 8px 0;"><strong>Net Principal Deployed:</strong></td>
                         <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Cycle Return:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedReturnBTC} BTC (≈ $${formattedReturnUSD} USD)</td>
+                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Fee (${cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFinalFeeBTC} BTC (≈ $${formattedFinalFeeUSD} USD)</strong></td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>ROI Per Cycle:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #10B981;">+${investment.returnPercentage || 0}%</td>
+                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Gross Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Per-Cycle Fee:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">${cycleFeePercent}%</td>
+                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Net Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
                       </tr>
                       ${compoundSummaryBlock}
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>BTC Price at Investment:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">$${formattedStartPrice}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>BTC Price at Completion:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">$${formattedEndPrice}</td>
-                      </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
                         <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>New Matured Wallet:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC</td>
+                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
                       </tr>
                     </table>
                   </div>
@@ -18086,14 +18044,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
-
-
-
-
-
-
 
 
 
