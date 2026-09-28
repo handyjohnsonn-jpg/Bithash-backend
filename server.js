@@ -20816,6 +20816,46 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -20931,7 +20971,7 @@ app.post('/api/investments', protect, [
 
     // Single cycle is always allowed. Multi-month requires plan opt-in.
     if (requestedMonths > 0 && requestedMonths < 1) {
-        return res.status(400).json({ status: 'fail', message: 'Invalid auto-compound duration' });
+      return res.status(400).json({ status: 'fail', message: 'Invalid auto-compound duration' });
     }
     if (requestedMonths >= 1 && !planAllowAutoCompound) {
       return res.status(400).json({
@@ -21316,7 +21356,7 @@ app.post('/api/investments', protect, [
     });
 
     // =============================================
-    // REFERRAL COMMISSIONS (unchanged)
+    // REFERRAL COMMISSIONS
     // =============================================
     await calculateReferralCommissions(investment);
 
@@ -21342,219 +21382,28 @@ app.post('/api/investments', protect, [
     }
 
     // =============================================
-    // SEND CONFIRMATION EMAIL
-    //
-    // This section generates the email content. It uses the new
-    // calculateContractProjection() helper to build the exact same
-    // projection data the user saw on the frontend, ensuring the
-    // email matches their expectations perfectly.
+    // SEND CONFIRMATION EMAIL (premium, mobile-safe)
     // =============================================
     try {
-      const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
-      const isSingleCycle = requestedMonths === 0;
-      const isLongTerm = !isSingleCycle;
-
-      // --- Format dates for display ---
-      const formattedStartDate = firstCycleStartDate.toLocaleString('en-US', {
-        year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
-      });
-      const finalEndDate = new Date(firstCycleStartDate.getTime() + totalCycles * plan.duration * 60 * 60 * 1000);
-      const formattedFinalEndDate = finalEndDate.toLocaleString('en-US', {
-        year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
-      });
-
-      // --- Build the projection data ---
-      // This is the SINGLE SOURCE OF TRUTH for all email figures.
       const projection = calculateContractProjection(amount, plan, requestedMonths, btcPrice);
 
-      // --- Format the numbers from the projection object ---
-      const formatted = {
-        grossUSD: projection.grossPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        grossBTC: projection.grossPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
-        feeUSD: projection.totalFeesUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        feeBTC: projection.totalFeesBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
-        netPrincipalUSD: projection.netPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        netPrincipalBTC: projection.netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
-        totalReturnUSD: projection.totalReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        totalReturnBTC: projection.totalReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
-        totalProfitUSD: projection.totalProfitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        totalProfitBTC: projection.totalProfitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
-        roiPercent: projection.roiPercent.toFixed(2),
-      };
-
-      // --- Build the HTML for the monthly breakdown (for long-term contracts) ---
-      let monthlyBreakdownHtml = '';
-      if (isLongTerm) {
-        const breakdownRows = projection.monthlyBreakdown.map(m => `
-          <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0;">Month ${m.month}</td>
-            <td style="padding: 8px 0; text-align: right;">$${m.startingPrincipalUSD.toLocaleString()}</td>
-            <td style="padding: 8px 0; text-align: right; font-weight: 600; color: #10B981;">$${m.endingValueUSD.toLocaleString()}</td>
-            <td style="padding: 8px 0; text-align: right; color: #10B981;">+$${m.profitUSD.toLocaleString()}</td>
-          </tr>
-        `).join('');
-
-        monthlyBreakdownHtml = `
-          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-            <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Monthly Payout Schedule</h3>
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-              <thead>
-                <tr>
-                  <th style="text-align: left; padding-bottom: 8px; font-weight: 600; color: #64748B;">Month</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Starting Capital</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Payout</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Profit</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${breakdownRows}
-              </tbody>
-            </table>
-          </div>
-        `;
-      }
-
-      // --- Build the final email HTML ---
-      const emailHtml = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-          <style>
-            /* Full-width mobile view: cards inside email body must never be cut or truncated */
-            @media only screen and (max-width: 600px) {
-              .email-wrapper { width: 100% !important; max-width: 100% !important; margin: 0 !important; border-radius: 0 !important; }
-              .email-body { padding: 16px !important; }
-              .email-card { width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; padding: 16px !important; margin: 16px 0 !important; overflow: visible !important; }
-              .email-card table { width: 100% !important; table-layout: fixed !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
-              .email-card td, .email-card th { white-space: normal !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
-              .email-card h1, .email-card h2, .email-card h3 { font-size: 18px !important; line-height: 1.4 !important; }
-              .email-card p, .email-card span, .email-card div { font-size: 14px !important; line-height: 1.6 !important; }
-              .email-cta { padding: 12px 24px !important; width: auto !important; max-width: 100% !important; display: block !important; box-sizing: border-box !important; text-align: center !important; }
-            }
-          </style>
-        </head>
-        <body style="margin: 0; padding: 0; width: 100%; -webkit-text-size-adjust: 100%; background: #FFFFFF;">
-        <div class="email-wrapper" style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF; width: 100%;">
-          <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-            <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-            <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-            <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-          </div>
-
-          <div class="email-body" style="padding: 30px; background: #FFFFFF;">
-            <div class="email-card" style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-              <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
-              <p style="color: #065F46; font-size: 13px; margin: 0;">Your ${isSingleCycle ? 'single-cycle' : `${requestedMonths}-month`} contract is now live.</p>
-            </div>
-
-            <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-            <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
-
-            <!-- Contract Summary -->
-            <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                    <tr>
-                        <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Fees Charged (${projection.cycleFeePercent}%):</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Initial Net Principal:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${projection.hashpower.toLocaleString()} TH/s</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${isSingleCycle ? `Single Cycle (${plan.duration}h)` : `${requestedMonths} Month(s) — ${projection.cyclesPerMonth} cycles/month`}</td>
-                    </tr>
-                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Cycle Start:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Payout Date:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${formattedFinalEndDate}</td>
-                    </tr>
-                    <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
-                    </tr>
-                </table>
-            </div>
-
-            <!-- Total Mining Return -->
-            <div class="email-card" style="background: #ECFDF5; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #A7F3D0;">
-              <h3 style="font-size: 16px; font-weight: 600; color: #065F46; margin: 0 0 16px 0; text-align: center;">Total Mining Return at Contract End</h3>
-              <div style="text-align: center; margin-bottom: 16px;">
-                <div style="font-size: 28px; font-weight: bold; color: #F7A600; margin-bottom: 4px;">
-                  +${formatted.totalReturnBTC} BTC
-                </div>
-                <div style="font-size: 16px; color: #B8860B; font-weight: 600;">
-                  ≈ $${formatted.totalReturnUSD} USD
-                </div>
-              </div>
-              <div style="border-top: 1px solid #A7F3D0; padding-top: 16px; margin-top: 16px;">
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                  <tr>
-                    <td style="padding: 6px 0; color: #065F46;"><strong>Net Profit:</strong></td>
-                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">+$${formatted.totalProfitUSD} USD</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 6px 0; color: #065F46;"><strong>Return on Investment (ROI):</strong></td>
-                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">${formatted.roiPercent}%</td>
-                  </tr>
-                </table>
-              </div>
-            </div>
-
-            <!-- Monthly Breakdown for long-term contracts -->
-            ${monthlyBreakdownHtml}
-
-            <!-- Final Note -->
-            <div class="email-card" style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-              <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Next Steps</p>
-              ${isSingleCycle
-                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract is a <strong>single ${plan.duration}-hour cycle</strong>. When the cycle closes, the full return of <strong>${formatted.totalReturnBTC} BTC (≈ $${formatted.totalReturnUSD} USD)</strong> will be credited directly to your Matured Wallet. Track live progress on your dashboard.</p>`
-                : requestedMonths === 1
-                  ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract runs for <strong>1 month</strong> — that is <strong>${projection.cyclesPerMonth} consecutive ${plan.duration}-hour cycles</strong>. Returns compound into the next cycle automatically. At month's end, the compounded amount is swept to your Matured Wallet. Track live progress on your dashboard.</p>`
-                  : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract runs for <strong>${requestedMonths} months</strong> — that is <strong>${projection.totalCycles} total cycles</strong> of ${plan.duration} hours each. At each month boundary, your compounded profit is credited to your Matured Wallet and the principal resets for the next month. Final payout lands in your Matured Wallet at the end of month ${requestedMonths}. Track live progress on your dashboard.</p>`
-              }
-            </div>
-
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="https://www.bithashcapital.live/dashboard" class="email-cta" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Contract on Dashboard</a>
-            </div>
-
-            <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedStartDate}</p>
-          </div>
-
-          <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-            <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-            <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-            <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-              <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
-              <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-            </p>
-          </div>
-        </div>
-        </body>
-        </html>
-      `;
+      const emailHtml = buildInvestmentConfirmationEmail({
+        user,
+        plan,
+        transaction,
+        projection,
+        requestedMonths,
+        isSingleCycle: requestedMonths === 0,
+        firstCycleStartDate,
+        totalCycles,
+        btcPrice,
+      });
 
       await infoTransporter.sendMail({
         from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
         to: user.email,
-        subject: `✅ Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month)` : ''} - ₿itHash Capital`,
-        html: emailHtml
+        subject: `✅ Mining Contract Activated${requestedMonths > 0 ? ` (${requestedMonths}-Month)` : ''} — ₿itHash Capital`,
+        html: emailHtml,
       });
 
       console.log(`📧 Investment confirmation email sent to ${user.email}`);
@@ -21609,10 +21458,640 @@ app.post('/api/investments', protect, [
 });
 
 
+// ============================================================================
+// EMAIL RENDERING ENGINE — Premium, Mobile-Safe, Inline-Styled
+// ============================================================================
+//
+// Design philosophy (battle-tested against Gmail iOS/Android, Apple Mail,
+// Outlook iOS/Android, Yahoo, ProtonMail):
+//
+//   1. NO reliance on <head><style>. Gmail strips it. All critical rules
+//      live in inline `style=""` attributes.
+//   2. Every data table uses `table-layout: fixed` + `word-break: break-word`
+//      so long BTC hashes / addresses never push the viewport wider than
+//      the screen (root cause of mobile truncation).
+//   3. Label/value rows use a two-column fixed table: 46% label / 54% value.
+//      Values right-align and wrap — data reads in a straight horizontal
+//      line on any device.
+//   4. Hero cards use layered gradients + inner glass panel + soft shadows
+//      to feel premium. No flat color blocks.
+//   5. MSO/Outlook conditional wrapper is included for Windows desktop.
+//
+// These helpers are intentionally pure functions of their inputs so they can
+// be unit-tested and previewed in a browser without spinning up the server.
+// ============================================================================
+
+const EMAIL_BRAND = Object.freeze({
+  ink:          '#0B0E11',
+  inkSoft:      '#11151C',
+  inkLift:      '#1A1F2B',
+  gold:         '#F7A600',
+  goldSoft:     '#FFC94D',
+  goldDeep:     '#B8860B',
+  green:        '#10B981',
+  greenDeep:    '#065F46',
+  greenSoft:    '#ECFDF5',
+  greenBorder:  '#A7F3D0',
+  amberSoft:    '#FEF3C7',
+  amberDeep:    '#92400E',
+  amberText:    '#78350F',
+  red:          '#EF4444',
+  text:         '#0F172A',
+  textMuted:    '#64748B',
+  textFaint:    '#94A3B8',
+  surface:      '#F8FAFC',
+  surfaceAlt:   '#F1F5F9',
+  border:       '#E2E8F0',
+  borderSoft:   '#EEF1F5',
+  pageBg:       '#EEF1F5',
+  white:        '#FFFFFF',
+});
+
+const EMAIL_LOGO_URL =
+  'https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png';
+
+const EMAIL_FONT_STACK =
+  "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
+
+// ---- Number formatting helpers (single source of truth) -------------------
+function fmtUSD(n, decimals = 2) {
+  const v = Number(n) || 0;
+  return v.toLocaleString('en-US', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+function fmtBTC(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString('en-US', {
+    minimumFractionDigits: 8,
+    maximumFractionDigits: 8,
+  });
+}
+function fmtDateLong(d) {
+  return new Date(d).toLocaleString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  });
+}
+
+// ---- Escape user/plan-controlled strings -----------------------------------
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ---- Reusable row renderer -------------------------------------------------
+// Renders a two-column label/value row. On any width, label sits on the left
+// and value on the right (stacked vertically inside the value cell when
+// needed). `valueSecondary` is a smaller muted line beneath the value.
+function renderSummaryRows(rows) {
+  return rows.map((r, i) => {
+    const valueColor = r.danger
+      ? `color:${EMAIL_BRAND.red};`
+      : r.green
+        ? `color:${EMAIL_BRAND.green};`
+        : r.gold
+          ? `color:${EMAIL_BRAND.gold};`
+          : `color:${EMAIL_BRAND.text};`;
+
+    const valueWeight = r.bold ? 'font-weight:800;' : 'font-weight:600;';
+    const valueSize = r.small ? 'font-size:11.5px;font-weight:500;' : 'font-size:13.5px;';
+
+    const subColor = r.danger
+      ? EMAIL_BRAND.red
+      : r.green
+        ? EMAIL_BRAND.greenDeep
+        : EMAIL_BRAND.textMuted;
+
+    return `
+      <tr${i > 0 ? ` style="border-top:1px solid ${EMAIL_BRAND.border};"` : ''}>
+        <td style="padding:11px 10px 11px 0;vertical-align:top;font-size:13px;line-height:1.45;color:${EMAIL_BRAND.textMuted};font-weight:500;width:46%;word-break:break-word;overflow-wrap:anywhere;">
+          ${esc(r.label)}
+        </td>
+        <td style="padding:11px 0 11px 10px;vertical-align:top;text-align:right;width:54%;word-break:break-word;overflow-wrap:anywhere;${valueColor}${valueWeight}${valueSize}line-height:1.45;">
+          ${r.value}
+          ${r.sub ? `<div style="font-size:11.5px;font-weight:500;color:${subColor};margin-top:3px;line-height:1.4;">${r.sub}</div>` : ''}
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+// ---- Reusable card wrapper -------------------------------------------------
+function renderCard(title, innerHtml) {
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;max-width:100%;border-collapse:collapse;margin:18px 0;">
+      <tr>
+        <td style="padding:0;">
+          <div style="background:${EMAIL_BRAND.surface};border:1px solid ${EMAIL_BRAND.border};border-radius:14px;padding:20px;box-sizing:border-box;">
+            ${title ? `<h3 style="margin:0 0 14px 0;padding-bottom:12px;border-bottom:1px solid ${EMAIL_BRAND.border};font-size:15px;font-weight:800;color:${EMAIL_BRAND.text};letter-spacing:0.2px;">${title}</h3>` : ''}
+            ${innerHtml}
+          </div>
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+// ---- Premium hero card (the "Total Mining Return" showpiece) ---------------
+// Layered design: dark gradient base + glass inner panel + gold hero number
+// + detail grid. This is the message-carrying card, so it gets the most
+// visual weight.
+function renderPremiumReturnHero({
+  eyebrow,
+  heroBtc,
+  heroUsd,
+  rows,
+  footnote,
+  accent = 'gold', // 'gold' | 'green'
+}) {
+  const accentColor = accent === 'green' ? EMAIL_BRAND.green : EMAIL_BRAND.gold;
+  const accentSoft  = accent === 'green' ? '#A7F3D0' : EMAIL_BRAND.goldSoft;
+
+  const detailRows = rows.map((r, i) => `
+    <tr>
+      <td style="padding:14px 16px;${i < rows.length - 1 ? 'border-bottom:1px solid rgba(255,255,255,0.08);' : ''}">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
+          <tr>
+            <td style="font-size:12.5px;color:#B7BDC6;font-weight:600;text-align:left;padding:0;word-break:break-word;overflow-wrap:anywhere;">
+              ${esc(r.label)}
+            </td>
+            <td style="font-size:14px;font-weight:800;text-align:right;padding:0;word-break:break-word;overflow-wrap:anywhere;color:${r.color || accentSoft};">
+              ${r.value}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  `).join('');
+
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;margin:24px 0;">
+      <tr>
+        <td style="padding:0;">
+          <div style="background:linear-gradient(135deg,${EMAIL_BRAND.ink} 0%,${EMAIL_BRAND.inkLift} 55%,${EMAIL_BRAND.inkSoft} 100%);border-radius:18px;padding:28px 22px;text-align:center;box-shadow:0 14px 36px rgba(11,14,17,0.30);border:1px solid #1E2329;box-sizing:border-box;">
+            <p style="margin:0 0 8px 0;font-size:11px;letter-spacing:2.4px;text-transform:uppercase;color:#B7BDC6;font-weight:800;">
+              ${esc(eyebrow)}
+            </p>
+
+            <p style="margin:6px 0 4px 0;font-size:34px;line-height:1.1;font-weight:800;color:${accentSoft};letter-spacing:-0.6px;word-break:break-word;overflow-wrap:anywhere;">
+              ${heroBtc}
+            </p>
+
+            <p style="margin:0 0 20px 0;font-size:15px;color:#E5E7EB;font-weight:600;">
+              ${heroUsd}
+            </p>
+
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;">
+              ${detailRows}
+            </table>
+
+            ${footnote ? `
+              <p style="margin:16px 0 0 0;font-size:11px;color:#8B93A1;letter-spacing:0.4px;line-height:1.5;">
+                ${footnote}
+              </p>
+            ` : ''}
+          </div>
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+// ---- HTML document skeleton (mobile-first, inline-styled) -----------------
+function renderEmailDocument({ title, preheader, innerHtml }) {
+  return `
+<!DOCTYPE html>
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="light only">
+  <meta name="supported-color-schemes" content="light only">
+  <title>${esc(title)}</title>
+  <!--[if mso]>
+  <xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml>
+  <![endif]-->
+</head>
+<body style="margin:0;padding:0;background:${EMAIL_BRAND.pageBg};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;font-family:${EMAIL_FONT_STACK};">
+
+  <div style="display:none;font-size:1px;color:${EMAIL_BRAND.pageBg};line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+    ${esc(preheader)}
+  </div>
+
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;background:${EMAIL_BRAND.pageBg};border-collapse:collapse;">
+    <tr>
+      <td align="center" style="padding:20px 12px;">
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;background:${EMAIL_BRAND.white};border-radius:20px;overflow:hidden;border-collapse:collapse;box-shadow:0 10px 40px rgba(11,14,17,0.08);">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,${EMAIL_BRAND.ink} 0%,${EMAIL_BRAND.inkSoft} 100%);padding:32px 20px 26px 20px;text-align:center;">
+              <img src="${EMAIL_LOGO_URL}" alt="₿itHash" width="58" height="58" style="display:block;margin:0 auto 12px auto;border-radius:14px;">
+              <h1 style="margin:0;color:${EMAIL_BRAND.white};font-size:26px;font-weight:800;letter-spacing:-0.4px;">₿itHash</h1>
+              <p style="margin:8px 0 0 0;color:#B7BDC6;font-size:12.5px;font-style:italic;font-weight:600;letter-spacing:0.3px;">
+                Where Your Financial Goals Become Reality
+              </p>
+            </td>
+          </tr>
+
+          ${innerHtml}
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:${EMAIL_BRAND.ink};padding:22px 20px;text-align:center;">
+              <p style="margin:0 0 6px 0;color:#6C7480;font-size:11.5px;">
+                &copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.
+              </p>
+              <p style="margin:0 0 6px 0;color:#6C7480;font-size:11.5px;">
+                800 Plant St, Wilmington, DE 19801, United States
+              </p>
+              <p style="margin:0;color:#6C7480;font-size:11.5px;">
+                <a href="mailto:support@bithashcapital.live" style="color:${EMAIL_BRAND.gold};text-decoration:none;font-weight:600;">support@bithashcapital.live</a>
+                <span style="color:#2A2F38;"> &nbsp;|&nbsp; </span>
+                <a href="https://www.bithashcapital.live" style="color:${EMAIL_BRAND.gold};text-decoration:none;font-weight:600;">www.bithashcapital.live</a>
+              </p>
+            </td>
+          </tr>
+
+        </table>
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+  `.trim();
+}
+
+// ---- CTA button ------------------------------------------------------------
+function renderCta({ href, label, color }) {
+  const bg = color || EMAIL_BRAND.gold;
+  const fg = color === EMAIL_BRAND.green ? EMAIL_BRAND.white : '#000000';
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;">
+      <tr>
+        <td align="center" style="padding:12px 0 8px 0;">
+          <a href="${href}" style="display:inline-block;background:${bg};color:${fg};padding:14px 36px;text-decoration:none;border-radius:999px;font-weight:800;font-size:15px;letter-spacing:0.3px;box-shadow:0 6px 18px rgba(247,166,0,0.35);">
+            ${esc(label)}
+          </a>
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+// ---- Next steps panel ------------------------------------------------------
+function renderNextStepsPanel(text) {
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;margin:20px 0;">
+      <tr>
+        <td style="padding:0;">
+          <div style="background:${EMAIL_BRAND.amberSoft};border-left:4px solid ${EMAIL_BRAND.gold};border-radius:10px;padding:16px 18px;box-sizing:border-box;">
+            <p style="margin:0 0 8px 0;color:${EMAIL_BRAND.amberDeep};font-size:12px;font-weight:800;letter-spacing:0.6px;text-transform:uppercase;">
+              Next Steps
+            </p>
+            <p style="margin:0;color:${EMAIL_BRAND.amberText};font-size:13.5px;line-height:1.65;">
+              ${text}
+            </p>
+          </div>
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+// ---- Status pill -----------------------------------------------------------
+function renderStatusPill({ label, tone = 'green' }) {
+  const colors = tone === 'green'
+    ? { bg: EMAIL_BRAND.greenSoft, border: EMAIL_BRAND.greenBorder, text: EMAIL_BRAND.greenDeep, dot: EMAIL_BRAND.green }
+    : { bg: EMAIL_BRAND.amberSoft, border: '#FCD34D', text: EMAIL_BRAND.amberDeep, dot: EMAIL_BRAND.gold };
+
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;">
+      <tr>
+        <td align="center" style="padding:0 0 18px 0;">
+          <div style="display:inline-block;background:${colors.bg};border:1px solid ${colors.border};border-radius:999px;padding:8px 18px;">
+            <span style="font-size:12.5px;font-weight:800;color:${colors.text};letter-spacing:0.6px;text-transform:uppercase;">
+              <span style="color:${colors.dot};">●</span> ${esc(label)}
+            </span>
+          </div>
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+// ============================================================================
+// BUILD: Investment Confirmation Email
+// ============================================================================
+function buildInvestmentConfirmationEmail({
+  user,
+  plan,
+  transaction,
+  projection,
+  requestedMonths,
+  isSingleCycle,
+  firstCycleStartDate,
+  totalCycles,
+  btcPrice,
+}) {
+  const isLongTerm = !isSingleCycle;
+
+  // ---- Formatted figures (from the single source of truth) ----
+  const F = {
+    grossUSD: fmtUSD(projection.grossPrincipalUSD),
+    grossBTC: fmtBTC(projection.grossPrincipalBTC),
+    feeUSD: fmtUSD(projection.totalFeesUSD),
+    feeBTC: fmtBTC(projection.totalFeesBTC),
+    netPrincipalUSD: fmtUSD(projection.netPrincipalUSD),
+    netPrincipalBTC: fmtBTC(projection.netPrincipalBTC),
+    totalReturnUSD: fmtUSD(projection.totalReturnUSD),
+    totalReturnBTC: fmtBTC(projection.totalReturnBTC),
+    totalProfitUSD: fmtUSD(projection.totalProfitUSD),
+    totalProfitBTC: fmtBTC(projection.totalProfitBTC),
+    roiPercent: Number(projection.roiPercent).toFixed(2),
+  };
+
+  const formattedStartDate = fmtDateLong(firstCycleStartDate);
+  const finalEndDate = new Date(
+    firstCycleStartDate.getTime() + totalCycles * plan.duration * 60 * 60 * 1000
+  );
+  const formattedFinalEndDate = fmtDateLong(finalEndDate);
+
+  // ---- Contract summary rows ----
+  const summaryRows = [
+    { label: 'Gross Investment', value: `${F.grossBTC} BTC`, sub: `≈ $${F.grossUSD} USD` },
+    { label: `Fees Charged (${projection.cycleFeePercent}%)`, value: `- ${F.feeBTC} BTC`, sub: `≈ $${F.feeUSD} USD`, danger: true },
+    { label: 'Initial Net Principal', value: `${F.netPrincipalBTC} BTC`, sub: `≈ $${F.netPrincipalUSD} USD`, bold: true },
+    { label: 'Assigned Hashpower', value: `${Number(projection.hashpower).toLocaleString()} TH/s` },
+    {
+      label: 'Contract Duration',
+      value: isSingleCycle
+        ? `Single Cycle (${plan.duration}h)`
+        : `${requestedMonths} Month(s) — ${projection.cyclesPerMonth} cycles/month`,
+    },
+    { label: 'Cycle Start', value: formattedStartDate },
+    { label: 'Final Payout Date', value: formattedFinalEndDate, gold: true },
+    { label: 'Contract ID', value: esc(transaction.reference), small: true },
+  ];
+
+  // ---- Premium hero card ----
+  const heroCard = renderPremiumReturnHero({
+    eyebrow: 'Total Mining Return at Contract End',
+    heroBtc: `+${F.totalReturnBTC} BTC`,
+    heroUsd: `≈ $${F.totalReturnUSD} USD`,
+    rows: [
+      { label: 'Net Profit', value: `+$${F.totalProfitUSD} USD`, color: EMAIL_BRAND.greenSoft },
+      { label: 'Return on Investment (ROI)', value: `${F.roiPercent}%`, color: EMAIL_BRAND.goldSoft },
+    ],
+    footnote: `Assigned Hashpower: <strong style="color:#E5E7EB;">${Number(projection.hashpower).toLocaleString()} TH/s</strong>`,
+    accent: 'gold',
+  });
+
+  // ---- Monthly breakdown (long-term only) ----
+  let monthlyBreakdownHtml = '';
+  if (isLongTerm && projection.monthlyBreakdown.length > 0) {
+    const rows = projection.monthlyBreakdown.map((m) => `
+      <tr>
+        <td colspan="2" style="padding:14px 0 6px 0;border-top:1px solid ${EMAIL_BRAND.border};">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
+            <tr>
+              <td style="font-size:13px;font-weight:800;color:${EMAIL_BRAND.text};padding:0;">Month ${m.month}</td>
+              <td style="font-size:13px;font-weight:800;color:${EMAIL_BRAND.green};text-align:right;padding:0;">+$${fmtUSD(m.profitUSD)}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:0 0 6px 0;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
+            <tr>
+              <td style="font-size:12px;color:${EMAIL_BRAND.textMuted};padding:0;">Starting Capital</td>
+              <td style="font-size:12px;color:${EMAIL_BRAND.text};font-weight:600;text-align:right;padding:0;">$${fmtUSD(m.startingPrincipalUSD)}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:0 0 10px 0;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;table-layout:fixed;border-collapse:collapse;">
+            <tr>
+              <td style="font-size:12px;color:${EMAIL_BRAND.textMuted};padding:0;">Payout at Month End</td>
+              <td style="font-size:12px;color:${EMAIL_BRAND.text};font-weight:700;text-align:right;padding:0;">$${fmtUSD(m.endingValueUSD)}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    `).join('');
+
+    monthlyBreakdownHtml = renderCard(
+      'Monthly Payout Schedule',
+      `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;table-layout:fixed;">${rows}</table>`
+    );
+  }
+
+  // ---- Next steps copy ----
+  let nextStepsText;
+  if (isSingleCycle) {
+    nextStepsText = `Your contract is a <strong>single ${plan.duration}-hour cycle</strong>. When the cycle closes, the full return of <strong>${F.totalReturnBTC} BTC (≈ $${F.totalReturnUSD} USD)</strong> will be credited directly to your Matured Wallet. Track live progress on your dashboard.`;
+  } else if (requestedMonths === 1) {
+    nextStepsText = `Your contract runs for <strong>1 month</strong> — that is <strong>${projection.cyclesPerMonth} consecutive ${plan.duration}-hour cycles</strong>. Returns compound into the next cycle automatically. At month's end, the compounded amount is swept to your Matured Wallet. Track live progress on your dashboard.`;
+  } else {
+    nextStepsText = `Your contract runs for <strong>${requestedMonths} months</strong> — that is <strong>${projection.totalCycles} total cycles</strong> of ${plan.duration} hours each. At each month boundary, your compounded profit is credited to your Matured Wallet and the principal resets for the next month. Final payout lands in your Matured Wallet at the end of month ${requestedMonths}. Track live progress on your dashboard.`;
+  }
+
+  // ---- Assemble body ----
+  const bodyInner = `
+    <tr>
+      <td style="padding:26px 20px 8px 20px;">
+
+        ${renderStatusPill({ label: 'Contract Activated', tone: 'green' })}
+        <p style="margin:0 0 8px 0;color:${EMAIL_BRAND.text};font-size:14.5px;line-height:1.6;">
+          Dear <strong>${esc(user.firstName)}</strong>,
+        </p>
+        <p style="margin:0 0 18px 0;color:${EMAIL_BRAND.text};font-size:14.5px;line-height:1.6;">
+          Your mining contract in the <strong>${esc(plan.name)}</strong> plan has been successfully activated. Below is the full contract breakdown.
+        </p>
+
+        ${renderCard('Contract Summary', `
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;table-layout:fixed;word-break:break-word;">
+            ${renderSummaryRows(summaryRows)}
+          </table>
+        `)}
+
+        ${heroCard}
+
+        ${monthlyBreakdownHtml}
+
+        ${renderNextStepsPanel(nextStepsText)}
+
+        ${renderCta({
+          href: 'https://www.bithashcapital.live/dashboard',
+          label: 'View Contract on Dashboard',
+          color: EMAIL_BRAND.gold,
+        })}
+
+        <p style="margin:18px 0 0 0;color:${EMAIL_BRAND.textFaint};font-size:11.5px;text-align:center;">
+          Email sent: ${formattedStartDate}
+        </p>
+
+      </td>
+    </tr>
+  `;
+
+  return renderEmailDocument({
+    title: 'Mining Contract Activated — ₿itHash Capital',
+    preheader: `Your ${isSingleCycle ? 'single-cycle' : `${requestedMonths}-month`} ${plan.name} contract is live. Total return: ${F.totalReturnBTC} BTC (≈ $${F.totalReturnUSD} USD).`,
+    innerHtml: bodyInner,
+  });
+}
+
+// ============================================================================
+// BUILD: Maturity Email
+// ============================================================================
+function buildMaturityEmail({
+  user,
+  plan,
+  investment,
+  cycleFeePercent,
+  now,
+  finalCycle,
+}) {
+  const {
+    netPrincipalUSD,
+    netPrincipalBTC,
+    cycleFeeUSD,
+    cycleFeeBTC,
+    cycleReturnUSD,
+    cycleReturnBTC,
+    cycleNetReturnUSD,
+    cycleNetReturnBTC,
+  } = finalCycle;
+
+  const isLongTerm = investment.autoCompoundMonths && investment.totalCycles > 1;
+
+  const F = {
+    principalUSD: fmtUSD(netPrincipalUSD),
+    principalBTC: fmtBTC(netPrincipalBTC),
+    feeUSD: fmtUSD(cycleFeeUSD),
+    feeBTC: fmtBTC(cycleFeeBTC),
+    grossReturnUSD: fmtUSD(cycleReturnUSD),
+    grossReturnBTC: fmtBTC(cycleReturnBTC),
+    netReturnUSD: fmtUSD(cycleNetReturnUSD),
+    netReturnBTC: fmtBTC(cycleNetReturnBTC),
+  };
+
+  const formattedCompletionDate = now.toLocaleString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short',
+  });
+
+  const newMaturedBTC = user.balances.matured?.get('btc') || 0;
+  const newMaturedUSD = user.balances.matured?.get('usd') || 0;
+  const formattedNewMaturedBTC = fmtBTC(newMaturedBTC);
+  const formattedNewMaturedUSD = fmtUSD(newMaturedUSD);
+
+  // ---- Detail rows ----
+  const maturityRows = [
+    { label: 'Contract Name', value: esc(plan.name) },
+    { label: 'Final Cycle Net Principal', value: `${F.principalBTC} BTC`, sub: `≈ $${F.principalUSD} USD` },
+    { label: `Final Cycle Fee (${cycleFeePercent}%)`, value: `- ${F.feeBTC} BTC`, sub: `≈ $${F.feeUSD} USD`, danger: true },
+    { label: 'Final Gross Return', value: `${F.grossReturnBTC} BTC`, sub: `≈ $${F.grossReturnUSD} USD`, green: true },
+    { label: 'Final Net Return', value: `+ ${F.netReturnBTC} BTC`, sub: `≈ $${F.netReturnUSD} USD`, green: true, bold: true },
+  ];
+
+  if (isLongTerm) {
+    maturityRows.push(
+      { label: 'Contract Duration', value: `${investment.autoCompoundMonths} month(s)`, sub: `${investment.cyclesPerMonth} cycles/month` },
+      { label: 'Final Month / Cycle', value: `Month ${investment.currentMonth} of ${investment.autoCompoundMonths}`, sub: `Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}` },
+      { label: 'Cumulative Gross Return', value: `${fmtBTC(investment.cumulativeReturnBTC)} BTC`, sub: `≈ $${fmtUSD(investment.cumulativeReturnUSD)} USD`, green: true },
+    );
+  }
+
+  maturityRows.push(
+    { label: 'Completion Date', value: formattedCompletionDate },
+    { label: 'New Matured Wallet Balance', value: `${formattedNewMaturedBTC} BTC`, sub: `≈ $${formattedNewMaturedUSD} USD`, bold: true },
+  );
+
+  // ---- Premium hero (green accent for maturity) ----
+  const heroCard = renderPremiumReturnHero({
+    eyebrow: 'Payout Credited to Matured Wallet',
+    heroBtc: `+${F.grossReturnBTC} BTC`,
+    heroUsd: `≈ $${F.grossReturnUSD} USD`,
+    rows: [
+      { label: 'Final Net Return', value: `+${F.netReturnBTC} BTC`, color: EMAIL_BRAND.greenSoft },
+      { label: 'New Matured Balance', value: `${formattedNewMaturedBTC} BTC`, color: EMAIL_BRAND.goldSoft },
+    ],
+    footnote: `Assigned Hashpower: <strong style="color:#E5E7EB;">${Number(investment.currentHashrate || 0).toLocaleString()} TH/s</strong>`,
+    accent: 'green',
+  });
+
+  const bodyInner = `
+    <tr>
+      <td style="padding:26px 20px 8px 20px;">
+
+        ${renderStatusPill({ label: 'Contract Matured', tone: 'green' })}
+        <p style="margin:0 0 8px 0;color:${EMAIL_BRAND.text};font-size:14.5px;line-height:1.6;">
+          Dear <strong>${esc(user.firstName)}</strong>,
+        </p>
+        <p style="margin:0 0 18px 0;color:${EMAIL_BRAND.text};font-size:14.5px;line-height:1.6;">
+          Congratulations! Your <strong>${esc(plan.name)}</strong> mining contract has completed. Your returns have been credited to your <strong style="color:${EMAIL_BRAND.green};">Matured Wallet</strong>.
+        </p>
+
+        ${heroCard}
+
+        ${renderCard('Contract Completion Details', `
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;border-collapse:collapse;table-layout:fixed;word-break:break-word;">
+            ${renderSummaryRows(maturityRows)}
+          </table>
+        `)}
+
+        ${renderNextStepsPanel(
+          `Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.`
+        )}
+
+        ${renderCta({
+          href: 'https://www.bithashcapital.live/dashboard',
+          label: 'Reinvest Now',
+          color: EMAIL_BRAND.green,
+        })}
+
+        <p style="margin:18px 0 0 0;color:${EMAIL_BRAND.textFaint};font-size:11.5px;text-align:center;">
+          Email sent: ${formattedCompletionDate}
+        </p>
+
+      </td>
+    </tr>
+  `;
+
+  return renderEmailDocument({
+    title: 'Contract Matured — ₿itHash Capital',
+    preheader: `Your ${plan.name} contract has matured. ${F.grossReturnBTC} BTC credited to your Matured Wallet.`,
+    innerHtml: bodyInner,
+  });
+}
+
+
 // =============================================
 // REAL-TIME BITCOIN PRICE WITH MULTIPLE API FALLBACKS
 // ALL FALLBACKS FETCH FROM ONLINE APIs - NO HARDCODED VALUES
-// (Unchanged — pure data fetcher.)
 // =============================================
 async function getRealTimeBitcoinPrice() {
   const errors = [];
@@ -21859,131 +22338,121 @@ async function getRealTimeBitcoinPrice() {
 //   - ROI is measured against the GROSS principal (what the user paid).
 // =============================================
 function calculateContractProjection(principalUSD, plan, months, currentBtcPrice) {
-    const planPercentageDecimal = plan.percentage / 100;
-    const durationHours = plan.duration;
-    const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
-    const isSingleCycle = months === 0;
-    const totalMonths = months === 0 ? 1 : months; // Treat 0 as a single cycle
-    const feePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
-        ? plan.cycleFeePercent
-        : CYCLE_FEE_PERCENT;
-    const feeDecimal = feePercent / 100;
+  const planPercentageDecimal = plan.percentage / 100;
+  const durationHours = plan.duration;
+  const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
+  const isSingleCycle = months === 0;
+  const totalMonths = months === 0 ? 1 : months;
+  const feePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+    ? plan.cycleFeePercent
+    : CYCLE_FEE_PERCENT;
+  const feeDecimal = feePercent / 100;
 
-    // Gross principal is the user's deposit.
-    const grossPrincipalUSD = principalUSD;
-    const grossPrincipalBTC = principalUSD / currentBtcPrice;
+  const grossPrincipalUSD = principalUSD;
+  const grossPrincipalBTC = principalUSD / currentBtcPrice;
 
-    // The net principal that actually mines in cycle 1.
-    // This is also the reset value for all subsequent months.
-    const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
-    const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
-    const netPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
-    const netPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
+  const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
+  const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
+  const netPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
+  const netPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
 
-    // Hashpower is derived from the net principal.
-    const initialHashpower = calculateHashpower(
-        netPrincipalUSD,
-        plan.percentage,
-        durationHours,
-        currentBtcPrice
-    );
+  const initialHashpower = calculateHashpower(
+    netPrincipalUSD,
+    plan.percentage,
+    durationHours,
+    currentBtcPrice
+  );
 
-    if (isSingleCycle) {
-        // A single cycle is its own complete contract.
-        const totalFeesUSD = firstCycleFeeUSD;
-        const totalFeesBTC = firstCycleFeeBTC;
-        const totalReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
-        const totalReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
-        const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
-        const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
-        const roiPercent = (totalProfitUSD / grossPrincipalUSD) * 100;
-
-        return {
-            grossPrincipalUSD,
-            grossPrincipalBTC,
-            netPrincipalUSD,
-            netPrincipalBTC,
-            totalFeesUSD,
-            totalFeesBTC,
-            totalReturnUSD,
-            totalReturnBTC,
-            totalProfitUSD,
-            totalProfitBTC,
-            hashpower: initialHashpower,
-            roiPercent,
-            totalMonths: 1,
-            cyclesPerMonth,
-            totalCycles: 1,
-            cycleFeePercent: feePercent,
-            monthlyBreakdown: [],
-        };
-    }
-
-    // --- Multi-Month Contract Logic ---
-    let totalFeesUSD = 0;
-    let totalReturnUSD = 0;
-    const monthlyBreakdown = [];
-
-    // Month 1 starts at the gross principal.
-    let monthStartingPrincipalUSD = grossPrincipalUSD;
-
-    for (let month = 1; month <= totalMonths; month++) {
-        let monthIncomingUSD = monthStartingPrincipalUSD;
-        let monthFeesUSD = 0;
-
-        for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
-            // Fee is charged on the incoming balance of EVERY cycle.
-            const cycleFeeUSD = monthIncomingUSD * feeDecimal;
-            monthFeesUSD += cycleFeeUSD;
-
-            const cycleNetUSD = monthIncomingUSD - cycleFeeUSD;
-            const cycleReturnUSD = cycleNetUSD * (1 + planPercentageDecimal);
-
-            // The output becomes the input for the next cycle.
-            monthIncomingUSD = cycleReturnUSD;
-        }
-
-        const monthReturnUSD = monthIncomingUSD; // The final value at the end of the month
-
-        totalFeesUSD += monthFeesUSD;
-        totalReturnUSD += monthReturnUSD;
-
-        monthlyBreakdown.push({
-            month,
-            startingPrincipalUSD: monthStartingPrincipalUSD,
-            endingValueUSD: monthReturnUSD,
-            profitUSD: monthReturnUSD - monthStartingPrincipalUSD,
-            cyclesInMonth: cyclesPerMonth,
-            feesPaidUSD: monthFeesUSD,
-        });
-
-        // CRITICAL: Month boundary reset.
-        // For month 2 onwards, the principal is reset to the original net principal.
-        monthStartingPrincipalUSD = netPrincipalUSD;
-    }
-
-    const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
+  if (isSingleCycle) {
+    const totalFeesUSD = firstCycleFeeUSD;
+    const totalFeesBTC = firstCycleFeeBTC;
+    const totalReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
+    const totalReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
+    const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
+    const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
     const roiPercent = (totalProfitUSD / grossPrincipalUSD) * 100;
 
     return {
-        grossPrincipalUSD,
-        grossPrincipalBTC,
-        netPrincipalUSD,
-        netPrincipalBTC,
-        totalFeesUSD,
-        totalFeesBTC: totalFeesUSD / currentBtcPrice, // Approximation for display
-        totalReturnUSD,
-        totalReturnBTC: totalReturnUSD / currentBtcPrice, // Approximation for display
-        totalProfitUSD,
-        totalProfitBTC: totalProfitUSD / currentBtcPrice, // Approximation for display
-        hashpower: initialHashpower,
-        roiPercent,
-        totalMonths,
-        cyclesPerMonth,
-        totalCycles: totalMonths * cyclesPerMonth,
-        cycleFeePercent: feePercent,
-        monthlyBreakdown,
+      grossPrincipalUSD,
+      grossPrincipalBTC,
+      netPrincipalUSD,
+      netPrincipalBTC,
+      totalFeesUSD,
+      totalFeesBTC,
+      totalReturnUSD,
+      totalReturnBTC,
+      totalProfitUSD,
+      totalProfitBTC,
+      hashpower: initialHashpower,
+      roiPercent,
+      totalMonths: 1,
+      cyclesPerMonth,
+      totalCycles: 1,
+      cycleFeePercent: feePercent,
+      monthlyBreakdown: [],
     };
+  }
+
+  // --- Multi-Month Contract Logic ---
+  let totalFeesUSD = 0;
+  let totalReturnUSD = 0;
+  const monthlyBreakdown = [];
+
+  let monthStartingPrincipalUSD = grossPrincipalUSD;
+
+  for (let month = 1; month <= totalMonths; month++) {
+    let monthIncomingUSD = monthStartingPrincipalUSD;
+    let monthFeesUSD = 0;
+
+    for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
+      const cycleFeeUSD = monthIncomingUSD * feeDecimal;
+      monthFeesUSD += cycleFeeUSD;
+
+      const cycleNetUSD = monthIncomingUSD - cycleFeeUSD;
+      const cycleReturnUSD = cycleNetUSD * (1 + planPercentageDecimal);
+
+      monthIncomingUSD = cycleReturnUSD;
+    }
+
+    const monthReturnUSD = monthIncomingUSD;
+
+    totalFeesUSD += monthFeesUSD;
+    totalReturnUSD += monthReturnUSD;
+
+    monthlyBreakdown.push({
+      month,
+      startingPrincipalUSD: monthStartingPrincipalUSD,
+      endingValueUSD: monthReturnUSD,
+      profitUSD: monthReturnUSD - monthStartingPrincipalUSD,
+      cyclesInMonth: cyclesPerMonth,
+      feesPaidUSD: monthFeesUSD,
+    });
+
+    monthStartingPrincipalUSD = netPrincipalUSD;
+  }
+
+  const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
+  const roiPercent = (totalProfitUSD / grossPrincipalUSD) * 100;
+
+  return {
+    grossPrincipalUSD,
+    grossPrincipalBTC,
+    netPrincipalUSD,
+    netPrincipalBTC,
+    totalFeesUSD,
+    totalFeesBTC: totalFeesUSD / currentBtcPrice,
+    totalReturnUSD,
+    totalReturnBTC: totalReturnUSD / currentBtcPrice,
+    totalProfitUSD,
+    totalProfitBTC: totalProfitUSD / currentBtcPrice,
+    hashpower: initialHashpower,
+    roiPercent,
+    totalMonths,
+    cyclesPerMonth,
+    totalCycles: totalMonths * cyclesPerMonth,
+    cycleFeePercent: feePercent,
+    monthlyBreakdown,
+  };
 }
 
 
@@ -22005,7 +22474,6 @@ const completeMaturedInvestmentsCron = async () => {
   try {
     const now = new Date();
 
-    // Find active investments where the CURRENT CYCLE's endDate has passed
     const maturedInvestments = await Investment.find({
       status: 'active',
       endDate: { $lte: now }
@@ -22031,23 +22499,15 @@ const completeMaturedInvestmentsCron = async () => {
         const userId = investment.user._id;
         const user = await User.findById(userId).session(session);
 
-        if (!user) {
-          throw new Error('User not found');
-        }
+        if (!user) throw new Error('User not found');
 
         const plan = investment.plan;
-        if (!plan) {
-          throw new Error('Plan not found');
-        }
+        if (!plan) throw new Error('Plan not found');
 
-        // =============================================
-        // RESOLVE CYCLE FEE (plan override → global fallback)
-        // =============================================
         const cycleFeePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
           ? plan.cycleFeePercent
           : CYCLE_FEE_PERCENT;
 
-        // Fetch fresh BTC price (internal only)
         let currentBTCPrice;
         try {
           currentBTCPrice = await getRealTimeBitcoinPrice();
@@ -22057,7 +22517,6 @@ const completeMaturedInvestmentsCron = async () => {
           throw new Error('Could not fetch BTC price');
         }
 
-        // ---- Locate the active cycle being closed (by cycleNumber + monthNumber) ----
         const cycleIdx = investment.cycleHistory.findIndex(
           c => c.cycleNumber === investment.currentCycle &&
                c.monthNumber === investment.currentMonth &&
@@ -22070,10 +22529,6 @@ const completeMaturedInvestmentsCron = async () => {
 
         const planReturnDecimal = plan.percentage / 100;
 
-        // ===================================================
-        // APPLY CYCLE FEE TO THE INCOMING BALANCE OF THIS CYCLE
-        // Every cycle pays its own fee, on its own incoming balance.
-        // ===================================================
         const incomingBalanceUSD = currentCycle.incomingBalanceUSD;
         const incomingBalanceBTC = currentCycle.incomingBalanceBTC;
 
@@ -22088,7 +22543,6 @@ const completeMaturedInvestmentsCron = async () => {
         const cycleNetReturnUSD = cycleReturnUSD - netPrincipalUSD;
         const cycleNetReturnBTC = cycleReturnBTC - netPrincipalBTC;
 
-        // Finalize the cycle record
         currentCycle.feeUSD = cycleFeeUSD;
         currentCycle.feeBTC = cycleFeeBTC;
         currentCycle.netPrincipalUSD = netPrincipalUSD;
@@ -22098,7 +22552,6 @@ const completeMaturedInvestmentsCron = async () => {
         currentCycle.btcPriceAtEnd = currentBTCPrice;
         currentCycle.status = 'completed';
 
-        // Accumulate returns
         investment.monthToDateReturnUSD = (investment.monthToDateReturnUSD || 0) + cycleReturnUSD;
         investment.monthToDateReturnBTC = (investment.monthToDateReturnBTC || 0) + cycleReturnBTC;
         investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleReturnUSD;
@@ -22111,9 +22564,6 @@ const completeMaturedInvestmentsCron = async () => {
         console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
         console.log(`   Month-to-date: ${investment.monthToDateReturnBTC.toFixed(8)} BTC ($${investment.monthToDateReturnUSD.toFixed(2)})`);
 
-        // ===================================================
-        // ROUTE THE FEE TO PLATFORM REVENUE (every cycle)
-        // ===================================================
         const feeTxRef = `CYCLE-FEE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
         const [feeTx] = await Transaction.create([{
           user: userId,
@@ -22158,17 +22608,11 @@ const completeMaturedInvestmentsCron = async () => {
           }
         }], { session });
 
-        // ===================================================
-        // DECIDE NEXT STEP: advance, month-reset, or final payout
-        // ===================================================
         const isLastCycleOfMonth = investment.currentCycle >= investment.cyclesPerMonth;
         const isLastMonth = investment.currentMonth >= investment.autoCompoundMonths;
         const contractComplete = isLastCycleOfMonth && isLastMonth;
 
         if (contractComplete) {
-          // ===================================================
-          // FINAL PAYOUT (contract's last month, last cycle)
-          // ===================================================
           console.log(`[CRON] Investment ${investment._id} completing: final cycle of final month`);
 
           investment.status = 'completed';
@@ -22178,7 +22622,6 @@ const completeMaturedInvestmentsCron = async () => {
           investment.actualReturnBTC = cycleNetReturnBTC;
           investment.btcPriceAtCompletion = currentBTCPrice;
 
-          // Credit the return to the user's matured wallet
           if (!user.balances) {
             user.balances = { main: new Map(), active: new Map(), matured: new Map() };
           }
@@ -22190,7 +22633,6 @@ const completeMaturedInvestmentsCron = async () => {
           const currentMaturedUSD = user.balances.matured.get('usd') || 0;
           user.balances.matured.set('usd', currentMaturedUSD + cycleReturnUSD);
 
-          // Remove the net principal from the active wallet (contract is closing)
           const currentActiveBTC = user.balances.active?.get('btc') || 0;
           const newActiveBTC = currentActiveBTC - netPrincipalBTC;
           if (newActiveBTC <= 0.00000001) {
@@ -22284,172 +22726,32 @@ const completeMaturedInvestmentsCron = async () => {
           completedCount++;
 
           // =============================================
-          // SEND MATURITY EMAIL
+          // SEND MATURITY EMAIL (premium, mobile-safe)
           // =============================================
           try {
-            const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
-
-            const formattedPrincipalUSD = netPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedPrincipalBTC = netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedFeeUSD = cycleFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedFeeBTC = cycleFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedGrossReturnUSD = cycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedGrossReturnBTC = cycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedNetReturnUSD = cycleNetReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedNetReturnBTC = cycleNetReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-
-            const formattedCompletionDate = now.toLocaleString('en-US', {
-              year: 'numeric',
-              month: 'long',
-              day: 'numeric',
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit',
-              timeZoneName: 'short'
+            const emailHtml = buildMaturityEmail({
+              user,
+              plan,
+              investment,
+              cycleFeePercent,
+              now,
+              finalCycle: {
+                netPrincipalUSD,
+                netPrincipalBTC,
+                cycleFeeUSD,
+                cycleFeeBTC,
+                cycleReturnUSD,
+                cycleReturnBTC,
+                cycleNetReturnUSD,
+                cycleNetReturnBTC,
+              },
             });
 
-            const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
-            const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
-            const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
-            const isLongTerm = (investment.autoCompoundMonths && investment.totalCycles > 1);
-
-            const compoundSummaryBlock = isLongTerm
-              ? `
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycles/month)</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Final Month / Cycle:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Cumulative Gross Return (All Cycles):</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${investment.cumulativeReturnBTC.toFixed(8)} BTC (≈ $${investment.cumulativeReturnUSD.toLocaleString()})</td>
-                </tr>
-              `
-              : '';
-
-            const mailTransporter = infoTransporter;
-
-            const emailHtml = `
-              <!DOCTYPE html>
-              <html>
-              <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-                <style>
-                  /* Full-width mobile view: cards inside email body must never be cut or truncated */
-                  @media only screen and (max-width: 600px) {
-                    .email-wrapper { width: 100% !important; max-width: 100% !important; margin: 0 !important; border-radius: 0 !important; }
-                    .email-body { padding: 16px !important; }
-                    .email-card { width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; padding: 16px !important; margin: 16px 0 !important; overflow: visible !important; }
-                    .email-card table { width: 100% !important; table-layout: fixed !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
-                    .email-card td, .email-card th { white-space: normal !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
-                    .email-card h1, .email-card h2, .email-card h3 { font-size: 18px !important; line-height: 1.4 !important; }
-                    .email-card p, .email-card span, .email-card div { font-size: 14px !important; line-height: 1.6 !important; }
-                    .email-cta { padding: 12px 24px !important; width: auto !important; max-width: 100% !important; display: block !important; box-sizing: border-box !important; text-align: center !important; }
-                  }
-                </style>
-              </head>
-              <body style="margin: 0; padding: 0; width: 100%; -webkit-text-size-adjust: 100%; background: #FFFFFF;">
-              <div class="email-wrapper" style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF; width: 100%;">
-                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                  <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                  <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                  <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                </div>
-
-                <div class="email-body" style="padding: 30px; background: #FFFFFF;">
-                  <div class="email-card" style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                        <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                      </svg>
-                    </div>
-                    <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">CONTRACT MATURED!</h2>
-                    <p style="color: #065F46; font-size: 13px; margin: 0;">Your mining contract has successfully completed</p>
-                  </div>
-
-                  <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                  <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
-
-                  <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <div>
-                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
-                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
-                      </div>
-                    </div>
-
-                    <table style="width: 100%; border-collapse: collapse;">
-                      <tr>
-                        <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Fee Charged (${cycleFeePercent}%):</strong></td>
-                        <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Gross Return:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Net Return:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
-                      </tr>
-                      ${compoundSummaryBlock}
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
-                      </tr>
-                    </table>
-                  </div>
-
-                  <div class="email-card" style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
-                    <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
-                  </div>
-
-                  <div style="text-align: center; margin: 30px 0;">
-                    <a href="https://www.bithashcapital.live/dashboard" class="email-cta" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
-                  </div>
-
-                  <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
-                </div>
-
-                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
-                    <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-                  </p>
-                </div>
-              </div>
-              </body>
-              </html>
-            `;
-
-            await mailTransporter.sendMail({
+            await infoTransporter.sendMail({
               from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
               to: user.email,
-              subject: `Congratulations! Your Mining Rewards Are Here - ₿itHash Capital`,
-              html: emailHtml
+              subject: `Congratulations! Your Mining Rewards Are Here — ₿itHash Capital`,
+              html: emailHtml,
             });
 
             console.log(`📧 [CRON] Maturity email sent to ${user.email}`);
@@ -22457,7 +22759,6 @@ const completeMaturedInvestmentsCron = async () => {
             console.error(`❌ [CRON] Failed to send maturity email for ${investment._id}:`, emailError);
           }
 
-          // Emit real-time balance update
           const io = global.io;
           if (io) {
             io.to(`user_${userId}`).emit('balance_update', {
@@ -22477,14 +22778,9 @@ const completeMaturedInvestmentsCron = async () => {
           }
 
         } else if (isLastCycleOfMonth) {
-          // ===================================================
-          // MONTH BOUNDARY: SWEEP the month's compounded growth
-          // and RESET principal to the original net starting value.
-          // ===================================================
           const sweptUSD = investment.monthToDateReturnUSD;
           const sweptBTC = investment.monthToDateReturnBTC;
 
-          // Credit the entire month's compounded result to the matured wallet
           if (!user.balances) {
             user.balances = { main: new Map(), active: new Map(), matured: new Map() };
           }
@@ -22496,7 +22792,6 @@ const completeMaturedInvestmentsCron = async () => {
           const currentMaturedUSD = user.balances.matured.get('usd') || 0;
           user.balances.matured.set('usd', currentMaturedUSD + sweptUSD);
 
-          // Remove the swept growth from active, keeping the original net principal
           const currentActiveBTC = user.balances.active?.get('btc') || 0;
           const newActiveBTC = currentActiveBTC - sweptBTC;
           if (newActiveBTC <= 0.00000001) {
@@ -22515,7 +22810,6 @@ const completeMaturedInvestmentsCron = async () => {
 
           await user.save({ session });
 
-          // Record the month sweep
           const sweepRef = `MONTH-SWEEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
           await Transaction.create([{
             user: userId,
@@ -22538,17 +22832,14 @@ const completeMaturedInvestmentsCron = async () => {
             exchangeRateAtTime: currentBTCPrice
           }], { session });
 
-          // Advance to next month, reset cycle counter and month-to-date tracking
           investment.currentMonth += 1;
           investment.currentCycle = 1;
           investment.monthToDateReturnUSD = 0;
           investment.monthToDateReturnBTC = 0;
 
-          // Principal resets to the original net starting value for the new month
           const resetPrincipalUSD = investment.monthStartingPrincipalUSD;
           const resetPrincipalBTC = investment.monthStartingPrincipalBTC;
 
-          // Recalculate hashpower for the new month's first cycle
           const resetHashpower = calculateHashpower(
             resetPrincipalUSD,
             plan.percentage,
@@ -22570,7 +22861,6 @@ const completeMaturedInvestmentsCron = async () => {
           investment.expectedReturn = resetPrincipalUSD * (1 + planReturnDecimal);
           investment.expectedReturnBTC = resetPrincipalBTC * (1 + planReturnDecimal);
 
-          // Push the first cycle of the new month (fee will be applied when it closes)
           investment.cycleHistory.push({
             cycleNumber: 1,
             monthNumber: investment.currentMonth,
@@ -22595,17 +22885,12 @@ const completeMaturedInvestmentsCron = async () => {
           resetCount++;
 
         } else {
-          // ===================================================
-          // ADVANCE TO NEXT CYCLE WITHIN THE SAME MONTH
-          // Cycle return becomes the next cycle's incoming balance.
-          // ===================================================
           investment.currentCycle += 1;
           const newCycleNumber = investment.currentCycle;
 
           const nextIncomingUSD = cycleReturnUSD;
           const nextIncomingBTC = cycleReturnBTC;
 
-          // Recalculate hashpower for the new cycle using fresh BTC price
           const newHashpower = calculateHashpower(
             nextIncomingUSD,
             plan.percentage,
@@ -22627,7 +22912,6 @@ const completeMaturedInvestmentsCron = async () => {
           investment.expectedReturn = nextIncomingUSD * (1 + planReturnDecimal);
           investment.expectedReturnBTC = nextIncomingBTC * (1 + planReturnDecimal);
 
-          // Push the new cycle (its fee will be applied when it closes)
           investment.cycleHistory.push({
             cycleNumber: newCycleNumber,
             monthNumber: investment.currentMonth,
@@ -22686,7 +22970,6 @@ cron.schedule('*/10 * * * * *', async () => {
   console.log(`${'='.repeat(70)}`);
 
   try {
-    // Find matured cycles first to log which users were found
     const now = new Date();
     const maturedInvestments = await Investment.find({
       status: 'active',
@@ -22722,7 +23005,6 @@ cron.schedule('*/10 * * * * *', async () => {
       console.log(`📭 [CRON SCHEDULER] No matured investment cycles found at ${runTime}`);
     }
 
-    // Run the actual cron job
     await completeMaturedInvestmentsCron();
 
     const endTime = new Date().toISOString();
@@ -22740,46 +23022,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
