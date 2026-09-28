@@ -19334,7 +19334,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
   const userAgentHeader = req.headers['user-agent'] || 'Unknown';
@@ -19543,42 +19542,50 @@ app.post('/api/mining/calculator', async (req, res) => {
      * ------------------------------------------------------------------
      * CONTRACT PROJECTION — MONTHLY RESET MODEL
      * ------------------------------------------------------------------
-     * This is the canonical implementation. It is mathematically identical
-     * to the projection used by POST /api/investments and by the client-
-     * side calculateMultiMonthProjection() on cloudmining.html.
+     * Canonical implementation. Mathematically identical to the projection
+     * used by POST /api/investments and by the client-side
+     * calculateMultiMonthProjection() on cloudmining.html.
      *
      * Model:
      *   1. The gross principal is the user's deposit (e.g. $1,000).
-     *   2. The 3% cycle fee is charged on the incoming balance of EVERY
-     *      cycle — including cycle 1. There is no "outside the loop"
-     *      fee. The fee is the ONLY cost on the contract.
+     *   2. The cycle fee (e.g. 3%) is charged on the incoming balance of
+     *      EVERY cycle — including cycle 1. There is no separate
+     *      "outside the loop" fee.
      *   3. Within a month, each cycle's post-fee return becomes the next
      *      cycle's incoming balance (in-month compounding).
      *   4. At the month boundary, the compounded month-end value is the
      *      month's payout. The principal RESETS to the ORIGINAL NET
-     *      principal (gross − firstCycleFee) for the next month.
-     *      This produces linear month-over-month growth rather than
-     *      exponential growth across months.
+     *      principal (gross − firstCycleFee) for the next month. This
+     *      produces linear month-over-month growth, not exponential.
      *
      * Fees accounting:
-     *   totalFeesUSD starts at the first-cycle fee (charged on the gross
-     *   principal), then accumulates every subsequent cycle's fee.
+     *   totalFeesUSD is a plain accumulator over every cycle's fee.
+     *   It is NOT seeded with the first-cycle fee and it is NOT adjusted
+     *   at the month-1 boundary. The loop already visits every cycle,
+     *   including cycle 1 of month 1, so summing monthFeesUSD for every
+     *   month already captures 100% of the fees actually charged.
+     *
+     *   (The previous version of this function both seeded totalFeesUSD
+     *   with firstCycleFeeUSD AND subtracted firstCycleFeeUSD from
+     *   monthFeesUSD during month 1, which produced a $30 under-report
+     *   on a $1,000 / 1-month projection. Both the seed and the
+     *   subtraction have been removed.)
      *
      * Profit accounting:
      *   totalProfitUSD = totalReturnUSD − grossPrincipalUSD
-     *   (gross principal, not net principal — the fee is already
-     *   included in the cycle math, so subtracting net principal would
-     *   understate the cost basis and inflate profit by exactly the
-     *   first-cycle fee.)
+     *   (gross principal, not net principal — the fee is already inside
+     *   the cycle math, so subtracting net principal would understate
+     *   the cost basis and inflate profit by exactly the first-cycle
+     *   fee.)
      *
      * For $1,000 on a 1-month plan with 15 cycles and 3% fee:
-     *   First cycle incoming = $1,000.00, fee = $30.00, net = $970.00
-     *   Cycle 2 incoming     = $1,022.83, fee = $30.68, ...
+     *   Cycle 1:  incoming $1,000.00, fee $30.00, net $970.00
+     *   Cycle 2:  incoming $1,054.22, fee $31.63, ...
      *   ...
-     *   Month-end return     = $2,141.47
-     *   Total fees           = $678.23
-     *   Net profit           = $2,141.47 − $1,000 = $1,141.47
-     *   ROI                  = 114.15%
+     *   Month-end return  = $2,141.47
+     *   Total fees        = $678.23
+     *   Net profit        = $2,141.47 − $1,000 = $1,141.47
+     *   ROI               = 114.15%
      * ------------------------------------------------------------------
      */
     const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
@@ -19609,11 +19616,12 @@ app.post('/api/mining/calculator', async (req, res) => {
       );
 
       // ----- Accumulators -----
-      // CRITICAL: seed the fee accumulator with the first-cycle fee,
-      //           since that fee is charged inside the cycle loop below.
-      //           Seeding at 0 is what caused the $30 under-report.
-      let totalFeesUSD = firstCycleFeeUSD;
-      let totalFeesBTC = firstCycleFeeBTC;
+      // CRITICAL: these start at zero. The cycle loop below visits every
+      // cycle (including cycle 1 of month 1), so summing monthFeesUSD
+      // for each month captures all fees actually charged. No seed, no
+      // month-1 adjustment.
+      let totalFeesUSD = 0;
+      let totalFeesBTC = 0;
 
       let totalReturnUSD = 0;
       let totalReturnBTC = 0;
@@ -19622,8 +19630,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
       // ----- Month loop (reset model) -----
       // At the start of each month, incoming = original net principal.
-      // That means cycle 1 of every month pays the same $30 fee on the
-      // same $970 base, which matches the investment endpoint.
+      // That means cycle 1 of every month pays the same fee on the same
+      // net base, matching the investment endpoint.
       let monthStartingPrincipalUSD = firstNetPrincipalUSD;
       let monthStartingPrincipalBTC = firstNetPrincipalBTC;
 
@@ -19661,20 +19669,15 @@ app.post('/api/mining/calculator', async (req, res) => {
           monthReturnBTC = cycleReturnBTC;
         }
 
-        // Month-end: compound result is the payout. Track it.
+        // Month-end: compounded result is the payout. Track it.
         totalReturnUSD += monthReturnUSD;
         totalReturnBTC += monthReturnBTC;
 
-        // Only the cycles inside this month contribute to the fee totals
-        // (the first-cycle fee was already seeded into totalFeesUSD).
-        if (month > 1) {
-          totalFeesUSD += monthFeesUSD;
-          totalFeesBTC += monthFeesBTC;
-        } else {
-          // Month 1: the first-cycle fee is already seeded; add the rest.
-          totalFeesUSD += (monthFeesUSD - firstCycleFeeUSD);
-          totalFeesBTC += (monthFeesBTC - firstCycleFeeBTC);
-        }
+        // Sum every cycle's fee for this month into the running total.
+        // No seeding and no month-1 adjustment — the loop already
+        // captured cycle 1's fee in monthFeesUSD.
+        totalFeesUSD += monthFeesUSD;
+        totalFeesBTC += monthFeesBTC;
 
         // Month-level profit: month-end value minus the principal that
         // started the month.
@@ -19706,7 +19709,7 @@ app.post('/api/mining/calculator', async (req, res) => {
 
       // Profit is measured against the GROSS principal. The fee is already
       // inside the cycle math, so subtracting net principal would add the
-      // first-cycle fee to the profit — that was the second half of the bug.
+      // first-cycle fee to the profit.
       const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
       const totalProfitBTC = totalReturnBTC - grossPrincipalBTC;
 
@@ -20389,8 +20392,6 @@ console.log('   - Real-time BTC price (not displayed)');
 console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
 console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
 console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
-
-
 
 
 
