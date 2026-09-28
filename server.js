@@ -20826,11 +20826,6 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
-
-
-
-
 // =============================================
 // INVESTMENT MATURITY CRON
 //
@@ -20839,7 +20834,7 @@ app.get('/api/plans', async (req, res) => {
 //   - in-month cycle advance
 //   - month-boundary sweep + principal reset
 //   - final payout (LINEAR month-over-month)
-//   - per-month payout email at each month boundary for long-term contracts
+//   - per-month payout email at each month boundary for multi-month contracts
 //   - final-contract-completion email when the last cycle closes
 //
 // SINGLE-CYCLE CONTRACTS:
@@ -20854,851 +20849,851 @@ app.get('/api/plans', async (req, res) => {
 //   contract completes regardless of month boundaries.
 // =============================================
 const completeMaturedInvestmentsCron = async () => {
-  const startTime = Date.now();
-  console.log('🔄 [CRON] Running automatic investment maturity check...');
+    const startTime = Date.now();
+    console.log('🔄 [CRON] Running automatic investment maturity check...');
 
-  try {
-    const now = new Date();
+    try {
+      const now = new Date();
 
-    // Find active investments where the CURRENT CYCLE's endDate has passed
-    const maturedInvestments = await Investment.find({
-      status: 'active',
-      endDate: { $lte: now }
-    }).populate('user plan');
+      // Find active investments where the CURRENT CYCLE's endDate has passed
+      const maturedInvestments = await Investment.find({
+        status: 'active',
+        endDate: { $lte: now }
+      }).populate('user plan');
 
-    if (maturedInvestments.length === 0) {
-      console.log(`📭 [CRON] No matured investments found. Check completed in ${Date.now() - startTime}ms`);
-      return;
-    }
+      if (maturedInvestments.length === 0) {
+        console.log(`📭 [CRON] No matured investments found. Check completed in ${Date.now() - startTime}ms`);
+        return;
+      }
 
-    console.log(`🎯 [CRON] Found ${maturedInvestments.length} matured cycle(s) to process`);
+      console.log(`🎯 [CRON] Found ${maturedInvestments.length} matured cycle(s) to process`);
 
-    let advancedCount = 0;
-    let resetCount = 0;
-    let completedCount = 0;
-    let failedCount = 0;
+      let advancedCount = 0;
+      let resetCount = 0;
+      let completedCount = 0;
+      let failedCount = 0;
 
-    for (const investment of maturedInvestments) {
-      const session = await mongoose.startSession();
-      session.startTransaction();
+      for (const investment of maturedInvestments) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-      try {
-        const userId = investment.user._id;
-        const user = await User.findById(userId).session(session);
-
-        if (!user) {
-          throw new Error('User not found');
-        }
-
-        const plan = investment.plan;
-        if (!plan) {
-          throw new Error('Plan not found');
-        }
-
-        // =============================================
-        // RESOLVE CYCLE FEE (plan override → global fallback)
-        // =============================================
-        const cycleFeePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
-          ? plan.cycleFeePercent
-          : CYCLE_FEE_PERCENT;
-
-        // Fetch fresh BTC price (internal only)
-        let currentBTCPrice;
         try {
-          currentBTCPrice = await getRealTimeBitcoinPrice();
-          console.log(`📊 [CRON] BTC price for ${investment._id}: $${currentBTCPrice}`);
-        } catch (priceError) {
-          console.error(`❌ [CRON] Failed to fetch BTC price: ${priceError.message}`);
-          throw new Error('Could not fetch BTC price');
-        }
+          const userId = investment.user._id;
+          const user = await User.findById(userId).session(session);
 
-        // ---- Locate the active cycle being closed (by cycleNumber + monthNumber) ----
-        const cycleIdx = investment.cycleHistory.findIndex(
-          c => c.cycleNumber === investment.currentCycle &&
-               c.monthNumber === investment.currentMonth &&
-               c.status === 'active'
-        );
-        if (cycleIdx === -1) {
-          throw new Error(`Cycle history mismatch: no active entry for cycle ${investment.currentCycle}, month ${investment.currentMonth}`);
-        }
-        const currentCycle = investment.cycleHistory[cycleIdx];
-
-        const planReturnDecimal = plan.percentage / 100;
-
-        // ===================================================
-        // APPLY CYCLE FEE TO THE INCOMING BALANCE OF THIS CYCLE
-        // Every cycle pays its own fee, on its own incoming balance.
-        // ===================================================
-        const incomingBalanceUSD = currentCycle.incomingBalanceUSD;
-        const incomingBalanceBTC = currentCycle.incomingBalanceBTC;
-
-        const cycleFeeUSD = incomingBalanceUSD * (cycleFeePercent / 100);
-        const cycleFeeBTC = incomingBalanceBTC * (cycleFeePercent / 100);
-        const netPrincipalUSD = incomingBalanceUSD - cycleFeeUSD;
-        const netPrincipalBTC = incomingBalanceBTC - cycleFeeBTC;
-
-        const cycleReturnUSD = netPrincipalUSD * (1 + planReturnDecimal);
-        const cycleReturnBTC = netPrincipalBTC * (1 + planReturnDecimal);
-
-        const cycleNetReturnUSD = cycleReturnUSD - netPrincipalUSD;
-        const cycleNetReturnBTC = cycleReturnBTC - netPrincipalBTC;
-
-        // Finalize the cycle record
-        currentCycle.feeUSD = cycleFeeUSD;
-        currentCycle.feeBTC = cycleFeeBTC;
-        currentCycle.netPrincipalUSD = netPrincipalUSD;
-        currentCycle.netPrincipalBTC = netPrincipalBTC;
-        currentCycle.returnUSD = cycleReturnUSD;
-        currentCycle.returnBTC = cycleReturnBTC;
-        currentCycle.btcPriceAtEnd = currentBTCPrice;
-        currentCycle.status = 'completed';
-
-        // Accumulate returns
-        investment.monthToDateReturnUSD = (investment.monthToDateReturnUSD || 0) + cycleReturnUSD;
-        investment.monthToDateReturnBTC = (investment.monthToDateReturnBTC || 0) + cycleReturnBTC;
-        investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleReturnUSD;
-        investment.cumulativeReturnBTC = (investment.cumulativeReturnBTC || 0) + cycleReturnBTC;
-
-        console.log(`📊 [CRON] Investment ${investment._id} month ${investment.currentMonth} cycle ${investment.currentCycle}/${investment.cyclesPerMonth}:`);
-        console.log(`   Incoming: ${incomingBalanceBTC.toFixed(8)} BTC ($${incomingBalanceUSD.toFixed(2)})`);
-        console.log(`   Fee (${cycleFeePercent}%): ${cycleFeeBTC.toFixed(8)} BTC ($${cycleFeeUSD.toFixed(2)})`);
-        console.log(`   Net Principal: ${netPrincipalBTC.toFixed(8)} BTC ($${netPrincipalUSD.toFixed(2)})`);
-        console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
-        console.log(`   Month-to-date: ${investment.monthToDateReturnBTC.toFixed(8)} BTC ($${investment.monthToDateReturnUSD.toFixed(2)})`);
-
-        // ===================================================
-        // ROUTE THE FEE TO PLATFORM REVENUE (every cycle)
-        // ===================================================
-        const feeTxRef = `CYCLE-FEE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-        const [feeTx] = await Transaction.create([{
-          user: userId,
-          type: 'investment',
-          amount: cycleFeeUSD,
-          amountBTC: cycleFeeBTC,
-          currency: 'BTC',
-          status: 'completed',
-          method: 'INTERNAL',
-          reference: feeTxRef,
-          details: {
-            investmentId: investment._id,
-            planName: plan.name,
-            cycle: investment.currentCycle,
-            month: investment.currentMonth,
-            transactionType: 'fee',
-            cycleFeePercent: cycleFeePercent,
-            description: `Cycle ${investment.currentCycle} (month ${investment.currentMonth}) ${cycleFeePercent}% fee`
-          },
-          fee: 0,
-          netAmount: cycleFeeUSD
-        }], { session });
-
-        await PlatformRevenue.create([{
-          source: 'investment_fee',
-          amount: cycleFeeUSD,
-          amountBTC: cycleFeeBTC,
-          currency: 'BTC',
-          transactionId: feeTx._id,
-          investmentId: investment._id,
-          userId: userId,
-          description: `${cycleFeePercent}% cycle fee (month ${investment.currentMonth}, cycle ${investment.currentCycle}) for ${plan.name} investment`,
-          metadata: {
-            planName: plan.name,
-            cycle: investment.currentCycle,
-            month: investment.currentMonth,
-            totalCycles: investment.totalCycles,
-            cyclesPerMonth: investment.cyclesPerMonth,
-            feePercentage: cycleFeePercent,
-            feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
-            btcPrice: currentBTCPrice
+          if (!user) {
+            throw new Error('User not found');
           }
-        }], { session });
 
-        // ===================================================
-        // DECIDE NEXT STEP
-        //
-        // The contract is complete when EITHER:
-        //   (a) the cycle that just closed is the last cycle of the last
-        //       month of the contract (isLastCycleOfMonth && isLastMonth), OR
-        //   (b) the cycle that just closed has reached totalCycles.
-        //
-        // (b) is what makes single-cycle contracts end after exactly one
-        // cycle. Without it, a plan with cyclesPerMonth > 1 would never
-        // hit (a) on cycle 1 and would incorrectly advance.
-        // ===================================================
-        const isLastCycleOfMonth = investment.currentCycle >= investment.cyclesPerMonth;
-        const isLastMonth = investment.currentMonth >= investment.autoCompoundMonths;
-        const reachedTotalCycles = investment.currentCycle >= investment.totalCycles;
+          const plan = investment.plan;
+          if (!plan) {
+            throw new Error('Plan not found');
+          }
 
-        const contractComplete = (isLastCycleOfMonth && isLastMonth) || reachedTotalCycles;
+          // =============================================
+          // RESOLVE CYCLE FEE (plan override → global fallback)
+          // =============================================
+          const cycleFeePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+            ? plan.cycleFeePercent
+            : CYCLE_FEE_PERCENT;
 
-        if (contractComplete) {
+          // Fetch fresh BTC price (internal only)
+          let currentBTCPrice;
+          try {
+            currentBTCPrice = await getRealTimeBitcoinPrice();
+            console.log(`📊 [CRON] BTC price for ${investment._id}: $${currentBTCPrice}`);
+          } catch (priceError) {
+            console.error(`❌ [CRON] Failed to fetch BTC price: ${priceError.message}`);
+            throw new Error('Could not fetch BTC price');
+          }
+
+          // ---- Locate the active cycle being closed (by cycleNumber + monthNumber) ----
+          const cycleIdx = investment.cycleHistory.findIndex(
+            c => c.cycleNumber === investment.currentCycle &&
+                 c.monthNumber === investment.currentMonth &&
+                 c.status === 'active'
+          );
+          if (cycleIdx === -1) {
+            throw new Error(`Cycle history mismatch: no active entry for cycle ${investment.currentCycle}, month ${investment.currentMonth}`);
+          }
+          const currentCycle = investment.cycleHistory[cycleIdx];
+
+          const planReturnDecimal = plan.percentage / 100;
+
           // ===================================================
-          // FINAL PAYOUT
+          // APPLY CYCLE FEE TO THE INCOMING BALANCE OF THIS CYCLE
+          // Every cycle pays its own fee, on its own incoming balance.
           // ===================================================
-          console.log(`[CRON] Investment ${investment._id} completing (cycle ${investment.currentCycle} / totalCycles ${investment.totalCycles})`);
+          const incomingBalanceUSD = currentCycle.incomingBalanceUSD;
+          const incomingBalanceBTC = currentCycle.incomingBalanceBTC;
 
-          investment.status = 'completed';
-          investment.isAutoCompoundActive = false;
-          investment.completionDate = now;
-          investment.actualReturn = cycleNetReturnUSD;
-          investment.actualReturnBTC = cycleNetReturnBTC;
-          investment.btcPriceAtCompletion = currentBTCPrice;
+          const cycleFeeUSD = incomingBalanceUSD * (cycleFeePercent / 100);
+          const cycleFeeBTC = incomingBalanceBTC * (cycleFeePercent / 100);
+          const netPrincipalUSD = incomingBalanceUSD - cycleFeeUSD;
+          const netPrincipalBTC = incomingBalanceBTC - cycleFeeBTC;
 
-          // Credit the return to the user's matured wallet
-          if (!user.balances) {
-            user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-          }
-          if (!user.balances.matured) user.balances.matured = new Map();
+          const cycleReturnUSD = netPrincipalUSD * (1 + planReturnDecimal);
+          const cycleReturnBTC = netPrincipalBTC * (1 + planReturnDecimal);
 
-          const currentMaturedBTC = user.balances.matured.get('btc') || 0;
-          user.balances.matured.set('btc', currentMaturedBTC + cycleReturnBTC);
+          const cycleNetReturnUSD = cycleReturnUSD - netPrincipalUSD;
+          const cycleNetReturnBTC = cycleReturnBTC - netPrincipalBTC;
 
-          const currentMaturedUSD = user.balances.matured.get('usd') || 0;
-          user.balances.matured.set('usd', currentMaturedUSD + cycleReturnUSD);
+          // Finalize the cycle record
+          currentCycle.feeUSD = cycleFeeUSD;
+          currentCycle.feeBTC = cycleFeeBTC;
+          currentCycle.netPrincipalUSD = netPrincipalUSD;
+          currentCycle.netPrincipalBTC = netPrincipalBTC;
+          currentCycle.returnUSD = cycleReturnUSD;
+          currentCycle.returnBTC = cycleReturnBTC;
+          currentCycle.btcPriceAtEnd = currentBTCPrice;
+          currentCycle.status = 'completed';
 
-          // Remove the net principal from the active wallet (contract is closing)
-          const currentActiveBTC = user.balances.active?.get('btc') || 0;
-          const newActiveBTC = currentActiveBTC - netPrincipalBTC;
-          if (newActiveBTC <= 0.00000001) {
-            user.balances.active.delete('btc');
-          } else {
-            user.balances.active.set('btc', newActiveBTC);
-          }
+          // Accumulate returns
+          investment.monthToDateReturnUSD = (investment.monthToDateReturnUSD || 0) + cycleReturnUSD;
+          investment.monthToDateReturnBTC = (investment.monthToDateReturnBTC || 0) + cycleReturnBTC;
+          investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleReturnUSD;
+          investment.cumulativeReturnBTC = (investment.cumulativeReturnBTC || 0) + cycleReturnBTC;
 
-          const currentActiveUSD = user.balances.active?.get('usd') || 0;
-          const newActiveUSD = currentActiveUSD - netPrincipalUSD;
-          if (newActiveUSD <= 0.01) {
-            user.balances.active.delete('usd');
-          } else {
-            user.balances.active.set('usd', newActiveUSD);
-          }
+          console.log(`📊 [CRON] Investment ${investment._id} month ${investment.currentMonth} cycle ${investment.currentCycle}/${investment.cyclesPerMonth}:`);
+          console.log(`   Incoming: ${incomingBalanceBTC.toFixed(8)} BTC ($${incomingBalanceUSD.toFixed(2)})`);
+          console.log(`   Fee (${cycleFeePercent}%): ${cycleFeeBTC.toFixed(8)} BTC ($${cycleFeeUSD.toFixed(2)})`);
+          console.log(`   Net Principal: ${netPrincipalBTC.toFixed(8)} BTC ($${netPrincipalUSD.toFixed(2)})`);
+          console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
+          console.log(`   Month-to-date: ${investment.monthToDateReturnBTC.toFixed(8)} BTC ($${investment.monthToDateReturnUSD.toFixed(2)})`);
 
-          await user.save({ session });
-
-          const finalTxRef = `FINAL-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          await Transaction.create([{
+          // ===================================================
+          // ROUTE THE FEE TO PLATFORM REVENUE (every cycle)
+          // ===================================================
+          const feeTxRef = `CYCLE-FEE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+          const [feeTx] = await Transaction.create([{
             user: userId,
-            type: 'interest',
-            amount: cycleReturnUSD,
-            amountBTC: cycleReturnBTC,
+            type: 'investment',
+            amount: cycleFeeUSD,
+            amountBTC: cycleFeeBTC,
             currency: 'BTC',
             status: 'completed',
             method: 'INTERNAL',
-            reference: finalTxRef,
+            reference: feeTxRef,
             details: {
               investmentId: investment._id,
               planName: plan.name,
-              finalCycle: investment.currentCycle,
-              finalMonth: investment.currentMonth,
-              totalCycles: investment.totalCycles,
-              autoCompoundMonths: investment.autoCompoundMonths || 1,
-              isSingleCycle: !investment.isAutoCompoundActive && investment.totalCycles === 1,
-              cumulativeReturnUSD: investment.cumulativeReturnUSD,
-              cumulativeReturnBTC: investment.cumulativeReturnBTC,
-              transactionType: 'credit',
-              description: `Final payout for completed ${plan.name} contract after ${investment.autoCompoundMonths} month(s) and ${investment.currentCycle} cycle(s) in final month. Return: ${cycleReturnBTC.toFixed(8)} BTC (≈ $${cycleReturnUSD.toLocaleString()}).`
+              cycle: investment.currentCycle,
+              month: investment.currentMonth,
+              transactionType: 'fee',
+              cycleFeePercent: cycleFeePercent,
+              description: `Cycle ${investment.currentCycle} (month ${investment.currentMonth}) ${cycleFeePercent}% fee`
             },
             fee: 0,
-            netAmount: cycleReturnUSD,
-            exchangeRateAtTime: currentBTCPrice
+            netAmount: cycleFeeUSD
           }], { session });
 
-          await SystemLog.create([{
-            action: 'investment_matured',
-            entity: 'Investment',
-            entityId: investment._id,
-            performedBy: userId,
-            performedByModel: 'User',
-            performedByEmail: user.email,
-            performedByName: `${user.firstName} ${user.lastName}`,
-            status: 'success',
-            ip: 'system.cron',
-            userAgent: 'system_cron_job',
-            deviceType: 'system',
-            os: 'System',
-            browser: 'CronJob',
-            location: 'System',
-            countryCode: 'SY',
-            city: 'System',
-            region: 'System',
+          await PlatformRevenue.create([{
+            source: 'investment_fee',
+            amount: cycleFeeUSD,
+            amountBTC: cycleFeeBTC,
+            currency: 'BTC',
+            transactionId: feeTx._id,
+            investmentId: investment._id,
+            userId: userId,
+            description: `${cycleFeePercent}% cycle fee (month ${investment.currentMonth}, cycle ${investment.currentCycle}) for ${plan.name} investment`,
             metadata: {
               planName: plan.name,
-              originalAmountUSD: investment.originalAmount,
-              originalAmountBTC: investment.originalAmountBTC,
-              totalCycles: investment.totalCycles,
-              totalMonths: investment.autoCompoundMonths,
-              completedCycles: investment.currentCycle,
-              finalMonth: investment.currentMonth,
-              finalReturnBTC: cycleReturnBTC,
-              finalReturnUSD: cycleReturnUSD,
-              cumulativeReturnBTC: investment.cumulativeReturnBTC,
-              cumulativeReturnUSD: investment.cumulativeReturnUSD,
-              cycleFeePercent: cycleFeePercent,
-              btcPriceAtStart: investment.btcPriceAtInvestment,
-              btcPriceAtCompletion: currentBTCPrice,
-              startDate: investment.startDate,
-              endDate: investment.endDate,
-              completionDate: investment.completionDate,
-              completedBy: 'system_cron_job',
-              transactionReference: finalTxRef
-            }
-          }], { session });
-
-          await investment.save({ session });
-          await session.commitTransaction();
-
-          console.log(`✅ [CRON] Investment ${investment._id} completed. Payout: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
-          completedCount++;
-
-          // =============================================
-          // SEND FINAL MATURITY EMAIL
-          //
-          // The template branches on whether the contract was a
-          // single-cycle contract or a multi-month contract:
-          //
-          //   SINGLE CYCLE
-          //     → "Cycle Return" and "Cycle Net Profit" only
-          //     → no cumulative month math shown
-          //
-          //   MULTI-MONTH
-          //     → "Final Gross Return" and "Final Net Profit"
-          //     → "Cumulative Gross Return Across Contract"
-          //     → reminds the user the funds are now in the Matured Wallet
-          // =============================================
-          try {
-            const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
-
-            const fmtUSD = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const fmtBTC = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-
-            const formattedPrincipalUSD = fmtUSD(netPrincipalUSD);
-            const formattedPrincipalBTC = fmtBTC(netPrincipalBTC);
-            const formattedFeeUSD = fmtUSD(cycleFeeUSD);
-            const formattedFeeBTC = fmtBTC(cycleFeeBTC);
-            const formattedGrossReturnUSD = fmtUSD(cycleReturnUSD);
-            const formattedGrossReturnBTC = fmtBTC(cycleReturnBTC);
-            const formattedNetReturnUSD = fmtUSD(cycleNetReturnUSD);
-            const formattedNetReturnBTC = fmtBTC(cycleNetReturnBTC);
-
-            const formattedCompletionDate = now.toLocaleString('en-US', {
-              year: 'numeric', month: 'long', day: 'numeric',
-              hour: '2-digit', minute: '2-digit', second: '2-digit',
-              timeZoneName: 'short'
-            });
-
-            const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
-            const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
-            const formattedNewMaturedBTC = fmtBTC(newMaturedBTCBalance);
-            const formattedNewMaturedUSD = fmtUSD(newMaturedUSDBalance);
-
-            const isLongTerm = (investment.autoCompoundMonths && investment.autoCompoundMonths > 1 && investment.totalCycles > 1);
-
-            const formattedCumulativeReturnUSD = fmtUSD(investment.cumulativeReturnUSD);
-            const formattedCumulativeReturnBTC = fmtBTC(investment.cumulativeReturnBTC);
-
-            const compoundSummaryBlock = isLongTerm
-              ? `
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycle(s)/month)</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Final Month / Final Cycle:</strong></td>
-                  <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 0;"><strong>Cumulative Gross Return Across Contract:</strong></td>
-                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedCumulativeReturnBTC} BTC (≈ $${formattedCumulativeReturnUSD} USD)</td>
-                </tr>
-              `
-              : '';
-
-            const mailTransporter = infoTransporter;
-
-            const maturitySubject = isLongTerm
-              ? `Congratulations! Your ${investment.autoCompoundMonths}-Month Contract Has Matured - ₿itHash Capital`
-              : `Congratulations! Your Mining Cycle Is Complete - ₿itHash Capital`;
-
-            const emailHtml = `
-              <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                  <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                  <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                  <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                </div>
-
-                <div style="padding: 30px; background: #FFFFFF;">
-                  <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                        <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                      </svg>
-                    </div>
-                    <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">${isLongTerm ? 'CONTRACT MATURED!' : 'CYCLE COMPLETE!'}</h2>
-                    <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `Your ${investment.autoCompoundMonths}-month mining contract has completed` : 'Your mining cycle has successfully completed'}</p>
-                  </div>
-
-                  <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                  <p style="color: #333333; line-height: 1.6;">${isLongTerm ? `Congratulations! Your <strong>${plan.name}</strong> mining contract has completed after <strong>${investment.autoCompoundMonths} month(s)</strong>. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.` : `Great news! Your <strong>${plan.name}</strong> mining cycle has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.`}</p>
-
-                  <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <div>
-                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
-                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
-                      </div>
-                    </div>
-
-                    <table style="width: 100%; border-collapse: collapse;">
-                      <tr>
-                        <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Fee (${cycleFeePercent}%):</strong></td>
-                        <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">${isLongTerm ? 'Final Gross Return:' : 'Cycle Gross Return:'}</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">${isLongTerm ? 'Final Net Profit:' : 'Cycle Net Profit:'}</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
-                      </tr>
-                      ${compoundSummaryBlock}
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
-                      </tr>
-                    </table>
-                  </div>
-
-                  <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
-                    <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
-                  </div>
-
-                  <div style="text-align: center; margin: 30px 0;">
-                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
-                  </div>
-
-                  <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
-                </div>
-
-                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
-                    <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-                  </p>
-                </div>
-              </div>
-            `;
-
-            await mailTransporter.sendMail({
-              from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-              to: user.email,
-              subject: maturitySubject,
-              html: emailHtml
-            });
-
-            console.log(`📧 [CRON] Maturity email sent to ${user.email} (${isLongTerm ? 'Multi-month' : 'Single cycle'})`);
-          } catch (emailError) {
-            console.error(`❌ [CRON] Failed to send maturity email for ${investment._id}:`, emailError);
-          }
-
-          // Emit real-time balance update
-          const io = global.io;
-          if (io) {
-            io.to(`user_${userId}`).emit('balance_update', {
-              main: user.balances.main?.get('usd') || 0,
-              active: user.balances.active?.get('usd') || 0,
-              matured: user.balances.matured?.get('usd') || 0
-            });
-
-            io.to(`user_${userId}`).emit('investment_update', {
-              investmentId: investment._id,
-              status: 'completed',
               cycle: investment.currentCycle,
               month: investment.currentMonth,
               totalCycles: investment.totalCycles,
-              timestamp: Date.now()
-            });
-          }
-
-        } else if (isLastCycleOfMonth) {
-          // ===================================================
-          // MONTH BOUNDARY (only reachable for multi-month contracts)
-          // SWEEP the month's compounded growth and RESET principal.
-          //
-          // After the sweep, we send the user an email describing:
-          //   - the month that just ended
-          //   - the gross return credited to their Matured Wallet
-          //   - the net profit they earned that month
-          //   - when their next month begins
-          // ===================================================
-          const sweptUSD = investment.monthToDateReturnUSD;
-          const sweptBTC = investment.monthToDateReturnBTC;
-
-          if (!user.balances) {
-            user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-          }
-          if (!user.balances.matured) user.balances.matured = new Map();
-
-          const currentMaturedBTC = user.balances.matured.get('btc') || 0;
-          user.balances.matured.set('btc', currentMaturedBTC + sweptBTC);
-
-          const currentMaturedUSD = user.balances.matured.get('usd') || 0;
-          user.balances.matured.set('usd', currentMaturedUSD + sweptUSD);
-
-          const currentActiveBTC = user.balances.active?.get('btc') || 0;
-          const newActiveBTC = currentActiveBTC - sweptBTC;
-          if (newActiveBTC <= 0.00000001) {
-            user.balances.active.delete('btc');
-          } else {
-            user.balances.active.set('btc', newActiveBTC);
-          }
-
-          const currentActiveUSD = user.balances.active?.get('usd') || 0;
-          const newActiveUSD = currentActiveUSD - sweptUSD;
-          if (newActiveUSD <= 0.01) {
-            user.balances.active.delete('usd');
-          } else {
-            user.balances.active.set('usd', newActiveUSD);
-          }
-
-          await user.save({ session });
-
-          const sweepRef = `MONTH-SWEEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          await Transaction.create([{
-            user: userId,
-            type: 'interest',
-            amount: sweptUSD,
-            amountBTC: sweptBTC,
-            currency: 'BTC',
-            status: 'completed',
-            method: 'INTERNAL',
-            reference: sweepRef,
-            details: {
-              investmentId: investment._id,
-              planName: plan.name,
-              monthNumber: investment.currentMonth,
-              transactionType: 'credit',
-              description: `Month ${investment.currentMonth} payout: compounded growth credited to Matured Wallet. Principal resets to original net value.`
-            },
-            fee: 0,
-            netAmount: sweptUSD,
-            exchangeRateAtTime: currentBTCPrice
+              cyclesPerMonth: investment.cyclesPerMonth,
+              feePercentage: cycleFeePercent,
+              feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
+              btcPrice: currentBTCPrice
+            }
           }], { session });
 
-          const monthJustCompleted = investment.currentMonth;
-
-          investment.currentMonth += 1;
-          investment.currentCycle = 1;
-          investment.monthToDateReturnUSD = 0;
-          investment.monthToDateReturnBTC = 0;
-
-          const resetPrincipalUSD = investment.monthStartingPrincipalUSD;
-          const resetPrincipalBTC = investment.monthStartingPrincipalBTC;
-
-          const resetHashpower = calculateHashpower(
-            resetPrincipalUSD,
-            plan.percentage,
-            plan.duration,
-            currentBTCPrice
-          );
-          investment.currentHashrate = resetHashpower;
-          investment.hashrateHistory.push({
-            cycleNumber: 1,
-            monthNumber: investment.currentMonth,
-            hashrate: resetHashpower,
-            btcPriceAtCalculation: currentBTCPrice,
-            calculatedAt: now
-          });
-
-          const newCycleStart = now;
-          const newCycleEnd = new Date(newCycleStart.getTime() + plan.duration * 60 * 60 * 1000);
-          investment.endDate = newCycleEnd;
-          investment.expectedReturn = resetPrincipalUSD * (1 + planReturnDecimal);
-          investment.expectedReturnBTC = resetPrincipalBTC * (1 + planReturnDecimal);
-
-          investment.cycleHistory.push({
-            cycleNumber: 1,
-            monthNumber: investment.currentMonth,
-            incomingBalanceUSD: resetPrincipalUSD,
-            incomingBalanceBTC: resetPrincipalBTC,
-            feeUSD: 0,
-            feeBTC: 0,
-            netPrincipalUSD: resetPrincipalUSD,
-            netPrincipalBTC: resetPrincipalBTC,
-            returnUSD: 0,
-            returnBTC: 0,
-            btcPriceAtStart: currentBTCPrice,
-            startDate: newCycleStart,
-            endDate: newCycleEnd,
-            status: 'active'
-          });
-
-          await investment.save({ session });
-          await session.commitTransaction();
-
-          console.log(`🔄 [CRON] Investment ${investment._id} MONTH RESET: swept ${sweptBTC.toFixed(8)} BTC ($${sweptUSD.toFixed(2)}) to matured wallet; principal restored to ${resetPrincipalBTC.toFixed(8)} BTC ($${resetPrincipalUSD.toFixed(2)}); now on month ${investment.currentMonth} cycle 1`);
-          resetCount++;
-
-          // =============================================
-          // SEND MONTHLY PAYOUT EMAIL
+          // ===================================================
+          // DECIDE NEXT STEP
           //
-          // This email is specific to multi-month contracts. The user
-          // needs to know:
-          //   - which month just ended
-          //   - the payout credited to their Matured Wallet
-          //   - the net profit from that month
-          //   - which month just started
-          //   - when the next month ends and when the final month lands
-          // =============================================
-          try {
-            const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
+          // The contract is complete when EITHER:
+          //   (a) the cycle that just closed is the last cycle of the last
+          //       month of the contract (isLastCycleOfMonth && isLastMonth), OR
+          //   (b) the cycle that just closed has reached totalCycles.
+          //
+          // (b) is what makes single-cycle contracts end after exactly one
+          // cycle. Without it, a plan with cyclesPerMonth > 1 would never
+          // hit (a) on cycle 1 and would incorrectly advance.
+          // ===================================================
+          const isLastCycleOfMonth = investment.currentCycle >= investment.cyclesPerMonth;
+          const isLastMonth = investment.currentMonth >= investment.autoCompoundMonths;
+          const reachedTotalCycles = investment.currentCycle >= investment.totalCycles;
 
-            const fmtUSD = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const fmtBTC = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+          const contractComplete = (isLastCycleOfMonth && isLastMonth) || reachedTotalCycles;
 
-            const formattedSweptBTC = fmtBTC(sweptBTC);
-            const formattedSweptUSD = fmtUSD(sweptUSD);
+          if (contractComplete) {
+            // ===================================================
+            // FINAL PAYOUT
+            // ===================================================
+            console.log(`[CRON] Investment ${investment._id} completing (cycle ${investment.currentCycle} / totalCycles ${investment.totalCycles})`);
 
-            // Net profit for the month = swept - month-starting principal.
-            const monthNetProfitUSD = sweptUSD - resetPrincipalUSD;
-            const monthNetProfitBTC = sweptBTC - resetPrincipalBTC;
+            investment.status = 'completed';
+            investment.isAutoCompoundActive = false;
+            investment.completionDate = now;
+            investment.actualReturn = cycleNetReturnUSD;
+            investment.actualReturnBTC = cycleNetReturnBTC;
+            investment.btcPriceAtCompletion = currentBTCPrice;
 
-            const formattedMonthNetProfitBTC = fmtBTC(monthNetProfitBTC);
-            const formattedMonthNetProfitUSD = fmtUSD(monthNetProfitUSD);
+            // Credit the return to the user's matured wallet
+            if (!user.balances) {
+              user.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!user.balances.matured) user.balances.matured = new Map();
 
-            const formattedResetPrincipalBTC = fmtBTC(resetPrincipalBTC);
-            const formattedResetPrincipalUSD = fmtUSD(resetPrincipalUSD);
+            const currentMaturedBTC = user.balances.matured.get('btc') || 0;
+            user.balances.matured.set('btc', currentMaturedBTC + cycleReturnBTC);
 
-            const formattedNextMonthStart = newCycleStart.toLocaleString('en-US', {
-              year: 'numeric', month: 'long', day: 'numeric',
-              hour: '2-digit', minute: '2-digit', second: '2-digit',
-              timeZoneName: 'short'
-            });
+            const currentMaturedUSD = user.balances.matured.get('usd') || 0;
+            user.balances.matured.set('usd', currentMaturedUSD + cycleReturnUSD);
 
-            const finalMaturityDate = new Date(
-              newCycleStart.getTime() + ((investment.autoCompoundMonths - monthJustCompleted) * investment.cyclesPerMonth * plan.duration * 60 * 60 * 1000)
-            );
-            const formattedFinalMaturityDate = finalMaturityDate.toLocaleString('en-US', {
-              year: 'numeric', month: 'long', day: 'numeric',
-              hour: '2-digit', minute: '2-digit', second: '2-digit',
-              timeZoneName: 'short'
-            });
+            // Remove the net principal from the active wallet (contract is closing)
+            const currentActiveBTC = user.balances.active?.get('btc') || 0;
+            const newActiveBTC = currentActiveBTC - netPrincipalBTC;
+            if (newActiveBTC <= 0.00000001) {
+              user.balances.active.delete('btc');
+            } else {
+              user.balances.active.set('btc', newActiveBTC);
+            }
 
-            const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
-            const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
-            const formattedNewMaturedBTC = fmtBTC(newMaturedBTCBalance);
-            const formattedNewMaturedUSD = fmtUSD(newMaturedUSDBalance);
+            const currentActiveUSD = user.balances.active?.get('usd') || 0;
+            const newActiveUSD = currentActiveUSD - netPrincipalUSD;
+            if (newActiveUSD <= 0.01) {
+              user.balances.active.delete('usd');
+            } else {
+              user.balances.active.set('usd', newActiveUSD);
+            }
 
-            const mailTransporter = infoTransporter;
+            await user.save({ session });
 
-            const monthlySubject = `💰 Month ${monthJustCompleted} Payout Credited to Your Matured Wallet - ₿itHash Capital`;
+            const finalTxRef = `FINAL-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+            await Transaction.create([{
+              user: userId,
+              type: 'interest',
+              amount: cycleReturnUSD,
+              amountBTC: cycleReturnBTC,
+              currency: 'BTC',
+              status: 'completed',
+              method: 'INTERNAL',
+              reference: finalTxRef,
+              details: {
+                investmentId: investment._id,
+                planName: plan.name,
+                finalCycle: investment.currentCycle,
+                finalMonth: investment.currentMonth,
+                totalCycles: investment.totalCycles,
+                autoCompoundMonths: investment.autoCompoundMonths || 1,
+                isSingleCycle: !investment.isAutoCompoundActive && investment.totalCycles === 1,
+                cumulativeReturnUSD: investment.cumulativeReturnUSD,
+                cumulativeReturnBTC: investment.cumulativeReturnBTC,
+                transactionType: 'credit',
+                description: `Final payout for completed ${plan.name} contract after ${investment.autoCompoundMonths} month(s) and ${investment.currentCycle} cycle(s) in final month. Return: ${cycleReturnBTC.toFixed(8)} BTC (≈ $${cycleReturnUSD.toLocaleString()}).`
+              },
+              fee: 0,
+              netAmount: cycleReturnUSD,
+              exchangeRateAtTime: currentBTCPrice
+            }], { session });
 
-            const emailHtml = `
-              <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                  <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                  <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                  <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                </div>
+            await SystemLog.create([{
+              action: 'investment_matured',
+              entity: 'Investment',
+              entityId: investment._id,
+              performedBy: userId,
+              performedByModel: 'User',
+              performedByEmail: user.email,
+              performedByName: `${user.firstName} ${user.lastName}`,
+              status: 'success',
+              ip: 'system.cron',
+              userAgent: 'system_cron_job',
+              deviceType: 'system',
+              os: 'System',
+              browser: 'CronJob',
+              location: 'System',
+              countryCode: 'SY',
+              city: 'System',
+              region: 'System',
+              metadata: {
+                planName: plan.name,
+                originalAmountUSD: investment.originalAmount,
+                originalAmountBTC: investment.originalAmountBTC,
+                totalCycles: investment.totalCycles,
+                totalMonths: investment.autoCompoundMonths,
+                completedCycles: investment.currentCycle,
+                finalMonth: investment.currentMonth,
+                finalReturnBTC: cycleReturnBTC,
+                finalReturnUSD: cycleReturnUSD,
+                cumulativeReturnBTC: investment.cumulativeReturnBTC,
+                cumulativeReturnUSD: investment.cumulativeReturnUSD,
+                cycleFeePercent: cycleFeePercent,
+                btcPriceAtStart: investment.btcPriceAtInvestment,
+                btcPriceAtCompletion: currentBTCPrice,
+                startDate: investment.startDate,
+                endDate: investment.endDate,
+                completionDate: investment.completionDate,
+                completedBy: 'system_cron_job',
+                transactionReference: finalTxRef
+              }
+            }], { session });
 
-                <div style="padding: 30px; background: #FFFFFF;">
-                  <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                        <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                      </svg>
-                    </div>
-                    <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">MONTH ${monthJustCompleted} PAYOUT CREDITED!</h2>
-                    <p style="color: #065F46; font-size: 13px; margin: 0;">Your Month ${monthJustCompleted} mining return has been sent to your Matured Wallet</p>
+            await investment.save({ session });
+            await session.commitTransaction();
+
+            console.log(`✅ [CRON] Investment ${investment._id} completed. Payout: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
+            completedCount++;
+
+            // =============================================
+            // SEND FINAL MATURITY EMAIL
+            //
+            // The template branches on whether the contract was a
+            // single-cycle contract or a multi-month contract:
+            //
+            //   SINGLE CYCLE
+            //     → "Cycle Return" and "Cycle Net Profit" only
+            //     → no cumulative month math shown
+            //
+            //   MULTI-MONTH
+            //     → "Final Gross Return" and "Final Net Profit"
+            //     → "Cumulative Gross Return Across Contract"
+            //     → reminds the user the funds are now in the Matured Wallet
+            // =============================================
+            try {
+              const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
+
+              const formattedPrincipalUSD = netPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              const formattedPrincipalBTC = netPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedFeeUSD = cycleFeeUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              const formattedFeeBTC = cycleFeeBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedGrossReturnUSD = cycleReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              const formattedGrossReturnBTC = cycleReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedNetReturnUSD = cycleNetReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              const formattedNetReturnBTC = cycleNetReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
+              const formattedCompletionDate = now.toLocaleString('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                timeZoneName: 'short'
+              });
+
+              const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
+              const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
+              const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+              const isLongTerm = (investment.autoCompoundMonths && investment.autoCompoundMonths > 1 && investment.totalCycles > 1);
+
+              const formattedCumulativeReturnUSD = investment.cumulativeReturnUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              const formattedCumulativeReturnBTC = investment.cumulativeReturnBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
+              const compoundSummaryBlock = isLongTerm
+                ? `
+                  <tr style="border-top: 1px solid #E2E8F0;">
+                    <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
+                    <td style="padding: 8px 0; text-align: right;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycle(s)/month)</td>
+                  </tr>
+                  <tr style="border-top: 1px solid #E2E8F0;">
+                    <td style="padding: 8px 0;"><strong>Final Month / Final Cycle:</strong></td>
+                    <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
+                  </tr>
+                  <tr style="border-top: 1px solid #E2E8F0;">
+                    <td style="padding: 8px 0;"><strong>Cumulative Gross Return Across Contract:</strong></td>
+                    <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedCumulativeReturnBTC} BTC (≈ $${formattedCumulativeReturnUSD} USD)</td>
+                  </tr>
+                `
+                : '';
+
+              const mailTransporter = infoTransporter;
+
+              const maturitySubject = isLongTerm
+                ? `Congratulations! Your ${investment.autoCompoundMonths}-Month Contract Has Matured - ₿itHash Capital`
+                : `Congratulations! Your Mining Cycle Is Complete - ₿itHash Capital`;
+
+              const emailHtml = `
+                <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+                  <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                    <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                    <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
                   </div>
 
-                  <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                  <p style="color: #333333; line-height: 1.6;">Your <strong>${plan.name}</strong> mining contract has completed <strong>Month ${monthJustCompleted}</strong>. The month's return has been credited to your <strong style="color: #10B981;">Matured Wallet</strong> and Month ${investment.currentMonth} is now running.</p>
-
-                  <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <div>
-                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedSweptBTC} BTC</div>
-                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedSweptUSD} USD credited to Matured Wallet</div>
+                  <div style="padding: 30px; background: #FFFFFF;">
+                    <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                      <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
+                          <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
                       </div>
+                      <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">${isLongTerm ? 'CONTRACT MATURED' : 'CYCLE COMPLETE'}</h2>
+                      <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `Your ${investment.autoCompoundMonths}-month mining contract has completed` : 'Your mining cycle has successfully completed'}</p>
                     </div>
 
-                    <table style="width: 100%; border-collapse: collapse;">
-                      <tr>
-                        <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Month Just Completed:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">Month ${monthJustCompleted} of ${investment.autoCompoundMonths}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Month ${monthJustCompleted} Gross Return:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedSweptBTC} BTC (≈ $${formattedSweptUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Month ${monthJustCompleted} Net Profit:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedMonthNetProfitBTC} BTC (≈ $${formattedMonthNetProfitUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Next Month Begins:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} on ${formattedNextMonthStart}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Principal Restored For Next Month:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formattedResetPrincipalBTC} BTC (≈ $${formattedResetPrincipalUSD} USD)</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Contract Maturity:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #F7A600;">${formattedFinalMaturityDate}</td>
-                      </tr>
-                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
-                      </tr>
-                    </table>
+                    <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
+                    <p style="color: #333333; line-height: 1.6;">${isLongTerm ? `Congratulations! Your <strong>${plan.name}</strong> mining contract has completed after <strong>${investment.autoCompoundMonths} month(s)</strong>. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.` : `Great news! Your <strong>${plan.name}</strong> mining cycle has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.`}</p>
+
+                    <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                      <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <div>
+                          <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
+                          <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
+                        </div>
+                      </div>
+
+                      <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                          <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Fee (${cycleFeePercent}%):</strong></td>
+                          <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong style="color: #10B981;">${isLongTerm ? 'Final Gross Return:' : 'Cycle Gross Return:'}</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong style="color: #10B981;">${isLongTerm ? 'Final Net Profit:' : 'Cycle Net Profit:'}</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
+                        </tr>
+                        ${compoundSummaryBlock}
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
+                        </tr>
+                      </table>
+                    </div>
+
+                    <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                      <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
+                      <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
+                    </div>
+
+                    <div style="text-align: center; margin: 30px 0;">
+                      <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
+                    </div>
+
+                    <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
                   </div>
 
-                  <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">What Happens Next</p>
-                    <p style="color: #78350F; margin: 0; font-size: 14px;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths} has begun. Your principal of ${formattedResetPrincipalBTC} BTC is now mining again. Your next monthly payout lands in your Matured Wallet at the end of Month ${investment.currentMonth}, and your final payout lands at the end of Month ${investment.autoCompoundMonths} on ${formattedFinalMaturityDate}.</p>
+                  <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+                      <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
+                      <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
+                    </p>
                   </div>
-
-                  <div style="text-align: center; margin: 30px 0;">
-                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Your Contract</a>
-                  </div>
-
-                  <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedNextMonthStart}</p>
                 </div>
+              `;
 
-                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
-                    <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-                  </p>
-                </div>
-              </div>
-            `;
+              await mailTransporter.sendMail({
+                from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+                to: user.email,
+                subject: maturitySubject,
+                html: emailHtml
+              });
 
-            await mailTransporter.sendMail({
-              from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-              to: user.email,
-              subject: monthlySubject,
-              html: emailHtml
+              console.log(`📧 [CRON] Maturity email sent to ${user.email} (${isLongTerm ? 'Multi-month' : 'Single cycle'})`);
+            } catch (emailError) {
+              console.error(`❌ [CRON] Failed to send maturity email for ${investment._id}:`, emailError);
+            }
+
+            // Emit real-time balance update
+            const io = global.io;
+            if (io) {
+              io.to(`user_${userId}`).emit('balance_update', {
+                main: user.balances.main?.get('usd') || 0,
+                active: user.balances.active?.get('usd') || 0,
+                matured: user.balances.matured?.get('usd') || 0
+              });
+
+              io.to(`user_${userId}`).emit('investment_update', {
+                investmentId: investment._id,
+                status: 'completed',
+                cycle: investment.currentCycle,
+                month: investment.currentMonth,
+                totalCycles: investment.totalCycles,
+                timestamp: Date.now()
+              });
+            }
+
+          } else if (isLastCycleOfMonth) {
+            // ===================================================
+            // MONTH BOUNDARY (only reachable for multi-month contracts)
+            // SWEEP the month's compounded growth and RESET principal.
+            //
+            // After the sweep, we send the user an email describing:
+            //   - the month that just ended
+            //   - the gross return credited to their Matured Wallet
+            //   - the net profit they earned that month
+            //   - when their next month begins
+            // ===================================================
+            const sweptUSD = investment.monthToDateReturnUSD;
+            const sweptBTC = investment.monthToDateReturnBTC;
+
+            if (!user.balances) {
+              user.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!user.balances.matured) user.balances.matured = new Map();
+
+            const currentMaturedBTC = user.balances.matured.get('btc') || 0;
+            user.balances.matured.set('btc', currentMaturedBTC + sweptBTC);
+
+            const currentMaturedUSD = user.balances.matured.get('usd') || 0;
+            user.balances.matured.set('usd', currentMaturedUSD + sweptUSD);
+
+            const currentActiveBTC = user.balances.active?.get('btc') || 0;
+            const newActiveBTC = currentActiveBTC - sweptBTC;
+            if (newActiveBTC <= 0.00000001) {
+              user.balances.active.delete('btc');
+            } else {
+              user.balances.active.set('btc', newActiveBTC);
+            }
+
+            const currentActiveUSD = user.balances.active?.get('usd') || 0;
+            const newActiveUSD = currentActiveUSD - sweptUSD;
+            if (newActiveUSD <= 0.01) {
+              user.balances.active.delete('usd');
+            } else {
+              user.balances.active.set('usd', newActiveUSD);
+            }
+
+            await user.save({ session });
+
+            const sweepRef = `MONTH-SWEEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+            await Transaction.create([{
+              user: userId,
+              type: 'interest',
+              amount: sweptUSD,
+              amountBTC: sweptBTC,
+              currency: 'BTC',
+              status: 'completed',
+              method: 'INTERNAL',
+              reference: sweepRef,
+              details: {
+                investmentId: investment._id,
+                planName: plan.name,
+                monthNumber: investment.currentMonth,
+                transactionType: 'credit',
+                description: `Month ${investment.currentMonth} payout: compounded growth credited to Matured Wallet. Principal resets to original net value.`
+              },
+              fee: 0,
+              netAmount: sweptUSD,
+              exchangeRateAtTime: currentBTCPrice
+            }], { session });
+
+            const monthJustCompleted = investment.currentMonth;
+
+            investment.currentMonth += 1;
+            investment.currentCycle = 1;
+            investment.monthToDateReturnUSD = 0;
+            investment.monthToDateReturnBTC = 0;
+
+            const resetPrincipalUSD = investment.monthStartingPrincipalUSD;
+            const resetPrincipalBTC = investment.monthStartingPrincipalBTC;
+
+            const resetHashpower = calculateHashpower(
+              resetPrincipalUSD,
+              plan.percentage,
+              plan.duration,
+              currentBTCPrice
+            );
+            investment.currentHashrate = resetHashpower;
+            investment.hashrateHistory.push({
+              cycleNumber: 1,
+              monthNumber: investment.currentMonth,
+              hashrate: resetHashpower,
+              btcPriceAtCalculation: currentBTCPrice,
+              calculatedAt: now
             });
 
-            console.log(`📧 [CRON] Monthly payout email sent to ${user.email} (Month ${monthJustCompleted} of ${investment.autoCompoundMonths})`);
-          } catch (emailError) {
-            console.error(`❌ [CRON] Failed to send monthly payout email for ${investment._id}:`, emailError);
+            const newCycleStart = now;
+            const newCycleEnd = new Date(newCycleStart.getTime() + plan.duration * 60 * 60 * 1000);
+            investment.endDate = newCycleEnd;
+            investment.expectedReturn = resetPrincipalUSD * (1 + planReturnDecimal);
+            investment.expectedReturnBTC = resetPrincipalBTC * (1 + planReturnDecimal);
+
+            investment.cycleHistory.push({
+              cycleNumber: 1,
+              monthNumber: investment.currentMonth,
+              incomingBalanceUSD: resetPrincipalUSD,
+              incomingBalanceBTC: resetPrincipalBTC,
+              feeUSD: 0,
+              feeBTC: 0,
+              netPrincipalUSD: resetPrincipalUSD,
+              netPrincipalBTC: resetPrincipalBTC,
+              returnUSD: 0,
+              returnBTC: 0,
+              btcPriceAtStart: currentBTCPrice,
+              startDate: newCycleStart,
+              endDate: newCycleEnd,
+              status: 'active'
+            });
+
+            await investment.save({ session });
+            await session.commitTransaction();
+
+            console.log(`🔄 [CRON] Investment ${investment._id} MONTH RESET: swept ${sweptBTC.toFixed(8)} BTC ($${sweptUSD.toFixed(2)}) to matured wallet; principal restored to ${resetPrincipalBTC.toFixed(8)} BTC ($${resetPrincipalUSD.toFixed(2)}); now on month ${investment.currentMonth} cycle 1`);
+            resetCount++;
+
+            // =============================================
+            // SEND MONTHLY PAYOUT EMAIL
+            //
+            // This email is specific to multi-month contracts. The user
+            // needs to know:
+            //   - which month just ended
+            //   - the payout credited to their Matured Wallet
+            //   - the net profit from that month
+            //   - which month just started
+            //   - when the next month ends and when the final month lands
+            // =============================================
+            try {
+              const cryptoLogoUrl = 'https://assets.coingecko.com/coins/images/1/large/bitcoin.png';
+
+              const formattedSweptBTC = sweptBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedSweptUSD = sweptUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+              // Net profit for the month = swept - month-starting principal.
+              // month-starting principal was the principal that began the month.
+              const monthNetProfitUSD = sweptUSD - resetPrincipalUSD;
+              const monthNetProfitBTC = sweptBTC - resetPrincipalBTC;
+
+              const formattedMonthNetProfitBTC = monthNetProfitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedMonthNetProfitUSD = monthNetProfitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+              const formattedResetPrincipalBTC = resetPrincipalBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedResetPrincipalUSD = resetPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+              const formattedNextMonthStart = newCycleStart.toLocaleString('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                timeZoneName: 'short'
+              });
+
+              const finalMaturityDate = new Date(
+                newCycleStart.getTime() + ((investment.autoCompoundMonths - monthJustCompleted) * investment.cyclesPerMonth * plan.duration * 60 * 60 * 1000)
+              );
+              const formattedFinalMaturityDate = finalMaturityDate.toLocaleString('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                timeZoneName: 'short'
+              });
+
+              const newMaturedBTCBalance = user.balances.matured?.get('btc') || 0;
+              const newMaturedUSDBalance = user.balances.matured?.get('usd') || 0;
+              const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+              const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+              const mailTransporter = infoTransporter;
+
+              const monthlySubject = `Month ${monthJustCompleted} Payout Credited to Your Matured Wallet - ₿itHash Capital`;
+
+              const emailHtml = `
+                <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+                  <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                    <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                    <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+                  </div>
+
+                  <div style="padding: 30px; background: #FFFFFF;">
+                    <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                      <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
+                          <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                      </div>
+                      <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">MONTH ${monthJustCompleted} PAYOUT CREDITED</h2>
+                      <p style="color: #065F46; font-size: 13px; margin: 0;">Your Month ${monthJustCompleted} mining return has been sent to your Matured Wallet</p>
+                    </div>
+
+                    <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
+                    <p style="color: #333333; line-height: 1.6;">Your <strong>${plan.name}</strong> mining contract has completed <strong>Month ${monthJustCompleted}</strong>. The month's return has been credited to your <strong style="color: #10B981;">Matured Wallet</strong> and Month ${investment.currentMonth} is now running.</p>
+
+                    <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                      <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <div>
+                          <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedSweptBTC} BTC</div>
+                          <div style="color: #64748B; font-size: 12px;">≈ $${formattedSweptUSD} USD credited to Matured Wallet</div>
+                        </div>
+                      </div>
+
+                      <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                          <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Month Just Completed:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold;">Month ${monthJustCompleted} of ${investment.autoCompoundMonths}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong style="color: #10B981;">Month ${monthJustCompleted} Gross Return:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedSweptBTC} BTC (≈ $${formattedSweptUSD} USD)</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong style="color: #10B981;">Month ${monthJustCompleted} Net Profit:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedMonthNetProfitBTC} BTC (≈ $${formattedMonthNetProfitUSD} USD)</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Next Month Begins:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} on ${formattedNextMonthStart}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Principal Restored For Next Month:</strong></td>
+                          <td style="padding: 8px 0; text-align: right;">${formattedResetPrincipalBTC} BTC (≈ $${formattedResetPrincipalUSD} USD)</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>Final Contract Maturity:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; color: #F7A600;">${formattedFinalMaturityDate}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #E2E8F0;">
+                          <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
+                          <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
+                        </tr>
+                      </table>
+                    </div>
+
+                    <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                      <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">What Happens Next</p>
+                      <p style="color: #78350F; margin: 0; font-size: 14px;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths} has begun. Your principal of ${formattedResetPrincipalBTC} BTC is now mining again. Your next monthly payout lands in your Matured Wallet at the end of Month ${investment.currentMonth}, and your final payout lands at the end of Month ${investment.autoCompoundMonths} on ${formattedFinalMaturityDate}.</p>
+                    </div>
+
+                    <div style="text-align: center; margin: 30px 0;">
+                      <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Your Contract</a>
+                    </div>
+
+                    <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedNextMonthStart}</p>
+                  </div>
+
+                  <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+                      <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
+                      <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
+                    </p>
+                  </div>
+                </div>
+              `;
+
+              await mailTransporter.sendMail({
+                from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+                to: user.email,
+                subject: monthlySubject,
+                html: emailHtml
+              });
+
+              console.log(`📧 [CRON] Monthly payout email sent to ${user.email} (Month ${monthJustCompleted} of ${investment.autoCompoundMonths})`);
+            } catch (emailError) {
+              console.error(`❌ [CRON] Failed to send monthly payout email for ${investment._id}:`, emailError);
+            }
+
+          } else {
+            // ===================================================
+            // ADVANCE TO NEXT CYCLE WITHIN THE SAME MONTH
+            // (only reachable for multi-month contracts)
+            // ===================================================
+            investment.currentCycle += 1;
+            const newCycleNumber = investment.currentCycle;
+
+            const nextIncomingUSD = cycleReturnUSD;
+            const nextIncomingBTC = cycleReturnBTC;
+
+            const newHashpower = calculateHashpower(
+              nextIncomingUSD,
+              plan.percentage,
+              plan.duration,
+              currentBTCPrice
+            );
+            investment.currentHashrate = newHashpower;
+            investment.hashrateHistory.push({
+              cycleNumber: newCycleNumber,
+              monthNumber: investment.currentMonth,
+              hashrate: newHashpower,
+              btcPriceAtCalculation: currentBTCPrice,
+              calculatedAt: now
+            });
+
+            const newCycleStart = now;
+            const newCycleEnd = new Date(newCycleStart.getTime() + plan.duration * 60 * 60 * 1000);
+            investment.endDate = newCycleEnd;
+            investment.expectedReturn = nextIncomingUSD * (1 + planReturnDecimal);
+            investment.expectedReturnBTC = nextIncomingBTC * (1 + planReturnDecimal);
+
+            investment.cycleHistory.push({
+              cycleNumber: newCycleNumber,
+              monthNumber: investment.currentMonth,
+              incomingBalanceUSD: nextIncomingUSD,
+              incomingBalanceBTC: nextIncomingBTC,
+              feeUSD: 0,
+              feeBTC: 0,
+              netPrincipalUSD: nextIncomingUSD,
+              netPrincipalBTC: nextIncomingBTC,
+              returnUSD: 0,
+              returnBTC: 0,
+              btcPriceAtStart: currentBTCPrice,
+              startDate: newCycleStart,
+              endDate: newCycleEnd,
+              status: 'active'
+            });
+
+            await investment.save({ session });
+            await session.commitTransaction();
+
+            console.log(`✅ [CRON] Investment ${investment._id} advanced to month ${investment.currentMonth} cycle ${newCycleNumber}/${investment.cyclesPerMonth} (hashpower: ${newHashpower} TH/s)`);
+            advancedCount++;
           }
 
-        } else {
-          // ===================================================
-          // ADVANCE TO NEXT CYCLE WITHIN THE SAME MONTH
-          // (only reachable for multi-month contracts)
-          // ===================================================
-          investment.currentCycle += 1;
-          const newCycleNumber = investment.currentCycle;
-
-          const nextIncomingUSD = cycleReturnUSD;
-          const nextIncomingBTC = cycleReturnBTC;
-
-          const newHashpower = calculateHashpower(
-            nextIncomingUSD,
-            plan.percentage,
-            plan.duration,
-            currentBTCPrice
-          );
-          investment.currentHashrate = newHashpower;
-          investment.hashrateHistory.push({
-            cycleNumber: newCycleNumber,
-            monthNumber: investment.currentMonth,
-            hashrate: newHashpower,
-            btcPriceAtCalculation: currentBTCPrice,
-            calculatedAt: now
-          });
-
-          const newCycleStart = now;
-          const newCycleEnd = new Date(newCycleStart.getTime() + plan.duration * 60 * 60 * 1000);
-          investment.endDate = newCycleEnd;
-          investment.expectedReturn = nextIncomingUSD * (1 + planReturnDecimal);
-          investment.expectedReturnBTC = nextIncomingBTC * (1 + planReturnDecimal);
-
-          investment.cycleHistory.push({
-            cycleNumber: newCycleNumber,
-            monthNumber: investment.currentMonth,
-            incomingBalanceUSD: nextIncomingUSD,
-            incomingBalanceBTC: nextIncomingBTC,
-            feeUSD: 0,
-            feeBTC: 0,
-            netPrincipalUSD: nextIncomingUSD,
-            netPrincipalBTC: nextIncomingBTC,
-            returnUSD: 0,
-            returnBTC: 0,
-            btcPriceAtStart: currentBTCPrice,
-            startDate: newCycleStart,
-            endDate: newCycleEnd,
-            status: 'active'
-          });
-
-          await investment.save({ session });
-          await session.commitTransaction();
-
-          console.log(`✅ [CRON] Investment ${investment._id} advanced to month ${investment.currentMonth} cycle ${newCycleNumber}/${investment.cyclesPerMonth} (hashpower: ${newHashpower} TH/s)`);
-          advancedCount++;
+        } catch (investmentError) {
+          await session.abortTransaction();
+          console.error(`❌ [CRON] Transaction failed for investment ${investment._id}:`, investmentError);
+          failedCount++;
+        } finally {
+          session.endSession();
         }
-
-      } catch (investmentError) {
-        await session.abortTransaction();
-        console.error(`❌ [CRON] Transaction failed for investment ${investment._id}:`, investmentError);
-        failedCount++;
-      } finally {
-        session.endSession();
       }
+
+      const elapsedTime = Date.now() - startTime;
+      console.log(`📊 [CRON] Investment maturity check completed in ${elapsedTime}ms`);
+      console.log(`   ✅ Advanced to next cycle: ${advancedCount}`);
+      console.log(`   🔄 Month resets: ${resetCount}`);
+      console.log(`   ✅ Completed (final payout): ${completedCount}`);
+      console.log(`   ❌ Failed: ${failedCount}`);
+
+    } catch (error) {
+      console.error('❌ [CRON] Fatal error in investment maturity cron job:', error);
     }
-
-    const elapsedTime = Date.now() - startTime;
-    console.log(`📊 [CRON] Investment maturity check completed in ${elapsedTime}ms`);
-    console.log(`   ✅ Advanced to next cycle: ${advancedCount}`);
-    console.log(`   🔄 Month resets: ${resetCount}`);
-    console.log(`   ✅ Completed (final payout): ${completedCount}`);
-    console.log(`   ❌ Failed: ${failedCount}`);
-
-  } catch (error) {
-    console.error('❌ [CRON] Fatal error in investment maturity cron job:', error);
-  }
-};
-
-
-
-
-
-
-
+  };
 
 
 
