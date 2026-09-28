@@ -20834,6 +20834,8 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -21401,28 +21403,27 @@ app.post('/api/investments', protect, [
       };
 
       // --- Build the HTML for the monthly breakdown (for long-term contracts) ---
-      // Mobile-safe: fixed layout + break-word on every cell so nothing truncates.
       let monthlyBreakdownHtml = '';
       if (isLongTerm) {
         const breakdownRows = projection.monthlyBreakdown.map(m => `
           <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 8px 0; word-break: break-word; overflow-wrap: anywhere;">Month ${m.month}</td>
-            <td style="padding: 8px 0; text-align: right; word-break: break-word; overflow-wrap: anywhere;">$${m.startingPrincipalUSD.toLocaleString()}</td>
-            <td style="padding: 8px 0; text-align: right; font-weight: 600; color: #10B981; word-break: break-word; overflow-wrap: anywhere;">$${m.endingValueUSD.toLocaleString()}</td>
-            <td style="padding: 8px 0; text-align: right; color: #10B981; word-break: break-word; overflow-wrap: anywhere;">+$${m.profitUSD.toLocaleString()}</td>
+            <td style="padding: 8px 0;">Month ${m.month}</td>
+            <td style="padding: 8px 0; text-align: right;">$${m.startingPrincipalUSD.toLocaleString()}</td>
+            <td style="padding: 8px 0; text-align: right; font-weight: 600; color: #10B981;">$${m.endingValueUSD.toLocaleString()}</td>
+            <td style="padding: 8px 0; text-align: right; color: #10B981;">+$${m.profitUSD.toLocaleString()}</td>
           </tr>
         `).join('');
 
         monthlyBreakdownHtml = `
-          <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0; box-sizing: border-box; width: 100%; max-width: 100%;">
+          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
             <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Monthly Payout Schedule</h3>
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
               <thead>
                 <tr>
-                  <th style="text-align: left; padding-bottom: 8px; font-weight: 600; color: #64748B; word-break: break-word; overflow-wrap: anywhere;">Month</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B; word-break: break-word; overflow-wrap: anywhere;">Starting Capital</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B; word-break: break-word; overflow-wrap: anywhere;">Payout</th>
-                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B; word-break: break-word; overflow-wrap: anywhere;">Profit</th>
+                  <th style="text-align: left; padding-bottom: 8px; font-weight: 600; color: #64748B;">Month</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Starting Capital</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Payout</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Profit</th>
                 </tr>
               </thead>
               <tbody>
@@ -21432,40 +21433,6 @@ app.post('/api/investments', protect, [
           </div>
         `;
       }
-
-      // =============================================
-      // CONTRACT SUMMARY ROWS — MOBILE-SAFE
-      //
-      // Rendered as a fixed-layout 2-column table: 45% label / 55% value.
-      // Every cell gets word-break:break-word + overflow-wrap:anywhere so
-      // long BTC strings (0.00527416 BTC) and USD figures wrap inside the
-      // column instead of pushing the table wider than the screen — the
-      // root cause of the mobile truncation.
-      // =============================================
-      const summaryRows = [
-        { label: 'Gross Investment:', value: `${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})` },
-        { label: `Fees Charged (${projection.cycleFeePercent}%):`, value: `- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})`, tone: 'danger' },
-        { label: 'Initial Net Principal:', value: `${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})`, tone: 'bold' },
-        { label: 'Assigned Hashpower:', value: `${projection.hashpower.toLocaleString()} TH/s`, tone: 'bold' },
-        { label: 'Contract Duration:', value: isSingleCycle ? `Single Cycle (${plan.duration}h)` : `${requestedMonths} Month(s) — ${projection.cyclesPerMonth} cycles/month` },
-        { label: 'Cycle Start:', value: `${formattedStartDate}` },
-        { label: 'Final Payout Date:', value: `${formattedFinalEndDate}`, tone: 'gold' },
-        { label: 'Contract ID:', value: `${transaction.reference}`, tone: 'small' },
-      ];
-
-      const summaryRowsHtml = summaryRows.map((r, i) => {
-        const labelColor = '#0B0E11';
-        const valueColor = r.tone === 'danger' ? '#EF4444' : r.tone === 'gold' ? '#F7A600' : '#0B0E11';
-        const fontWeight = (r.tone === 'bold' || r.tone === 'danger' || r.tone === 'gold') ? '700' : '400';
-        const fontSize = r.tone === 'small' ? '11px' : '14px';
-        const borderTop = i > 0 ? 'border-top: 1px solid #E2E8F0;' : '';
-        return `
-          <tr style="${borderTop}">
-            <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: ${labelColor}; word-break: break-word; overflow-wrap: anywhere;">${r.label}</td>
-            <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: ${fontSize}; font-weight: ${fontWeight}; color: ${valueColor}; word-break: break-word; overflow-wrap: anywhere;">${r.value}</td>
-          </tr>
-        `;
-      }).join('');
 
       // --- Build the final email HTML ---
       const emailHtml = `
@@ -21506,66 +21473,97 @@ app.post('/api/investments', protect, [
             <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
 
             <!-- Contract Summary -->
-            <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0; box-sizing: border-box; width: 100%; max-width: 100%;">
+            <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
                 <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere;">
-                    ${summaryRowsHtml}
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed;">
+                    <tr>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Gross Investment:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong style="color: #EF4444;">Fees Charged (${projection.cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #EF4444; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Initial Net Principal:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Assigned Hashpower:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${projection.hashpower.toLocaleString()} TH/s</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract Duration:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${isSingleCycle ? `Single Cycle (${plan.duration}h)` : `${requestedMonths} Month(s) — ${projection.cyclesPerMonth} cycles/month`}</td>
+                    </tr>
+                     <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Cycle Start:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedStartDate}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Payout Date:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedFinalEndDate}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract ID:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-size: 11px; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${transaction.reference}</td>
+                    </tr>
                 </table>
             </div>
 
-            <!-- =============================================
-                 TOTAL MINING RETURN — PREMIUM CARD
-                 =============================================
-                 Redesigned for hierarchy + weight. Uses the same brand
-                 palette (green surface, gold BTC, green ROI) but layers
-                 an inner glass panel, an eyebrow label, and a hashpower
-                 footer so the card carries the message like a fintech
-                 confirmation, not a plain green block.
-
-                 Mobile-safe: every element uses width:100% + box-sizing
-                 so nothing can overflow the 320px viewport.
-                 ============================================= -->
-            <div class="email-card" style="background: linear-gradient(135deg, #ECFDF5 0%, #D1FAE5 100%); padding: 22px 20px 20px 20px; border-radius: 16px; margin: 20px 0; border: 1px solid #A7F3D0; box-sizing: border-box; width: 100%; max-width: 100%; box-shadow: 0 1px 0 rgba(16,185,129,0.08), inset 0 1px 0 rgba(255,255,255,0.6);">
-
-              <!-- Eyebrow -->
-              <p style="margin: 0 0 14px 0; text-align: center; font-size: 11px; letter-spacing: 2.2px; text-transform: uppercase; color: #065F46; font-weight: 800;">Total Mining Return at Contract End</p>
-
-              <!-- Hero amount -->
-              <div style="text-align: center; margin-bottom: 18px;">
-                <div style="font-size: 30px; line-height: 1.15; font-weight: 800; color: #F7A600; letter-spacing: -0.4px; word-break: break-word; overflow-wrap: anywhere;">
-                  +${formatted.totalReturnBTC} <span style="font-size: 18px; font-weight: 700; color: #B8860B;">BTC</span>
-                </div>
-                <div style="font-size: 15px; color: #B8860B; font-weight: 600; margin-top: 4px;">
-                  ≈ $${formatted.totalReturnUSD} USD
-                </div>
-              </div>
-
-              <!-- Inner glass panel: Net Profit + ROI -->
-              <table style="width: 100%; border-collapse: collapse; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere; background: rgba(255,255,255,0.7); border: 1px solid #A7F3D0; border-radius: 12px;">
+            <!-- ============================================
+                 TOTAL MINING RETURN — PREMIUM HERO CARD
+                 (inline-styled, mobile-safe, brand-gold accent)
+                 ============================================ -->
+            <div class="email-card" style="background: #0B0E11; border-radius: 16px; padding: 0; margin: 24px 0; overflow: hidden; border: 1px solid #1E2329;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
                 <tr>
-                  <td style="padding: 12px 14px; border-bottom: 1px solid #A7F3D0; word-break: break-word; overflow-wrap: anywhere;">
-                    <table style="width: 100%; border-collapse: collapse; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere;">
+                  <td style="padding: 24px 20px 8px 20px; text-align: center;">
+                    <p style="margin: 0; font-size: 11px; letter-spacing: 2.4px; text-transform: uppercase; color: #B7BDC6; font-weight: 700;">Total Mining Return at Contract End</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 4px 20px 2px 20px; text-align: center;">
+                    <p style="margin: 0; font-size: 34px; line-height: 1.1; font-weight: 800; color: #F7A600; letter-spacing: -0.6px; word-break: break-word; overflow-wrap: anywhere;">+${formatted.totalReturnBTC} BTC</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 2px 20px 20px 20px; text-align: center;">
+                    <p style="margin: 0; font-size: 15px; font-weight: 600; color: #E5E7EB;">≈ $${formatted.totalReturnUSD} USD</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 0 16px 18px 16px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed; background: #11151C; border: 1px solid #1E2329; border-radius: 12px;">
                       <tr>
-                        <td style="font-size: 13px; color: #065F46; font-weight: 600; text-align: left; padding: 0; word-break: break-word; overflow-wrap: anywhere;">Net Profit</td>
-                        <td style="font-size: 14px; color: #10B981; font-weight: 800; text-align: right; padding: 0; word-break: break-word; overflow-wrap: anywhere;">+$${formatted.totalProfitUSD} USD</td>
+                        <td style="padding: 14px 16px; border-bottom: 1px solid #1E2329;">
+                          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+                            <tr>
+                              <td style="font-size: 13px; color: #B7BDC6; font-weight: 600; text-align: left; padding: 0; vertical-align: middle;">Net Profit</td>
+                              <td style="font-size: 15px; color: #10B981; font-weight: 800; text-align: right; padding: 0; vertical-align: middle; word-break: break-word; overflow-wrap: anywhere;">+$${formatted.totalProfitUSD} USD</td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 14px 16px;">
+                          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+                            <tr>
+                              <td style="font-size: 13px; color: #B7BDC6; font-weight: 600; text-align: left; padding: 0; vertical-align: middle;">Return on Investment (ROI)</td>
+                              <td style="font-size: 15px; color: #F7A600; font-weight: 800; text-align: right; padding: 0; vertical-align: middle; word-break: break-word; overflow-wrap: anywhere;">${formatted.roiPercent}%</td>
+                            </tr>
+                          </table>
+                        </td>
                       </tr>
                     </table>
                   </td>
                 </tr>
                 <tr>
-                  <td style="padding: 12px 14px; word-break: break-word; overflow-wrap: anywhere;">
-                    <table style="width: 100%; border-collapse: collapse; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere;">
-                      <tr>
-                        <td style="font-size: 13px; color: #065F46; font-weight: 600; text-align: left; padding: 0; word-break: break-word; overflow-wrap: anywhere;">Return on Investment (ROI)</td>
-                        <td style="font-size: 14px; color: #10B981; font-weight: 800; text-align: right; padding: 0; word-break: break-word; overflow-wrap: anywhere;">${formatted.roiPercent}%</td>
-                      </tr>
-                    </table>
+                  <td style="padding: 0 20px 22px 20px; text-align: center;">
+                    <p style="margin: 0; font-size: 11px; letter-spacing: 0.4px; color: #8B93A1;">Assigned Hashpower: <strong style="color: #E5E7EB;">${projection.hashpower.toLocaleString()} TH/s</strong></p>
                   </td>
                 </tr>
               </table>
-
-              <!-- Hashpower footer -->
-              <p style="margin: 14px 0 0 0; text-align: center; font-size: 11.5px; color: #065F46; letter-spacing: 0.3px;">Assigned Hashpower: <strong style="color: #0B0E11;">${projection.hashpower.toLocaleString()} TH/s</strong></p>
             </div>
 
             <!-- Monthly Breakdown for long-term contracts -->
@@ -22370,16 +22368,16 @@ const completeMaturedInvestmentsCron = async () => {
             const compoundSummaryBlock = isLongTerm
               ? `
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract Duration:</strong></td>
-                  <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycles/month)</td>
+                  <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract Duration:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycles/month)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Month / Cycle:</strong></td>
-                  <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
+                  <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Month / Cycle:</strong></td>
+                  <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Cumulative Gross Return (All Cycles):</strong></td>
-                  <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; font-weight: 800; color: #10B981; word-break: break-word; overflow-wrap: anywhere;">${investment.cumulativeReturnBTC.toFixed(8)} BTC (≈ $${investment.cumulativeReturnUSD.toLocaleString()})</td>
+                  <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Cumulative Gross Return (All Cycles):</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${investment.cumulativeReturnBTC.toFixed(8)} BTC (≈ $${investment.cumulativeReturnUSD.toLocaleString()})</td>
                 </tr>
               `
               : '';
@@ -22430,44 +22428,86 @@ const completeMaturedInvestmentsCron = async () => {
                   <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
                   <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
 
-                  <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0; box-sizing: border-box; width: 100%; max-width: 100%;">
-                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                      <div>
-                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
-                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
-                      </div>
-                    </div>
-
-                    <table style="width: 100%; border-collapse: collapse; table-layout: fixed; word-break: break-word; overflow-wrap: anywhere;">
+                  <!-- ============================================
+                       MATURITY PAYOUT — PREMIUM HERO CARD
+                       (mirrors the confirmation hero card)
+                       ============================================ -->
+                  <div class="email-card" style="background: #0B0E11; border-radius: 16px; padding: 0; margin: 24px 0; overflow: hidden; border: 1px solid #1E2329;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
                       <tr>
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract Name:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">${plan.name}</td>
+                        <td style="padding: 24px 20px 8px 20px; text-align: center;">
+                          <p style="margin: 0; font-size: 11px; letter-spacing: 2.4px; text-transform: uppercase; color: #B7BDC6; font-weight: 700;">Payout Credited to Matured Wallet</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 4px 20px 2px 20px; text-align: center;">
+                          <p style="margin: 0; font-size: 34px; line-height: 1.1; font-weight: 800; color: #F7A600; letter-spacing: -0.6px; word-break: break-word; overflow-wrap: anywhere;">+${formattedGrossReturnBTC} BTC</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 2px 20px 20px 20px; text-align: center;">
+                          <p style="margin: 0; font-size: 15px; font-weight: 600; color: #E5E7EB;">≈ $${formattedGrossReturnUSD} USD</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 0 16px 18px 16px;">
+                          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed; background: #11151C; border: 1px solid #1E2329; border-radius: 12px;">
+                            <tr>
+                              <td style="padding: 14px 16px; border-bottom: 1px solid #1E2329;">
+                                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+                                  <tr>
+                                    <td style="font-size: 13px; color: #B7BDC6; font-weight: 600; text-align: left; padding: 0; vertical-align: middle;">Final Net Return</td>
+                                    <td style="font-size: 15px; color: #10B981; font-weight: 800; text-align: right; padding: 0; vertical-align: middle; word-break: break-word; overflow-wrap: anywhere;">+${formattedNetReturnBTC} BTC</td>
+                                  </tr>
+                                </table>
+                              </td>
+                            </tr>
+                            <tr>
+                              <td style="padding: 14px 16px;">
+                                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+                                  <tr>
+                                    <td style="font-size: 13px; color: #B7BDC6; font-weight: 600; text-align: left; padding: 0; vertical-align: middle;">New Matured Balance</td>
+                                    <td style="font-size: 15px; color: #F7A600; font-weight: 800; text-align: right; padding: 0; vertical-align: middle; word-break: break-word; overflow-wrap: anywhere;">${formattedNewMaturedBTC} BTC</td>
+                                  </tr>
+                                </table>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </div>
+
+                  <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                    <table style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+                      <tr>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Contract Name:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Cycle Net Principal:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Cycle Net Principal:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #EF4444; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Cycle Fee Charged (${cycleFeePercent}%):</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; font-weight: 700; color: #EF4444; word-break: break-word; overflow-wrap: anywhere;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong style="color: #EF4444;">Final Cycle Fee Charged (${cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #10B981; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Gross Return:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; font-weight: 700; color: #10B981; word-break: break-word; overflow-wrap: anywhere;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong style="color: #10B981;">Final Gross Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #10B981; word-break: break-word; overflow-wrap: anywhere;"><strong>Final Net Return:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; font-weight: 700; color: #10B981; word-break: break-word; overflow-wrap: anywhere;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong style="color: #10B981;">Final Net Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
                       </tr>
                       ${compoundSummaryBlock}
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>Completion Date:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">${formattedCompletionDate}</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>Completion Date:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedCompletionDate}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 6px 8px 0; vertical-align: top; width: 45%; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;"><strong>New Matured Wallet Balance:</strong></td>
-                        <td style="padding: 8px 0 8px 6px; vertical-align: top; width: 55%; text-align: right; font-size: 14px; font-weight: 700; color: #0B0E11; word-break: break-word; overflow-wrap: anywhere;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
+                        <td style="padding: 8px 8px 8px 0; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;"><strong>New Matured Wallet Balance:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; vertical-align: top; word-break: break-word; overflow-wrap: anywhere;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
                       </tr>
                     </table>
                   </div>
@@ -22792,8 +22832,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
 
 
 
