@@ -20813,22 +20813,148 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+// =============================================
+// CENTRALIZED CONTRACT PROJECTION CALCULATOR
+//
+// This is the single source of truth for all projections.
+// It is used by the frontend preview and the backend confirmation
+// email to ensure the user sees exactly what they get.
+//
+// It implements the "Monthly Reset Compounding" model:
+//   - Cycle 1 of Month 1 starts from the GROSS principal ($1,000).
+//   - Every cycle pays a fee on its incoming balance (including cycle 1).
+//   - Within a month, each cycle's return becomes the next cycle's incoming balance.
+//   - At each month boundary, the compounded result is "swept" as a payout,
+//     and the principal is RESET to the original NET principal.
+//   - totalReturnUSD is the sum of all monthly payouts.
+// =============================================
+function calculateContractProjection(principalUSD, plan, months, currentBtcPrice) {
+    const planPercentageDecimal = plan.percentage / 100;
+    const durationHours = plan.duration;
+    const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
+    const totalMonths = months === 0 ? 1 : months; // Treat 0 as a single cycle
+    const isSingleCycle = months === 0;
+    const feePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
+        ? plan.cycleFeePercent
+        : CYCLE_FEE_PERCENT;
+    const feeDecimal = feePercent / 100;
 
+    // Gross principal is the user's deposit.
+    const grossPrincipalUSD = principalUSD;
+    const grossPrincipalBTC = principalUSD / currentBtcPrice;
 
+    // The net principal that actually mines in cycle 1.
+    // This is also the reset value for all subsequent months.
+    const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
+    const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
+    const netPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
+    const netPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
 
+    // Hashpower is derived from the net principal.
+    const initialHashpower = calculateHashpower(
+        netPrincipalUSD,
+        plan.percentage,
+        durationHours,
+        currentBtcPrice
+    );
 
+    if (isSingleCycle) {
+        // A single cycle is its own complete contract.
+        const totalFeesUSD = firstCycleFeeUSD;
+        const totalFeesBTC = firstCycleFeeBTC;
+        const totalReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
+        const totalReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
+        const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
+        const totalProfitBTC = totalReturnBTC - grossPrincipalBTC;
+        const roiPercent = (totalProfitUSD / grossPrincipalUSD) * 100;
 
+        return {
+            grossPrincipalUSD,
+            grossPrincipalBTC,
+            netPrincipalUSD,
+            netPrincipalBTC,
+            totalFeesUSD,
+            totalFeesBTC,
+            totalReturnUSD,
+            totalReturnBTC,
+            totalProfitUSD,
+            totalProfitBTC,
+            hashpower: initialHashpower,
+            roiPercent,
+            totalMonths: 1,
+            cyclesPerMonth,
+            totalCycles: 1,
+            cycleFeePercent: feePercent,
+            monthlyBreakdown: [],
+        };
+    }
 
+    // --- Multi-Month Contract Logic ---
+    let totalFeesUSD = 0;
+    let totalReturnUSD = 0;
+    const monthlyBreakdown = [];
 
+    // Month 1 starts at the gross principal.
+    let monthStartingPrincipalUSD = grossPrincipalUSD;
 
+    for (let month = 1; month <= totalMonths; month++) {
+        let monthIncomingUSD = monthStartingPrincipalUSD;
+        let monthFeesUSD = 0;
 
+        for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
+            // Fee is charged on the incoming balance of EVERY cycle.
+            const cycleFeeUSD = monthIncomingUSD * feeDecimal;
+            monthFeesUSD += cycleFeeUSD;
 
+            const cycleNetUSD = monthIncomingUSD - cycleFeeUSD;
+            const cycleReturnUSD = cycleNetUSD * (1 + planPercentageDecimal);
 
+            // The output becomes the input for the next cycle.
+            monthIncomingUSD = cycleReturnUSD;
+        }
 
+        const monthReturnUSD = monthIncomingUSD; // The final value at the end of the month
 
+        totalFeesUSD += monthFeesUSD;
+        totalReturnUSD += monthReturnUSD;
 
+        monthlyBreakdown.push({
+            month,
+            startingPrincipalUSD: monthStartingPrincipalUSD,
+            endingValueUSD: monthReturnUSD,
+            profitUSD: monthReturnUSD - monthStartingPrincipalUSD,
+            cyclesInMonth: cyclesPerMonth,
+            feesPaidUSD: monthFeesUSD,
+        });
 
+        // CRITICAL: Month boundary reset.
+        // For month 2 onwards, the principal is reset to the original net principal.
+        monthStartingPrincipalUSD = netPrincipalUSD;
+    }
 
+    const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
+    const roiPercent = (totalProfitUSD / grossPrincipalUSD) * 100;
+
+    return {
+        grossPrincipalUSD,
+        grossPrincipalBTC,
+        netPrincipalUSD,
+        netPrincipalBTC,
+        totalFeesUSD,
+        totalFeesBTC: totalFeesUSD / currentBtcPrice, // Approximation for display
+        totalReturnUSD,
+        totalReturnBTC: totalReturnUSD / currentBtcPrice, // Approximation for display
+        totalProfitUSD,
+        totalProfitBTC: totalProfitUSD / currentBtcPrice, // Approximation for display
+        hashpower: initialHashpower,
+        roiPercent,
+        totalMonths,
+        cyclesPerMonth,
+        totalCycles: totalMonths * cyclesPerMonth,
+        cycleFeePercent: feePercent,
+        monthlyBreakdown,
+    };
+}
 
 
 // =============================================
@@ -21456,7 +21582,7 @@ app.post('/api/investments', protect, [
                         <td style="padding: 8px 0; text-align: right;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Total Fees Deducted (${projection.cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Total Estimated Fees (${projection.cycleFeePercent}%):</strong></td>
                         <td style="padding: 8px 0; text-align: right; color: #EF4444;">- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
@@ -22701,6 +22827,13 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
+
+
+
+
+
+
+
 
 
 
