@@ -20816,21 +20816,29 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
 // =============================================
-// CREATE INVESTMENT (with optional auto-compounding)
+// CREATE INVESTMENT
 // POST /api/investments
 //
+// CONTRACT WITH THE FRONTEND:
+//   autoCompoundMonths = 0   → single cycle (one cycle, no auto-compound)
+//   autoCompoundMonths = 1   → 1-month auto-compounding contract
+//   autoCompoundMonths = N   → N-month auto-compounding contract
+//
+// IMPORTANT: the previous version collapsed 0 and 1 into "1", which made
+// a "Single Cycle" selection behave like a 1-month contract. This rewrite
+// preserves the distinction end-to-end.
+//
 // Fee is read from plan.cycleFeePercent (falls back to global CYCLE_FEE_PERCENT).
-// autoCompoundMonths is validated against plan.autoCompoundOptions and plan.allowAutoCompound.
+// autoCompoundMonths is validated against plan.autoCompoundOptions when > 0.
 // =============================================
 app.post('/api/investments', protect, [
   body('planId').notEmpty().withMessage('Plan ID is required').isMongoId().withMessage('Invalid Plan ID'),
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be a positive number'),
   body('balanceType').isIn(['main', 'matured']).withMessage('Balance type must be either "main" or "matured"'),
-  // autoCompoundMonths is validated against the plan's own allowed options below.
-  body('autoCompoundMonths').optional({ nullable: true }).isInt({ min: 1, max: 12 })
-    .withMessage('Auto-compound months must be an integer between 1 and 12')
+  // 0 = single cycle. 1..12 = N-month contract.
+  body('autoCompoundMonths').optional({ nullable: true }).isInt({ min: 0, max: 12 })
+    .withMessage('autoCompoundMonths must be an integer between 0 and 12 (0 = single cycle)')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -20910,37 +20918,47 @@ app.post('/api/investments', protect, [
     }
 
     // =============================================
-    // AUTO-COMPOUND VALIDATION (per-plan)
+    // AUTO-COMPOUND INPUT NORMALIZATION
+    //
+    // 0 or null/undefined → single cycle
+    // >=1                 → N-month contract
     // =============================================
     const planAutoCompoundOptions = Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length > 0
       ? plan.autoCompoundOptions
       : [1, 3, 6, 9, 12];
     const planAllowAutoCompound = plan.allowAutoCompound !== false;
 
-    // Normalize input: null/undefined/0/1 → normal hourly mode (1 month, single cycle)
-    let requestedMonths = (autoCompoundMonths === null || autoCompoundMonths === undefined)
-      ? 1
+    const rawMonths = (autoCompoundMonths === null || autoCompoundMonths === undefined)
+      ? 0
       : Number(autoCompoundMonths);
 
-    if (!Number.isInteger(requestedMonths) || requestedMonths < 1) {
+    if (!Number.isInteger(rawMonths) || rawMonths < 0) {
       return res.status(400).json({
         status: 'fail',
-        message: 'Invalid auto-compound duration'
+        message: 'Invalid auto-compound duration. Use 0 for single cycle, or a positive integer for multi-month.'
       });
     }
 
-    if (requestedMonths > 1 && !planAllowAutoCompound) {
-      return res.status(400).json({
-        status: 'fail',
-        message: `Long-term auto-compound is not available for the ${plan.name} plan. Please use the normal hourly rental.`
-      });
-    }
+    const isSingleCycle = rawMonths === 0;
 
-    if (requestedMonths > 1 && !planAutoCompoundOptions.includes(requestedMonths)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: `Auto-compound duration must be one of: ${planAutoCompoundOptions.join(', ')} months`
-      });
+    // For a single cycle we still store autoCompoundMonths = 1 (schema enum),
+    // but isSingleCycle drives every downstream decision. This keeps the
+    // existing schema intact while preserving the intent.
+    const requestedMonths = isSingleCycle ? 1 : rawMonths;
+
+    if (!isSingleCycle) {
+      if (!planAllowAutoCompound) {
+        return res.status(400).json({
+          status: 'fail',
+          message: `Long-term auto-compound is not available for the ${plan.name} plan. Please use the single-cycle option.`
+        });
+      }
+      if (!planAutoCompoundOptions.includes(requestedMonths)) {
+        return res.status(400).json({
+          status: 'fail',
+          message: `Auto-compound duration must be one of: ${planAutoCompoundOptions.join(', ')} months`
+        });
+      }
     }
 
     // =============================================
@@ -20957,8 +20975,8 @@ app.post('/api/investments', protect, [
 
     if (existingActiveInvestment) {
       const remainingCycles = (existingActiveInvestment.totalCycles || 1) - (existingActiveInvestment.currentCycle || 1) + 1;
-      const isAutoCompound = existingActiveInvestment.isAutoCompoundActive && existingActiveInvestment.totalCycles > 1;
-      const autoCompoundMsg = isAutoCompound
+      const existingIsAuto = existingActiveInvestment.isAutoCompoundActive && existingActiveInvestment.totalCycles > 1;
+      const autoCompoundMsg = existingIsAuto
         ? ` It is currently on cycle ${existingActiveInvestment.currentCycle} of ${existingActiveInvestment.totalCycles} (${remainingCycles} cycle(s) remaining).`
         : ` It has ${remainingCycles} cycle(s) remaining.`;
 
@@ -20990,10 +21008,19 @@ app.post('/api/investments', protect, [
     }
 
     // =============================================
-    // CALCULATE CYCLES & DYNAMIC HASHPOWER (INTERNAL)
+    // CALCULATE CYCLES
+    //
+    // single cycle → totalCycles === cyclesPerMonth (only the first month's worth)
+    //               BUT the contract must stop after ONE cycle, not one month.
+    //               We enforce that by setting autoCompoundMonths = 1 and
+    //               capping totalCycles to 1 for single-cycle contracts.
+    // N-month     → totalCycles = N * cyclesPerMonth
     // =============================================
-    const totalCycles = calculateTotalCycles(requestedMonths, plan.duration);
     const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
+
+    const totalCycles = isSingleCycle
+      ? 1
+      : requestedMonths * cyclesPerMonth;
 
     const amountInBTC = amount / btcPrice;
 
@@ -21043,7 +21070,7 @@ app.post('/api/investments', protect, [
     console.log(`   Matured Wallet BTC: ${maturedBitcoinBalance}`);
     console.log(`   Investment: $${amount} USD = ${amountInBTC.toFixed(8)} BTC`);
     console.log(`   BTC Price from API: $${btcPrice}`);
-    console.log(`   Auto-compound: ${requestedMonths > 1 ? requestedMonths + ' month(s)' : 'single cycle (normal hourly rental)'}`);
+    console.log(`   Contract Type: ${isSingleCycle ? 'SINGLE CYCLE' : requestedMonths + '-MONTH AUTO-COMPOUND'}`);
     console.log(`   Total Cycles: ${totalCycles}`);
     console.log(`   Cycles per Month: ${cyclesPerMonth}`);
     console.log(`   Cycle Fee: ${cycleFeePercent}% (source: ${typeof plan.cycleFeePercent === 'number' ? 'plan' : 'global'})`);
@@ -21113,8 +21140,15 @@ app.post('/api/investments', protect, [
     await user.save();
 
     // =============================================
-    // CREATE INVESTMENT RECORD (with monthly-reset fields)
+    // CREATE INVESTMENT RECORD
+    //
+    // Key semantics:
+    //   isSingleCycle         → totalCycles = 1, isAutoCompoundActive = false
+    //   !isSingleCycle        → totalCycles = N * cyclesPerMonth,
+    //                           isAutoCompoundActive = (totalCycles > 1)
     // =============================================
+    const isAutoCompoundActive = !isSingleCycle && totalCycles > 1;
+
     const investment = await Investment.create({
       user: userId,
       plan: planId,
@@ -21142,12 +21176,15 @@ app.post('/api/investments', protect, [
       // =============================================
       // MONTHLY-RESET / AUTO-COMPOUND FIELDS
       // =============================================
+      // Schema enum is [1, 3, 6, 9, 12]. For single cycle we still store 1,
+      // but totalCycles = 1 and isAutoCompoundActive = false keep it a
+      // true single-cycle contract.
       autoCompoundMonths: requestedMonths,
       totalCycles: totalCycles,
       cyclesPerMonth: cyclesPerMonth,
       currentCycle: 1,
       currentMonth: 1,
-      isAutoCompoundActive: totalCycles > 1,
+      isAutoCompoundActive: isAutoCompoundActive,
       monthStartingPrincipalUSD: netPrincipalUSD,
       monthStartingPrincipalBTC: netPrincipalBTC,
       monthToDateReturnUSD: 0,
@@ -21183,6 +21220,10 @@ app.post('/api/investments', protect, [
     // =============================================
     // TRANSACTION RECORD
     // =============================================
+    const contractLabel = isSingleCycle
+      ? 'single cycle (one cycle only)'
+      : `${requestedMonths}-month auto-compounding contract (${cyclesPerMonth} cycles/month)`;
+
     const transaction = await Transaction.create({
       user: userId,
       type: 'investment',
@@ -21201,6 +21242,7 @@ app.post('/api/investments', protect, [
         cyclesPerMonth: cyclesPerMonth,
         balanceType: balanceType,
         autoCompoundMonths: requestedMonths,
+        isSingleCycle: isSingleCycle,
         investmentFeeUSD: firstCycleFeeUSD,
         investmentFeeBTC: firstCycleFeeBTC,
         cycleFeePercent: cycleFeePercent,
@@ -21213,7 +21255,7 @@ app.post('/api/investments', protect, [
         expectedReturnUSD: firstCycleReturnUSD,
         assignedHashrate: initialHashpower,
         transactionType: 'debit',
-        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${requestedMonths > 1 ? ` for ${requestedMonths} month(s) (${cyclesPerMonth} cycles/month)` : ' (single cycle, normal hourly rental)'}. ${cycleFeePercent}% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net principal: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
+        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan for ${contractLabel}. ${cycleFeePercent}% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net principal: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
       },
       fee: firstCycleFeeUSD,
       netAmount: netPrincipalUSD
@@ -21238,6 +21280,7 @@ app.post('/api/investments', protect, [
         totalCycles: totalCycles,
         cyclesPerMonth: cyclesPerMonth,
         autoCompoundMonths: requestedMonths,
+        isSingleCycle: isSingleCycle,
         incomingBalanceUSD: incomingBalanceUSD,
         incomingBalanceBTC: incomingBalanceBTC,
         netPrincipalUSD: netPrincipalUSD,
@@ -21293,6 +21336,8 @@ app.post('/api/investments', protect, [
         endDate: firstCycleEndDate,
         balanceTypeUsed: balanceType,
         autoCompoundMonths: requestedMonths,
+        isSingleCycle: isSingleCycle,
+        isAutoCompoundActive: isAutoCompoundActive,
         totalCycles: totalCycles,
         cyclesPerMonth: cyclesPerMonth,
         assignedHashrate: initialHashpower,
@@ -21311,7 +21356,7 @@ app.post('/api/investments', protect, [
     });
 
     // =============================================
-    // REFERRAL COMMISSIONS (unchanged)
+    // REFERRAL COMMISSIONS
     // =============================================
     await calculateReferralCommissions(investment);
 
@@ -21377,7 +21422,8 @@ app.post('/api/investments', protect, [
       const formattedNewActiveBTC = newActiveBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
       const formattedNewActiveUSD = newActiveUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-      const isLongTerm = requestedMonths > 1 && totalCycles > 1;
+      // Email uses the SAME isSingleCycle flag as the contract logic.
+      const isLongTerm = !isSingleCycle;
 
       const mailTransporter = infoTransporter;
 
@@ -21399,7 +21445,7 @@ app.post('/api/investments', protect, [
                 </svg>
               </div>
               <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
-              <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `${requestedMonths}-month contract - ${cyclesPerMonth} cycles/month` : 'Your mining contract is now active'}</p>
+              <p style="color: #065F46; font-size: 13px; margin: 0;">${isLongTerm ? `${requestedMonths}-month contract - ${cyclesPerMonth} cycles/month` : 'Single cycle - one cycle only'}</p>
             </div>
 
             <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
@@ -21418,6 +21464,10 @@ app.post('/api/investments', protect, [
                 <tr>
                   <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
                   <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
+                </tr>
+                <tr style="border-top: 1px solid #E2E8F0;">
+                  <td style="padding: 8px 0;"><strong>Contract Type:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${isLongTerm ? `${requestedMonths}-Month Auto-Compounding` : 'Single Cycle'}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
                   <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
@@ -21470,7 +21520,7 @@ app.post('/api/investments', protect, [
               <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Mining Information</p>
               ${isLongTerm
                 ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract runs for <strong>${requestedMonths} month(s)</strong>, with <strong>${cyclesPerMonth} cycles</strong> per month. At each month boundary, the compounded growth is swept to your Matured Wallet and the principal resets, producing linear month-over-month growth. Final payout lands in your Matured Wallet at the end of month ${requestedMonths}.</p>`
-                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can then rent again or activate a multi-month contract.</p>`
+                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your mining contract will run for <strong>one cycle only (${plan.duration} hours)</strong>. The full cycle return will be credited to your Matured Wallet when the cycle ends. No automatic renewal.</p>`
               }
             </div>
 
@@ -21495,7 +21545,7 @@ app.post('/api/investments', protect, [
       await mailTransporter.sendMail({
         from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
         to: user.email,
-        subject: `✅ Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month Contract)` : ''} - ₿itHash Capital`,
+        subject: `✅ Mining Contract Activated${isLongTerm ? ` (${requestedMonths}-Month Contract)` : ' (Single Cycle)'} - ₿itHash Capital`,
         html: emailHtml
       });
 
@@ -21530,6 +21580,7 @@ app.post('/api/investments', protect, [
           totalCycles: totalCycles,
           cyclesPerMonth: cyclesPerMonth,
           autoCompoundMonths: requestedMonths,
+          isSingleCycle: isSingleCycle,
           isAutoCompoundActive: investment.isAutoCompoundActive,
           cycleDurationHours: plan.duration,
           firstCycleEndDate: investment.endDate,
@@ -21771,7 +21822,6 @@ async function getRealTimeBitcoinPrice() {
     errors.push(`Gemini: ${err.message}`);
   }
 
-  // If all APIs failed, log error and throw
   console.error('❌ All BTC price APIs failed. Errors:', errors);
   throw new Error('Unable to fetch current BTC price. Please try again later.');
 }
@@ -21779,14 +21829,23 @@ async function getRealTimeBitcoinPrice() {
 
 // =============================================
 // INVESTMENT MATURITY CRON
-// Handles: per-cycle fee (plan-driven), in-month cycle advance,
-// month-boundary sweep + principal reset, and final payout
-// (LINEAR month-over-month).
 //
-// The cycle fee is read from the parent plan on every cycle:
-//   cycleFeePercent = plan.cycleFeePercent ?? CYCLE_FEE_PERCENT
-// so per-plan overrides are respected from investment creation
-// through maturity.
+// Handles:
+//   - per-cycle fee (plan-driven, read from the parent plan on every cycle)
+//   - in-month cycle advance
+//   - month-boundary sweep + principal reset
+//   - final payout (LINEAR month-over-month)
+//
+// SINGLE-CYCLE CONTRACTS:
+//   The investment endpoint stores totalCycles = 1 and
+//   isAutoCompoundActive = false for single-cycle investments.
+//   Because isLastCycleOfMonth = (currentCycle >= cyclesPerMonth) is
+//   FALSE on cycle 1 for any plan with cyclesPerMonth > 1, and because
+//   contractComplete is computed from isLastCycleOfMonth && isLastMonth,
+//   a single-cycle contract would otherwise advance inside its first
+//   month. To stop that, the cron treats totalCycles as the hard cap:
+//   when the current cycle's cycleNumber reaches totalCycles, the
+//   contract completes regardless of month boundaries.
 // =============================================
 const completeMaturedInvestmentsCron = async () => {
   const startTime = Date.now();
@@ -21949,17 +22008,28 @@ const completeMaturedInvestmentsCron = async () => {
         }], { session });
 
         // ===================================================
-        // DECIDE NEXT STEP: advance, month-reset, or final payout
+        // DECIDE NEXT STEP
+        //
+        // The contract is complete when EITHER:
+        //   (a) the cycle that just closed is the last cycle of the last
+        //       month of the contract (isLastCycleOfMonth && isLastMonth), OR
+        //   (b) the cycle that just closed has reached totalCycles.
+        //
+        // (b) is what makes single-cycle contracts end after exactly one
+        // cycle. Without it, a plan with cyclesPerMonth > 1 would never
+        // hit (a) on cycle 1 and would incorrectly advance.
         // ===================================================
         const isLastCycleOfMonth = investment.currentCycle >= investment.cyclesPerMonth;
         const isLastMonth = investment.currentMonth >= investment.autoCompoundMonths;
-        const contractComplete = isLastCycleOfMonth && isLastMonth;
+        const reachedTotalCycles = investment.currentCycle >= investment.totalCycles;
+
+        const contractComplete = (isLastCycleOfMonth && isLastMonth) || reachedTotalCycles;
 
         if (contractComplete) {
           // ===================================================
-          // FINAL PAYOUT (contract's last month, last cycle)
+          // FINAL PAYOUT
           // ===================================================
-          console.log(`[CRON] Investment ${investment._id} completing: final cycle of final month`);
+          console.log(`[CRON] Investment ${investment._id} completing (cycle ${investment.currentCycle} / totalCycles ${investment.totalCycles})`);
 
           investment.status = 'completed';
           investment.isAutoCompoundActive = false;
@@ -22016,6 +22086,7 @@ const completeMaturedInvestmentsCron = async () => {
               finalMonth: investment.currentMonth,
               totalCycles: investment.totalCycles,
               autoCompoundMonths: investment.autoCompoundMonths || 1,
+              isSingleCycle: !investment.isAutoCompoundActive && investment.totalCycles === 1,
               cumulativeReturnUSD: investment.cumulativeReturnUSD,
               cumulativeReturnBTC: investment.cumulativeReturnBTC,
               transactionType: 'credit',
@@ -22103,7 +22174,8 @@ const completeMaturedInvestmentsCron = async () => {
             const formattedNewMaturedBTC = newMaturedBTCBalance.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
             const formattedNewMaturedUSD = newMaturedUSDBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-            const isLongTerm = (investment.autoCompoundMonths && investment.totalCycles > 1);
+            // Long-term only if the contract actually had multiple months
+            const isLongTerm = (investment.autoCompoundMonths && investment.autoCompoundMonths > 1 && investment.totalCycles > 1);
 
             const compoundSummaryBlock = isLongTerm
               ? `
@@ -22246,13 +22318,12 @@ const completeMaturedInvestmentsCron = async () => {
 
         } else if (isLastCycleOfMonth) {
           // ===================================================
-          // MONTH BOUNDARY: SWEEP the month's compounded growth
-          // and RESET principal to the original net starting value.
+          // MONTH BOUNDARY (only reachable for multi-month contracts)
+          // SWEEP the month's compounded growth and RESET principal.
           // ===================================================
           const sweptUSD = investment.monthToDateReturnUSD;
           const sweptBTC = investment.monthToDateReturnBTC;
 
-          // Credit the entire month's compounded result to the matured wallet
           if (!user.balances) {
             user.balances = { main: new Map(), active: new Map(), matured: new Map() };
           }
@@ -22264,7 +22335,6 @@ const completeMaturedInvestmentsCron = async () => {
           const currentMaturedUSD = user.balances.matured.get('usd') || 0;
           user.balances.matured.set('usd', currentMaturedUSD + sweptUSD);
 
-          // Remove the swept growth from active, keeping the original net principal
           const currentActiveBTC = user.balances.active?.get('btc') || 0;
           const newActiveBTC = currentActiveBTC - sweptBTC;
           if (newActiveBTC <= 0.00000001) {
@@ -22283,7 +22353,6 @@ const completeMaturedInvestmentsCron = async () => {
 
           await user.save({ session });
 
-          // Record the month sweep
           const sweepRef = `MONTH-SWEEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
           await Transaction.create([{
             user: userId,
@@ -22306,17 +22375,14 @@ const completeMaturedInvestmentsCron = async () => {
             exchangeRateAtTime: currentBTCPrice
           }], { session });
 
-          // Advance to next month, reset cycle counter and month-to-date tracking
           investment.currentMonth += 1;
           investment.currentCycle = 1;
           investment.monthToDateReturnUSD = 0;
           investment.monthToDateReturnBTC = 0;
 
-          // Principal resets to the original net starting value for the new month
           const resetPrincipalUSD = investment.monthStartingPrincipalUSD;
           const resetPrincipalBTC = investment.monthStartingPrincipalBTC;
 
-          // Recalculate hashpower for the new month's first cycle
           const resetHashpower = calculateHashpower(
             resetPrincipalUSD,
             plan.percentage,
@@ -22338,7 +22404,6 @@ const completeMaturedInvestmentsCron = async () => {
           investment.expectedReturn = resetPrincipalUSD * (1 + planReturnDecimal);
           investment.expectedReturnBTC = resetPrincipalBTC * (1 + planReturnDecimal);
 
-          // Push the first cycle of the new month (fee will be applied when it closes)
           investment.cycleHistory.push({
             cycleNumber: 1,
             monthNumber: investment.currentMonth,
@@ -22365,7 +22430,7 @@ const completeMaturedInvestmentsCron = async () => {
         } else {
           // ===================================================
           // ADVANCE TO NEXT CYCLE WITHIN THE SAME MONTH
-          // Cycle return becomes the next cycle's incoming balance.
+          // (only reachable for multi-month contracts)
           // ===================================================
           investment.currentCycle += 1;
           const newCycleNumber = investment.currentCycle;
@@ -22373,7 +22438,6 @@ const completeMaturedInvestmentsCron = async () => {
           const nextIncomingUSD = cycleReturnUSD;
           const nextIncomingBTC = cycleReturnBTC;
 
-          // Recalculate hashpower for the new cycle using fresh BTC price
           const newHashpower = calculateHashpower(
             nextIncomingUSD,
             plan.percentage,
@@ -22395,7 +22459,6 @@ const completeMaturedInvestmentsCron = async () => {
           investment.expectedReturn = nextIncomingUSD * (1 + planReturnDecimal);
           investment.expectedReturnBTC = nextIncomingBTC * (1 + planReturnDecimal);
 
-          // Push the new cycle (its fee will be applied when it closes)
           investment.cycleHistory.push({
             cycleNumber: newCycleNumber,
             monthNumber: investment.currentMonth,
@@ -22454,7 +22517,6 @@ cron.schedule('*/10 * * * * *', async () => {
   console.log(`${'='.repeat(70)}`);
 
   try {
-    // Find matured cycles first to log which users were found
     const now = new Date();
     const maturedInvestments = await Investment.find({
       status: 'active',
@@ -22472,13 +22534,16 @@ cron.schedule('*/10 * * * * *', async () => {
         const cycleNum = investment.currentCycle || 1;
         const monthNum = investment.currentMonth || 1;
         const cyclesPerMonth = investment.cyclesPerMonth || 1;
-        const isAuto = investment.autoCompoundMonths > 1;
+        const totalCycles = investment.totalCycles || 1;
+        const isSingle = totalCycles === 1 && !investment.isAutoCompoundActive;
+        const isAuto = investment.isAutoCompoundActive === true;
 
         console.log(`\n👤 USER FOUND: ${userEmail} (${userName})`);
         console.log(`   ├─ Investment ID: ${investment._id}`);
         console.log(`   ├─ Plan: ${planName}`);
+        console.log(`   ├─ Contract Type: ${isSingle ? 'SINGLE CYCLE' : (isAuto ? 'AUTO-COMPOUND' : 'UNKNOWN')}`);
         console.log(`   ├─ Month: ${monthNum} of ${investment.autoCompoundMonths || 1}`);
-        console.log(`   ├─ Cycle: ${cycleNum} of ${cyclesPerMonth} (this month) ${isAuto ? '(auto-compounding)' : '(single cycle)'}`);
+        console.log(`   ├─ Cycle: ${cycleNum} of ${cyclesPerMonth} (this month), ${cycleNum} of ${totalCycles} (total)`);
         console.log(`   ├─ Current Hashpower: ${investment.currentHashrate || 0} TH/s`);
         console.log(`   ├─ Month-Starting Principal: ${investment.monthStartingPrincipalBTC?.toFixed(8) || '0'} BTC`);
         console.log(`   ├─ Month-to-Date Return: ${investment.monthToDateReturnBTC?.toFixed(8) || '0'} BTC`);
@@ -22490,7 +22555,6 @@ cron.schedule('*/10 * * * * *', async () => {
       console.log(`📭 [CRON SCHEDULER] No matured investment cycles found at ${runTime}`);
     }
 
-    // Run the actual cron job
     await completeMaturedInvestmentsCron();
 
     const endTime = new Date().toISOString();
@@ -22508,7 +22572,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
 
 
 
