@@ -20819,6 +20819,16 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
+
+
+
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -21419,15 +21429,35 @@ app.post('/api/investments', protect, [
 
       // --- Build the final email HTML ---
       const emailHtml = `
-        <div style="font-family: 'Inter', sans-serif; width: 100%; max-width: 100%; margin: 0 auto; background: #FFFFFF; box-sizing: border-box;">
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+          <style>
+            /* Full-width mobile view: cards inside email body must never be cut or truncated */
+            @media only screen and (max-width: 600px) {
+              .email-wrapper { width: 100% !important; max-width: 100% !important; margin: 0 !important; border-radius: 0 !important; }
+              .email-body { padding: 16px !important; }
+              .email-card { width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; padding: 16px !important; margin: 16px 0 !important; overflow: visible !important; }
+              .email-card table { width: 100% !important; table-layout: fixed !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
+              .email-card td, .email-card th { white-space: normal !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
+              .email-card h1, .email-card h2, .email-card h3 { font-size: 18px !important; line-height: 1.4 !important; }
+              .email-card p, .email-card span, .email-card div { font-size: 14px !important; line-height: 1.6 !important; }
+              .email-cta { padding: 12px 24px !important; width: auto !important; max-width: 100% !important; display: block !important; box-sizing: border-box !important; text-align: center !important; }
+            }
+          </style>
+        </head>
+        <body style="margin: 0; padding: 0; width: 100%; -webkit-text-size-adjust: 100%; background: #FFFFFF;">
+        <div class="email-wrapper" style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF; width: 100%;">
           <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
             <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
             <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
             <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
           </div>
 
-          <div style="padding: 30px; background: #FFFFFF; box-sizing: border-box; width: 100%;">
-            <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+          <div class="email-body" style="padding: 30px; background: #FFFFFF;">
+            <div class="email-card" style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
               <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
               <p style="color: #065F46; font-size: 13px; margin: 0;">Your ${isSingleCycle ? 'single-cycle' : `${requestedMonths}-month`} contract is now live.</p>
             </div>
@@ -21436,12 +21466,12 @@ app.post('/api/investments', protect, [
             <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
 
             <!-- Contract Summary -->
-            <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+            <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
                 <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; word-wrap: break-word;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                     <tr>
-                        <td style="padding: 8px 0; width: 50%;"><strong>Gross Investment:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; width: 50%;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
+                        <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong style="color: #EF4444;">Fees Charged (${projection.cycleFeePercent}%):</strong></td>
@@ -21469,16 +21499,16 @@ app.post('/api/investments', protect, [
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${transaction.reference}</td>
+                        <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
                     </tr>
                 </table>
             </div>
 
             <!-- Total Mining Return -->
-            <div style="background: #ECFDF5; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #A7F3D0;">
+            <div class="email-card" style="background: #ECFDF5; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #A7F3D0;">
               <h3 style="font-size: 16px; font-weight: 600; color: #065F46; margin: 0 0 16px 0; text-align: center;">Total Mining Return at Contract End</h3>
               <div style="text-align: center; margin-bottom: 16px;">
-                <div style="font-size: 28px; font-weight: bold; color: #F7A600; margin-bottom: 4px; word-break: break-word;">
+                <div style="font-size: 28px; font-weight: bold; color: #F7A600; margin-bottom: 4px;">
                   +${formatted.totalReturnBTC} BTC
                 </div>
                 <div style="font-size: 16px; color: #B8860B; font-weight: 600;">
@@ -21486,10 +21516,10 @@ app.post('/api/investments', protect, [
                 </div>
               </div>
               <div style="border-top: 1px solid #A7F3D0; padding-top: 16px; margin-top: 16px;">
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; word-wrap: break-word;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                   <tr>
-                    <td style="padding: 6px 0; color: #065F46; width: 50%;"><strong>Net Profit:</strong></td>
-                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold; width: 50%;">+$${formatted.totalProfitUSD} USD</td>
+                    <td style="padding: 6px 0; color: #065F46;"><strong>Net Profit:</strong></td>
+                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">+$${formatted.totalProfitUSD} USD</td>
                   </tr>
                   <tr>
                     <td style="padding: 6px 0; color: #065F46;"><strong>Return on Investment (ROI):</strong></td>
@@ -21503,7 +21533,7 @@ app.post('/api/investments', protect, [
             ${monthlyBreakdownHtml}
 
             <!-- Final Note -->
-            <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+            <div class="email-card" style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
               <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Next Steps</p>
               ${isSingleCycle
                 ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract is a <strong>single ${plan.duration}-hour cycle</strong>. When the cycle closes, the full return of <strong>${formatted.totalReturnBTC} BTC (≈ $${formatted.totalReturnUSD} USD)</strong> will be credited directly to your Matured Wallet. Track live progress on your dashboard.</p>`
@@ -21514,7 +21544,7 @@ app.post('/api/investments', protect, [
             </div>
 
             <div style="text-align: center; margin: 30px 0;">
-              <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Contract on Dashboard</a>
+              <a href="https://www.bithashcapital.live/dashboard" class="email-cta" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Contract on Dashboard</a>
             </div>
 
             <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedStartDate}</p>
@@ -21529,6 +21559,8 @@ app.post('/api/investments', protect, [
             </p>
           </div>
         </div>
+        </body>
+        </html>
       `;
 
       await infoTransporter.sendMail({
@@ -22316,15 +22348,35 @@ const completeMaturedInvestmentsCron = async () => {
             const mailTransporter = infoTransporter;
 
             const emailHtml = `
-              <div style="font-family: 'Inter', sans-serif; width: 100%; max-width: 100%; margin: 0 auto; background: #FFFFFF; box-sizing: border-box;">
+              <!DOCTYPE html>
+              <html>
+              <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                <style>
+                  /* Full-width mobile view: cards inside email body must never be cut or truncated */
+                  @media only screen and (max-width: 600px) {
+                    .email-wrapper { width: 100% !important; max-width: 100% !important; margin: 0 !important; border-radius: 0 !important; }
+                    .email-body { padding: 16px !important; }
+                    .email-card { width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; padding: 16px !important; margin: 16px 0 !important; overflow: visible !important; }
+                    .email-card table { width: 100% !important; table-layout: fixed !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
+                    .email-card td, .email-card th { white-space: normal !important; word-break: break-word !important; overflow-wrap: anywhere !important; }
+                    .email-card h1, .email-card h2, .email-card h3 { font-size: 18px !important; line-height: 1.4 !important; }
+                    .email-card p, .email-card span, .email-card div { font-size: 14px !important; line-height: 1.6 !important; }
+                    .email-cta { padding: 12px 24px !important; width: auto !important; max-width: 100% !important; display: block !important; box-sizing: border-box !important; text-align: center !important; }
+                  }
+                </style>
+              </head>
+              <body style="margin: 0; padding: 0; width: 100%; -webkit-text-size-adjust: 100%; background: #FFFFFF;">
+              <div class="email-wrapper" style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF; width: 100%;">
                 <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
                   <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
                   <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
                   <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
                 </div>
 
-                <div style="padding: 30px; background: #FFFFFF; box-sizing: border-box; width: 100%;">
-                  <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                <div class="email-body" style="padding: 30px; background: #FFFFFF;">
+                  <div class="email-card" style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
                     <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
                       <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                       <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -22339,7 +22391,7 @@ const completeMaturedInvestmentsCron = async () => {
                   <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
                   <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
 
-                  <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                  <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
                     <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
                       <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                       <div>
@@ -22348,10 +22400,10 @@ const completeMaturedInvestmentsCron = async () => {
                       </div>
                     </div>
 
-                    <table style="width: 100%; border-collapse: collapse; table-layout: fixed; word-wrap: break-word;">
+                    <table style="width: 100%; border-collapse: collapse;">
                       <tr>
-                        <td style="padding: 8px 0; width: 50%;"><strong>Contract Name:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; width: 50%;">${plan.name}</td>
+                        <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
@@ -22381,13 +22433,13 @@ const completeMaturedInvestmentsCron = async () => {
                     </table>
                   </div>
 
-                  <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                  <div class="email-card" style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
                     <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
                     <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
                   </div>
 
                   <div style="text-align: center; margin: 30px 0;">
-                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
+                    <a href="https://www.bithashcapital.live/dashboard" class="email-cta" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
                   </div>
 
                   <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
@@ -22402,6 +22454,8 @@ const completeMaturedInvestmentsCron = async () => {
                   </p>
                 </div>
               </div>
+              </body>
+              </html>
             `;
 
             await mailTransporter.sendMail({
@@ -22699,16 +22753,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
-
-
-
-
-
-
-
-
 
 
 
