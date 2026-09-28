@@ -20820,6 +20820,13 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -20933,8 +20940,9 @@ app.post('/api/investments', protect, [
       });
     }
 
+    // Single cycle is always allowed. Multi-month requires plan opt-in.
     if (requestedMonths > 0 && requestedMonths < 1) {
-      return res.status(400).json({ status: 'fail', message: 'Invalid auto-compound duration' });
+        return res.status(400).json({ status: 'fail', message: 'Invalid auto-compound duration' });
     }
     if (requestedMonths >= 1 && !planAllowAutoCompound) {
       return res.status(400).json({
@@ -20943,6 +20951,9 @@ app.post('/api/investments', protect, [
       });
     }
 
+    // If it's a multi-month contract, it must be one of the allowed options.
+    // The `autoCompoundOptions` from the plan can contain 1, so a 1-month
+    // contract is valid if the plan allows it. Single-cycle is handled separately.
     if (requestedMonths >= 1 && !planAutoCompoundOptions.includes(requestedMonths)) {
       return res.status(400).json({
         status: 'fail',
@@ -21387,23 +21398,23 @@ app.post('/api/investments', protect, [
       if (isLongTerm) {
         const breakdownRows = projection.monthlyBreakdown.map(m => `
           <tr style="border-top: 1px solid #E2E8F0;">
-            <td style="padding: 10px 8px; font-weight: 500; color: #374151;">Month ${m.month}</td>
-            <td style="padding: 10px 8px; text-align: right; color: #6B7280;">$${m.startingPrincipalUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-            <td style="padding: 10px 8px; text-align: right; font-weight: 600; color: #10B981;">$${m.endingValueUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-            <td style="padding: 10px 8px; text-align: right; font-weight: 600; color: #10B981;">+$${m.profitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+            <td style="padding: 8px 0;">Month ${m.month}</td>
+            <td style="padding: 8px 0; text-align: right;">$${m.startingPrincipalUSD.toLocaleString()}</td>
+            <td style="padding: 8px 0; text-align: right; font-weight: 600; color: #10B981;">$${m.endingValueUSD.toLocaleString()}</td>
+            <td style="padding: 8px 0; text-align: right; color: #10B981;">+$${m.profitUSD.toLocaleString()}</td>
           </tr>
         `).join('');
 
         monthlyBreakdownHtml = `
-          <div style="background: #F8FAFC; padding: 24px; border-radius: 12px; margin: 24px 0; border: 1px solid #E2E8F0;">
-            <h3 style="font-size: 15px; font-weight: 700; color: #0B0E11; margin: 0 0 16px 0; padding-bottom: 12px; border-bottom: 2px solid #F7A600; text-transform: uppercase; letter-spacing: 0.5px;">Monthly Payout Schedule</h3>
+          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+            <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Monthly Payout Schedule</h3>
             <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
               <thead>
-                <tr style="background: #F1F5F9;">
-                  <th style="text-align: left; padding: 12px 8px; font-weight: 700; color: #374151; border-bottom: 1px solid #E2E8F0;">Month</th>
-                  <th style="text-align: right; padding: 12px 8px; font-weight: 700; color: #374151; border-bottom: 1px solid #E2E8F0;">Starting Capital</th>
-                  <th style="text-align: right; padding: 12px 8px; font-weight: 700; color: #374151; border-bottom: 1px solid #E2E8F0;">Payout</th>
-                  <th style="text-align: right; padding: 12px 8px; font-weight: 700; color: #374151; border-bottom: 1px solid #E2E8F0;">Profit</th>
+                <tr>
+                  <th style="text-align: left; padding-bottom: 8px; font-weight: 600; color: #64748B;">Month</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Starting Capital</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Payout</th>
+                  <th style="text-align: right; padding-bottom: 8px; font-weight: 600; color: #64748B;">Profit</th>
                 </tr>
               </thead>
               <tbody>
@@ -21416,123 +21427,110 @@ app.post('/api/investments', protect, [
 
       // --- Build the final email HTML ---
       const emailHtml = `
-        <div style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-          
-          <!-- Header -->
-          <div style="text-align: center; padding: 32px 24px 24px 24px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-            <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 16px;">
-            <h1 style="color: #FFFFFF; font-size: 26px; margin: 0; font-weight: 700; letter-spacing: 0.5px;">₿itHash</h1>
-            <p style="color: #B7BDC6; font-size: 13px; margin: 12px 0 0 0; font-style: italic;">Where Your Financial Goals Become Reality</p>
+        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+          <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+            <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+            <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+            <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
           </div>
 
-          <!-- Main Content -->
-          <div style="padding: 32px 24px; background: #FFFFFF;">
-            
-            <!-- Status Banner -->
-            <div style="background: #ECFDF5; border-radius: 12px; padding: 20px 24px; text-align: center; margin-bottom: 28px; border: 1px solid #A7F3D0;">
-              <h2 style="color: #059669; font-size: 20px; margin: 0 0 6px 0; font-weight: 700;">Mining Contract Activated</h2>
-              <p style="color: #047857; font-size: 13px; margin: 0;">Your ${isSingleCycle ? 'single-cycle' : `${requestedMonths}-month`} contract is now live and generating returns.</p>
+          <div style="padding: 30px; background: #FFFFFF;">
+            <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+              <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">Mining Contract Activated!</h2>
+              <p style="color: #065F46; font-size: 13px; margin: 0;">Your ${isSingleCycle ? 'single-cycle' : `${requestedMonths}-month`} contract is now live.</p>
             </div>
 
-            <!-- Greeting -->
-            <p style="color: #374151; line-height: 1.6; margin: 0 0 8px 0; font-size: 15px;">Dear <strong>${user.firstName}</strong>,</p>
-            <p style="color: #6B7280; line-height: 1.6; margin: 0 0 28px 0; font-size: 14px;">Your mining contract in the <strong style="color: #0B0E11;">${plan.name}</strong> plan has been successfully activated and is now operational.</p>
+            <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
+            <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
 
-            <!-- Contract Summary Card -->
-            <div style="background: #F8FAFC; padding: 24px; border-radius: 12px; margin: 0 0 24px 0; border: 1px solid #E2E8F0;">
-              <h3 style="font-size: 15px; font-weight: 700; color: #0B0E11; margin: 0 0 20px 0; padding-bottom: 12px; border-bottom: 2px solid #F7A600; text-transform: uppercase; letter-spacing: 0.5px;">Contract Summary</h3>
-              
-              <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                <tr>
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Gross Investment:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${formatted.grossBTC} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${formatted.grossUSD})</span></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #EF4444; font-weight: 500;">Total Fees (${projection.cycleFeePercent}%):</td>
-                  <td style="padding: 10px 0; text-align: right; color: #EF4444; font-weight: 600;">- ${formatted.feeBTC} BTC <span style="color: #F87171; font-weight: 400;">(≈ $${formatted.feeUSD})</span></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Initial Net Principal:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 700;">${formatted.netPrincipalBTC} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${formatted.netPrincipalUSD})</span></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Assigned Hashpower:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 700;">${projection.hashpower.toLocaleString()} TH/s</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Contract Duration:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${isSingleCycle ? 'Single Cycle' : `${requestedMonths} Month(s)`} <span style="color: #9CA3AF; font-weight: 400;">(${projection.cyclesPerMonth} cycles/month)</span></td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Cycle Start:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${formattedStartDate}</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Final Payout Date:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #F7A600; font-weight: 700;">${formattedFinalEndDate}</td>
-                </tr>
-                <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Contract ID:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #6B7280; font-family: 'SF Mono', Monaco, monospace; font-size: 12px;">${transaction.reference}</td>
-                </tr>
-              </table>
+            <!-- Contract Summary -->
+            <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                    <tr>
+                        <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Total Estimated Fees (${projection.cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Initial Net Principal:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${projection.hashpower.toLocaleString()} TH/s</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${isSingleCycle ? 'Single Cycle' : `${requestedMonths} Month(s)`} (${projection.cyclesPerMonth} cycles/month)</td>
+                    </tr>
+                     <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Cycle Start:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Final Payout Date:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${formattedFinalEndDate}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
+                    </tr>
+                </table>
             </div>
 
-            <!-- Return Summary Card -->
-            <div style="background: linear-gradient(135deg, #FFFBEB 0%, #FEF3C7 100%); padding: 24px; border-radius: 12px; margin: 0 0 24px 0; border: 1px solid #FCD34D;">
-              <h3 style="font-size: 15px; font-weight: 700; color: #92400E; margin: 0 0 20px 0; padding-bottom: 12px; border-bottom: 2px solid #F7A600; text-transform: uppercase; letter-spacing: 0.5px;">Total Mining Return at Contract End</h3>
-              
-              <div style="text-align: center;">
-                <div style="font-size: 32px; font-weight: 800; color: #F7A600; margin-bottom: 8px; letter-spacing: -0.5px;">
+            <!-- Total Mining Return -->
+            <div style="background: #ECFDF5; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #A7F3D0;">
+              <h3 style="font-size: 16px; font-weight: 600; color: #065F46; margin: 0 0 16px 0; text-align: center;">Total Mining Return at Contract End</h3>
+              <div style="text-align: center; margin-bottom: 16px;">
+                <div style="font-size: 28px; font-weight: bold; color: #F7A600; margin-bottom: 4px;">
                   +${formatted.totalReturnBTC} BTC
                 </div>
-                <div style="font-size: 18px; color: #B45309; font-weight: 600; margin-bottom: 24px;">
+                <div style="font-size: 16px; color: #B8860B; font-weight: 600;">
                   ≈ $${formatted.totalReturnUSD} USD
                 </div>
               </div>
-              
-              <!-- ROI and Net Profit - Separated for clarity -->
-              <div style="display: flex; gap: 16px; margin-top: 20px;">
-                <div style="flex: 1; background: #FFFFFF; padding: 16px; border-radius: 10px; text-align: center; border: 1px solid #D1FAE5;">
-                  <div style="font-size: 11px; color: #6B7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; font-weight: 600;">Net Profit</div>
-                  <div style="font-size: 20px; font-weight: 800; color: #10B981;">+$${formatted.totalProfitUSD}</div>
-                  <div style="font-size: 11px; color: #9CA3AF; margin-top: 4px;">USD</div>
-                </div>
-                <div style="flex: 1; background: #FFFFFF; padding: 16px; border-radius: 10px; text-align: center; border: 1px solid #D1FAE5;">
-                  <div style="font-size: 11px; color: #6B7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; font-weight: 600;">Return on Investment</div>
-                  <div style="font-size: 20px; font-weight: 800; color: #10B981;">${formatted.roiPercent}%</div>
-                  <div style="font-size: 11px; color: #9CA3AF; margin-top: 4px;">Total ROI</div>
-                </div>
+              <div style="border-top: 1px solid #A7F3D0; padding-top: 16px; margin-top: 16px;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                  <tr>
+                    <td style="padding: 6px 0; color: #065F46;"><strong>Net Profit:</strong></td>
+                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">+$${formatted.totalProfitUSD} USD</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 6px 0; color: #065F46;"><strong>Return on Investment (ROI):</strong></td>
+                    <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">${formatted.roiPercent}%</td>
+                  </tr>
+                </table>
               </div>
             </div>
 
-            <!-- Monthly Breakdown (for long-term contracts) -->
+            <!-- Monthly Breakdown for long-term contracts -->
             ${monthlyBreakdownHtml}
 
-            <!-- Next Steps -->
-            <div style="background: #EFF6FF; border-left: 4px solid #3B82F6; padding: 20px 24px; border-radius: 8px; margin: 24px 0;">
-              <p style="color: #1E40AF; margin: 0 0 10px 0; font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Next Steps</p>
+            <!-- Final Note -->
+            <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+              <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Next Steps</p>
               ${isLongTerm
-                ? `<p style="color: #1E3A8A; margin: 0; font-size: 14px; line-height: 1.6;">Your contract will run for <strong>${requestedMonths} month(s)</strong>. At the end of each month, your returns are credited to your Matured Wallet and a new month begins automatically. You can track your contract's progress live on your dashboard.</p>`
-                : `<p style="color: #1E3A8A; margin: 0; font-size: 14px; line-height: 1.6;">Your contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can track your contract's progress live on your dashboard.</p>`
+                ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract will run for <strong>${requestedMonths} month(s)</strong>. At the end of each month, your profits are credited to your Matured Wallet and a new month begins automatically. You can track your contract's progress live on your dashboard.</p>`
+                : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract will automatically mature after ${plan.duration} hours. The proceeds will be credited to your Matured Wallet. You can track your contract's progress live on your dashboard.</p>`
               }
             </div>
 
-            <!-- CTA Button -->
-            <div style="text-align: center; margin: 32px 0;">
-              <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #0B0E11; padding: 14px 36px; text-decoration: none; border-radius: 50px; font-weight: 700; font-size: 14px; display: inline-block; letter-spacing: 0.5px;">View Contract on Dashboard</a>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Contract on Dashboard</a>
             </div>
 
-            <p style="color: #9CA3AF; font-size: 12px; margin-top: 32px; text-align: center;">Email sent: ${formattedStartDate}</p>
+            <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedStartDate}</p>
           </div>
 
-          <!-- Footer -->
-          <div style="text-align: center; padding: 24px; background: #0B0E11; border-top: 1px solid #1E2329;">
+          <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
             <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
             <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-            <p style="color: #6C7480; font-size: 12px; margin: 8px 0 0 0;">
-              <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a>
-              <span style="color: #4B5563; margin: 0 8px;">|</span>
+            <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+              <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
               <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
             </p>
           </div>
@@ -21601,6 +21599,7 @@ app.post('/api/investments', protect, [
 // =============================================
 // REAL-TIME BITCOIN PRICE WITH MULTIPLE API FALLBACKS
 // ALL FALLBACKS FETCH FROM ONLINE APIs - NO HARDCODED VALUES
+// (Unchanged — pure data fetcher.)
 // =============================================
 async function getRealTimeBitcoinPrice() {
   const errors = [];
@@ -22298,16 +22297,16 @@ const completeMaturedInvestmentsCron = async () => {
             const compoundSummaryBlock = isLongTerm
               ? `
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Contract Duration:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${investment.autoCompoundMonths} month(s) <span style="color: #9CA3AF; font-weight: 400;">(${investment.cyclesPerMonth} cycles/month)</span></td>
+                  <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">${investment.autoCompoundMonths} month(s) (${investment.cyclesPerMonth} cycles/month)</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Final Month / Cycle:</td>
-                  <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
+                  <td style="padding: 8px 0;"><strong>Final Month / Cycle:</strong></td>
+                  <td style="padding: 8px 0; text-align: right;">Month ${investment.currentMonth} of ${investment.autoCompoundMonths}, Cycle ${investment.currentCycle} of ${investment.cyclesPerMonth}</td>
                 </tr>
                 <tr style="border-top: 1px solid #E2E8F0;">
-                  <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Cumulative Gross Return (All Cycles):</td>
-                  <td style="padding: 10px 0; text-align: right; font-weight: 700; color: #10B981;">${investment.cumulativeReturnBTC.toFixed(8)} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${investment.cumulativeReturnUSD.toLocaleString()})</span></td>
+                  <td style="padding: 8px 0;"><strong>Cumulative Gross Return (All Cycles):</strong></td>
+                  <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${investment.cumulativeReturnBTC.toFixed(8)} BTC (≈ $${investment.cumulativeReturnUSD.toLocaleString()})</td>
                 </tr>
               `
               : '';
@@ -22315,99 +22314,88 @@ const completeMaturedInvestmentsCron = async () => {
             const mailTransporter = infoTransporter;
 
             const emailHtml = `
-              <div style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                
-                <!-- Header -->
-                <div style="text-align: center; padding: 32px 24px 24px 24px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                  <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 16px;">
-                  <h1 style="color: #FFFFFF; font-size: 26px; margin: 0; font-weight: 700; letter-spacing: 0.5px;">₿itHash</h1>
-                  <p style="color: #B7BDC6; font-size: 13px; margin: 12px 0 0 0; font-style: italic;">Where Your Financial Goals Become Reality</p>
+              <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                  <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                  <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                  <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
                 </div>
 
-                <!-- Main Content -->
-                <div style="padding: 32px 24px; background: #FFFFFF;">
-                  
-                  <!-- Status Banner -->
-                  <div style="background: #ECFDF5; border-radius: 12px; padding: 20px 24px; text-align: center; margin-bottom: 28px; border: 1px solid #A7F3D0;">
-                    <div style="display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 10px;">
-                      <img src="${cryptoLogoUrl}" width="36" height="36" style="border-radius: 50%;">
-                      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <div style="padding: 30px; background: #FFFFFF;">
+                  <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                         <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
                         <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                       </svg>
                     </div>
-                    <h2 style="color: #059669; font-size: 20px; margin: 0 0 6px 0; font-weight: 700;">Mining Contract Matured</h2>
-                    <p style="color: #047857; font-size: 13px; margin: 0;">Your mining contract has successfully completed and returns have been credited.</p>
+                    <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">CONTRACT MATURED!</h2>
+                    <p style="color: #065F46; font-size: 13px; margin: 0;">Your mining contract has successfully completed</p>
                   </div>
 
-                  <!-- Greeting -->
-                  <p style="color: #374151; line-height: 1.6; margin: 0 0 8px 0; font-size: 15px;">Dear <strong>${user.firstName}</strong>,</p>
-                  <p style="color: #6B7280; line-height: 1.6; margin: 0 0 28px 0; font-size: 14px;">Your <strong style="color: #0B0E11;">${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
+                  <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
+                  <p style="color: #333333; line-height: 1.6;">Congratulations! Your <strong>${plan.name}</strong> mining contract has completed. Your returns have been credited to your <strong style="color: #10B981;">Matured Wallet</strong>.</p>
 
-                  <!-- Payout Summary Card -->
-                  <div style="background: #F8FAFC; padding: 24px; border-radius: 12px; margin: 0 0 24px 0; border: 1px solid #E2E8F0;">
-                    <div style="display: flex; align-items: center; gap: 16px; padding-bottom: 20px; border-bottom: 1px solid #E2E8F0; margin-bottom: 20px;">
-                      <img src="${cryptoLogoUrl}" width="48" height="48" style="border-radius: 50%;">
+                  <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
                       <div>
-                        <div style="font-weight: 800; font-size: 24px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
-                        <div style="color: #6B7280; font-size: 14px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
+                        <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedGrossReturnBTC} BTC</div>
+                        <div style="color: #64748B; font-size: 12px;">≈ $${formattedGrossReturnUSD} USD credited to Matured Wallet</div>
                       </div>
                     </div>
 
-                    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                    <table style="width: 100%; border-collapse: collapse;">
                       <tr>
-                        <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Contract Name:</td>
-                        <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${plan.name}</td>
+                        <td style="padding: 8px 0;"><strong>Contract Name:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Final Cycle Net Principal:</td>
-                        <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${formattedPrincipalBTC} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${formattedPrincipalUSD})</span></td>
+                        <td style="padding: 8px 0;"><strong>Final Cycle Net Principal:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #EF4444; font-weight: 500;">Final Cycle Fee (${cycleFeePercent}%):</td>
-                        <td style="padding: 10px 0; text-align: right; color: #EF4444; font-weight: 600;">- ${formattedFeeBTC} BTC <span style="color: #F87171; font-weight: 400;">(≈ $${formattedFeeUSD})</span></td>
+                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Fee (${cycleFeePercent}%):</strong></td>
+                        <td style="padding: 8px 0; text-align: right;"><strong style="color: #EF4444;">- ${formattedFeeBTC} BTC (≈ $${formattedFeeUSD} USD)</strong></td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Final Gross Return:</td>
-                        <td style="padding: 10px 0; text-align: right; color: #F7A600; font-weight: 700;">${formattedGrossReturnBTC} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${formattedGrossReturnUSD})</span></td>
+                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Gross Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">${formattedGrossReturnBTC} BTC (≈ $${formattedGrossReturnUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #10B981; font-weight: 600;">Final Net Return:</td>
-                        <td style="padding: 10px 0; text-align: right; font-weight: 800; color: #10B981;">+ ${formattedNetReturnBTC} BTC <span style="color: #6EE7B7; font-weight: 400;">(≈ $${formattedNetReturnUSD})</span></td>
+                        <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Net Return:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedNetReturnBTC} BTC (≈ $${formattedNetReturnUSD} USD)</td>
                       </tr>
                       ${compoundSummaryBlock}
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">Completion Date:</td>
-                        <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 600;">${formattedCompletionDate}</td>
+                        <td style="padding: 8px 0;"><strong>Completion Date:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formattedCompletionDate}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 10px 0; color: #6B7280; font-weight: 500;">New Matured Wallet Balance:</td>
-                        <td style="padding: 10px 0; text-align: right; color: #0B0E11; font-weight: 700;">${formattedNewMaturedBTC} BTC <span style="color: #9CA3AF; font-weight: 400;">(≈ $${formattedNewMaturedUSD})</span></td>
+                        <td style="padding: 8px 0;"><strong>New Matured Wallet Balance:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formattedNewMaturedBTC} BTC (≈ $${formattedNewMaturedUSD} USD)</td>
                       </tr>
                     </table>
                   </div>
 
-                  <!-- Info Box -->
-                  <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 20px 24px; border-radius: 8px; margin: 24px 0;">
-                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Funds Available in Matured Wallet</p>
-                    <p style="color: #78350F; margin: 0; font-size: 14px; line-height: 1.6;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
+                  <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Funds Available in Matured Wallet</p>
+                    <p style="color: #78350F; margin: 0; font-size: 14px;">Your matured funds are now available. You can reinvest into a new mining contract, withdraw to your external wallet, or convert to other cryptocurrencies.</p>
                   </div>
 
-                  <!-- CTA Button -->
-                  <div style="text-align: center; margin: 32px 0;">
-                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 14px 36px; text-decoration: none; border-radius: 50px; font-weight: 700; font-size: 14px; display: inline-block; letter-spacing: 0.5px;">Reinvest Now</a>
+                  <div style="text-align: center; margin: 30px 0;">
+                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #10B981; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Reinvest Now</a>
                   </div>
 
-                  <p style="color: #9CA3AF; font-size: 12px; margin-top: 32px; text-align: center;">Email sent: ${formattedCompletionDate}</p>
+                  <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${formattedCompletionDate}</p>
                 </div>
 
-                <!-- Footer -->
-                <div style="text-align: center; padding: 24px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
                   <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
                   <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                  <p style="color: #6C7480; font-size: 12px; margin: 8px 0 0 0;">
-                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a>
-                    <span style="color: #4B5563; margin: 0 8px;">|</span>
+                  <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
                     <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
                   </p>
                 </div>
@@ -22709,6 +22697,8 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
+
+
 
 
 
