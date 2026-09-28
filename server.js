@@ -19338,8 +19338,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
-
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
   const userAgentHeader = req.headers['user-agent'] || 'Unknown';
@@ -19564,13 +19562,22 @@ app.post('/api/mining/calculator', async (req, res) => {
     };
 
     /**
-     * Calculate full contract projection with monthly reset model
+     * Calculate full contract projection with monthly reset model.
      *
-     * FIXED: The 3% cycle fee is now charged ONCE per cycle inside the
-     * cycle loop — on each cycle's incoming balance. There is no separate
-     * "first cycle fee" deducted outside the loop. This makes the
-     * calculator produce the same numbers as POST /api/investments and
-     * the cloudmining page.
+     * The 3% cycle fee is charged ONCE per cycle inside the cycle loop —
+     * on each cycle's incoming balance. There is no separate "first cycle
+     * fee" deducted outside the loop.
+     *
+     * MONTH-BOUNDARY RESET RULE (aligned with POST /api/investments):
+     * At the end of each month, the compounded result is swept to matured,
+     * and the principal resets to the ORIGINAL NET starting principal
+     * (firstNetPrincipalUSD), NOT to the gross principal.
+     *
+     * This is the only place where the calculator previously diverged from
+     * the investment endpoint. Resetting to the net principal means the
+     * next month's cycle 1 charges its fee on the same net base that the
+     * investment endpoint charges it on. The two paths now produce the
+     * exact same numbers for every month.
      *
      * For a 1-month contract this means:
      *   cycle 1 incoming = $1,000.00, fee = $30.00, net = $970.00
@@ -19579,8 +19586,6 @@ app.post('/api/mining/calculator', async (req, res) => {
      *   Total fees across all 15 cycles = $678.23
      *   Net return = $2,141.47 − $1,000 = $1,141.47
      *   ROI = 114.15%
-     *
-     * Returns precise values for the entire contract life.
      */
     const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
       const planPercentage = plan.percentage / 100;
@@ -19609,13 +19614,20 @@ app.post('/api/mining/calculator', async (req, res) => {
         currentBtcPrice
       );
 
-      // Monthly reset model tracking
-      // NOTE: We start the month loop with the GROSS principal ($1,000),
-      //       not the net principal ($970). The cycle loop will charge
-      //       the fee on cycle 1 exactly once, producing the same net
-      //       principal that POST /api/investments produces.
-      let currentMonthStartingPrincipalUSD = initialIncomingUSD;
-      let currentMonthStartingPrincipalBTC = initialIncomingBTC;
+      // Monthly reset model tracking.
+      //
+      // FIX: We start the month loop with the NET principal ($970), not
+      //      the gross principal ($1,000). This mirrors POST /api/investments
+      //      exactly: the first cycle's 3% fee is deducted once to produce
+      //      the mining principal, and every subsequent month restarts from
+      //      that same net principal so the next month's cycle 1 charges
+      //      the same $30 fee on the same $970 base.
+      //
+      //      Previously the reset used initialIncomingUSD (gross), which
+      //      made the calculator produce different ROI and fee figures
+      //      than the investment endpoint.
+      let currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
+      let currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
       let totalReturnUSD = 0;
       let totalReturnBTC = 0;
       let totalFeesUSD = 0;
@@ -19661,13 +19673,12 @@ app.post('/api/mining/calculator', async (req, res) => {
 
         // After all cycles in month, this is the month's total return.
         // At month boundary: sweep the COMPOUNDED result to matured
-        // and RESET principal to the ORIGINAL GROSS starting value.
+        // and RESET principal to the ORIGINAL NET starting value.
         //
-        // NOTE: We reset to the GROSS principal (initialIncomingUSD), not
-        //       to firstNetPrincipalUSD, because the next month's cycle 1
-        //       must itself charge its own 3% fee on its own incoming
-        //       balance. That produces the same $30 cycle-1 fee the
-        //       investment endpoint charges at the start of each month.
+        // FIX: We reset to firstNetPrincipalUSD (the amount that actually
+        //      mines), not to initialIncomingUSD (the gross deposit).
+        //      This produces the same cycle-1 fee and the same month-by-month
+        //      growth as POST /api/investments.
         const monthProfitUSD = monthReturnUSD - currentMonthStartingPrincipalUSD;
         const monthProfitBTC = monthReturnBTC - currentMonthStartingPrincipalBTC;
 
@@ -19689,11 +19700,11 @@ app.post('/api/mining/calculator', async (req, res) => {
           feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
         });
 
-        // Principal resets to the ORIGINAL GROSS starting value for the
+        // Principal resets to the ORIGINAL NET starting value for the
         // next month, so that next month's cycle 1 charges its own fee
-        // on the gross balance exactly once.
-        currentMonthStartingPrincipalUSD = initialIncomingUSD;
-        currentMonthStartingPrincipalBTC = initialIncomingBTC;
+        // on the same net base the investment endpoint charges it on.
+        currentMonthStartingPrincipalUSD = firstNetPrincipalUSD;
+        currentMonthStartingPrincipalBTC = firstNetPrincipalBTC;
       }
 
       // Final payout is the last month's ending value
@@ -20191,7 +20202,6 @@ app.post('/api/mining/calculator', async (req, res) => {
     // =============================================
     // LOG ACTIVITY TO SYSTEMLOG
     //
-    // Fixes in this version:
     //   1. entity is 'system' (lowercase) so the enum passes.
     //   2. action correctly separates user vs guest.
     //   3. Logged-in users are ALWAYS attributed to their real account:
