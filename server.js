@@ -20836,6 +20836,14 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
+
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -21546,7 +21554,7 @@ app.post('/api/investments', protect, [
                 ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract is a <strong>single ${plan.duration}-hour cycle</strong>. When the cycle closes, the full return of <strong>${formatted.totalReturnBTC} BTC (≈ $${formatted.totalReturnUSD} USD)</strong> will be credited directly to your Matured Wallet. Track live progress on your dashboard.</p>`
                 : requestedMonths === 1
                   ? `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract runs for <strong>1 month</strong> — that is <strong>${projection.cyclesPerMonth} consecutive ${plan.duration}-hour cycles</strong>. Returns compound into the next cycle automatically. At month's end, the compounded amount is swept to your Matured Wallet. Track live progress on your dashboard.</p>`
-                  : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract runs for <strong>${requestedMonths} months</strong> — that is <strong>${projection.totalCycles} total cycles</strong> of ${plan.duration} hours each. At each month boundary, your compounded profit is credited to your Matured Wallet and the principal resets for the next month. Final payout lands in your Matured Wallet at the end of month ${requestedMonths}. Track live progress on your dashboard.</p>`
+                  : `<p style="color: #78350F; margin: 0; font-size: 14px;">Your contract runs for <strong>${requestedMonths} months</strong>, with mining cycles of ${plan.duration} hours each. Each month, your earnings are credited to your Matured Wallet and your contract automatically continues with the next month. Your final payout will be delivered to your Matured Wallet at the end of month ${requestedMonths}. Track live progress on your dashboard.</p>`
               }
             </div>
 
@@ -22760,25 +22768,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
