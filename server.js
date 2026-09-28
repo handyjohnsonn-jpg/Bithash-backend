@@ -38162,71 +38162,68 @@ async function calculateAccurateClosingBalances(userId, endDate) {
 
 
 
-
 // =============================================
 // GET /api/investments/active
+// =============================================
 //
-// Returns every active investment for the authenticated user, fully
-// hydrated with data derived from the investment record itself —
-// NOT from hardcoded plan-name lookups.
+// AUTHORITATIVE SOURCES (read directly from the investment record):
 //
-// AUTHORITATIVE SOURCES (read directly, never invented):
 //   • investment.amount                    → net principal (USD)
 //   • investment.amountBTC                 → net principal (BTC)
 //   • investment.originalAmount            → gross investment (USD)
 //   • investment.originalAmountBTC         → gross investment (BTC)
-//   • investment.investmentFee             → first-cycle fee paid (USD)
-//   • investment.investmentFeeBTC          → first-cycle fee paid (BTC)
+//   • investment.investmentFee             → creation fee (USD)
+//   • investment.investmentFeeBTC          → creation fee (BTC)
 //   • investment.expectedReturn            → current cycle expected return (USD)
 //   • investment.expectedReturnBTC         → current cycle expected return (BTC)
-//   • investment.currentHashrate           → live TH/s for the active cycle
-//   • investment.hashrateHistory[]         → full hashrate timeline
-//   • investment.cycleHistory[]            → every cycle ever run
-//   • investment.monthToDateReturnUSD/BTC  → accumulated return this month
-//   • investment.cumulativeReturnUSD/BTC   → accumulated return entire contract
-//   • investment.currentCycle              → cycle number within the month
-//   • investment.currentMonth              → month number (1-indexed)
-//   • investment.totalCycles               → total cycles in contract
+//   • investment.currentHashrate           → live TH/s
+//   • investment.hashrateHistory[]         → hashrate timeline
+//   • investment.cycleHistory[]            → every cycle ever run (incl. fees)
+//   • investment.monthToDateReturnUSD/BTC  → accumulated this month
+//   • investment.cumulativeReturnUSD/BTC   → accumulated whole contract
+//   • investment.currentCycle              → cycle within the month
+//   • investment.currentMonth              → month (1-indexed)
+//   • investment.totalCycles               → total cycles in the contract
 //   • investment.cyclesPerMonth            → cycles per 30-day month
-//   • investment.monthStartingPrincipalUSD → principal that began this month
+//   • investment.monthStartingPrincipalUSD → principal at start of month
 //   • investment.monthStartingPrincipalBTC
-//   • investment.autoCompoundMonths        → 1, 3, 6, 9, or 12
-//   • investment.isAutoCompoundActive      → bool
-//   • investment.btcPriceAtInvestment      → BTC price locked at creation
+//   • investment.autoCompoundMonths        → total contract life in months
+//   • investment.isAutoCompoundActive
+//   • investment.btcPriceAtInvestment      → locked BTC price at creation
 //   • investment.startDate
 //   • investment.endDate                   → current cycle end
-//   • investment.lastPayoutDate
 //   • investment.status
 //
-// PLAN DATA (read from populated plan):
-//   • plan.name
-//   • plan.percentage                      → ROI % applied to net principal
-//   • plan.duration                        → hours per cycle
-//   • plan.cycleFeePercent                 → per-cycle fee override
-//   • plan.minAmount / maxAmount
-//   • plan.referralBonus
+// PLAN DATA:
+//   • plan.name, plan.percentage, plan.duration
+//   • plan.cycleFeePercent, plan.hashrateUnit
+//   • plan.minAmount, plan.maxAmount, plan.referralBonus
 //
 // BTC PRICE:
-//   • Fetched fresh from getCryptoPrice('BTC') so profit-in-BTC is
-//     always expressed in today's market value.
-//   • If the price fetch fails, the endpoint DOES NOT 503 — it
-//     falls back to investment.btcPriceAtInvestment and flags the
-//     response with `priceStale: true`.
+//   • Fetched fresh via getCryptoPrice('BTC') on every request.
+//   • On failure, falls back to investment.btcPriceAtInvestment and
+//     sets priceStale: true. Endpoint NEVER 503s on price-feed outage.
+//
+// BACKWARD COMPATIBILITY:
+//   • A flat key block is emitted alongside the nested one, using the
+//     same names the current HTML already reads (amount, durationHours,
+//     profitPercentage, currentProfitBTC/USD, progressPercentage,
+//     endDate, statusText, statusClass, hashrate.value, hashrate.unit,
+//     lastUpdated). This makes the existing card display real numbers
+//     with ZERO frontend change, then upgrade later.
 // =============================================
+
 app.get('/api/investments/active', protect, async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 10));
-    const skip = (page - 1) * limit;
+    const skip  = (page - 1) * limit;
 
-    // =============================================
+    // ============================================================
     // 1. FETCH ACTIVE INVESTMENTS
-    // =============================================
+    // ============================================================
     const [investments, total] = await Promise.all([
-      Investment.find({
-        user: req.user.id,
-        status: 'active'
-      })
+      Investment.find({ user: req.user.id, status: 'active' })
         .sort({ endDate: 1, createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -38235,60 +38232,45 @@ app.get('/api/investments/active', protect, async (req, res) => {
           select: 'name percentage duration minAmount maxAmount referralBonus cycleFeePercent hashrateUnit'
         })
         .lean(),
-      Investment.countDocuments({
-        user: req.user.id,
-        status: 'active'
-      })
+      Investment.countDocuments({ user: req.user.id, status: 'active' })
     ]);
 
-    // =============================================
-    // 2. FETCH CURRENT BTC PRICE (NON-BLOCKING)
-    //
-    // We never 503 the whole endpoint just because the price
-    // feed is temporarily down. We degrade gracefully by using
-    // the BTC price locked at investment creation.
-    // =============================================
+    // ============================================================
+    // 2. FETCH CURRENT BTC PRICE (NON-BLOCKING, WITH FALLBACK)
+    // ============================================================
     let currentBTCPrice = null;
     let priceStale = false;
-    let priceSource = 'live';
 
     try {
-      const fetchedPrice = await getCryptoPrice('BTC');
-      if (fetchedPrice && fetchedPrice > 0) {
-        currentBTCPrice = fetchedPrice;
+      const fetched = await getCryptoPrice('BTC');
+      if (fetched && fetched > 0) {
+        currentBTCPrice = fetched;
       } else {
         priceStale = true;
       }
-    } catch (priceError) {
+    } catch (err) {
       priceStale = true;
       console.warn(
-        `[investments/active] BTC price fetch failed: ${priceError.message}. ` +
+        `[investments/active] BTC price fetch failed: ${err.message}. ` +
         `Falling back to investment.btcPriceAtInvestment.`
       );
     }
 
-    const now = new Date();
+    const now   = new Date();
     const nowMs = now.getTime();
 
-    // =============================================
+    // ============================================================
     // 3. HELPERS
-    // =============================================
+    // ============================================================
 
-    /**
-     * Resolve the BTC price to use for this investment.
-     *
-     * Priority:
-     *   1. Live price (if fresh)
-     *   2. investment.btcPriceAtInvestment (locked at creation)
-     *   3. The most recent non-zero btcPriceAtEnd in cycleHistory
-     *   4. A safe sentinel of 1 (only to prevent divide-by-zero)
-     */
     const resolveBtcPrice = (investment) => {
       if (currentBTCPrice && currentBTCPrice > 0) return currentBTCPrice;
       if (investment.btcPriceAtInvestment && investment.btcPriceAtInvestment > 0) {
         return investment.btcPriceAtInvestment;
       }
-      const history = Array.isArray(investment.cycleHistory) ? investment.cycleHistory : [];
+      const history = Array.isArray(investment.cycleHistory)
+        ? investment.cycleHistory
+        : [];
       for (let i = history.length - 1; i >= 0; i--) {
         const p = history[i]?.btcPriceAtEnd || history[i]?.btcPriceAtStart;
         if (p && p > 0) return p;
@@ -38296,10 +38278,6 @@ app.get('/api/investments/active', protect, async (req, res) => {
       return 1;
     };
 
-    /**
-     * Resolve the per-cycle fee percent for this plan.
-     * Per-plan override wins; otherwise the global constant.
-     */
     const resolveCycleFeePercent = (plan) => {
       if (plan && typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0) {
         return plan.cycleFeePercent;
@@ -38307,62 +38285,57 @@ app.get('/api/investments/active', protect, async (req, res) => {
       return CYCLE_FEE_PERCENT;
     };
 
-    /**
-     * Format a Date to "YYYY-MM-DD" for display purposes.
-     */
     const formatDate = (date) => {
       if (!date) return null;
       const d = new Date(date);
       if (Number.isNaN(d.getTime())) return null;
       return d.toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
+        year: 'numeric', month: 'short', day: 'numeric'
       });
     };
 
-    /**
-     * Format a Date to "HH:MM:SS" for last-updated display.
-     */
     const formatTime = (date) => {
       if (!date) return null;
       const d = new Date(date);
       if (Number.isNaN(d.getTime())) return null;
       return d.toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
       });
     };
 
-    // =============================================
+    const formatDateTime = (date) => {
+      if (!date) return null;
+      const d = new Date(date);
+      if (Number.isNaN(d.getTime())) return null;
+      return d.toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
+      });
+    };
+
+    // ============================================================
     // 4. BUILD ENHANCED INVESTMENT OBJECTS
-    // =============================================
+    // ============================================================
     const enhancedInvestments = investments.map((investment) => {
       const plan = investment.plan || {};
       const btcPrice = resolveBtcPrice(investment);
       const cycleFeePercent = resolveCycleFeePercent(plan);
 
-      // -------------------------------------------------
-      // 4a. IDENTITY
-      // -------------------------------------------------
-      const planName = plan.name || 'Mining Contract';
+      // ---------------- IDENTITY ----------------
+      const planName       = plan.name || 'Mining Contract';
       const planPercentage = Number(plan.percentage) || 0;
-      const durationHours = Number(plan.duration) || 0;
+      const durationHours  = Number(plan.duration)   || 0;
+      const hashrateUnit   = plan.hashrateUnit || 'TH/s';
 
-      // -------------------------------------------------
-      // 4b. TIMING (cycle-aware)
-      // -------------------------------------------------
+      // ---------------- TIMING ----------------
       const startDate = investment.startDate ? new Date(investment.startDate) : null;
-      const endDate = investment.endDate ? new Date(investment.endDate) : null;
+      const endDate   = investment.endDate   ? new Date(investment.endDate)   : null;
+      const startMs   = startDate ? startDate.getTime() : null;
+      const endMs     = endDate   ? endDate.getTime()   : null;
 
-      const startMs = startDate ? startDate.getTime() : null;
-      const endMs = endDate ? endDate.getTime() : null;
-
-      // Time remaining in the CURRENT cycle
       const timeLeftMs = endMs ? Math.max(0, endMs - nowMs) : 0;
 
-      const hoursLeft = Math.floor(timeLeftMs / (1000 * 60 * 60));
+      const hoursLeft   = Math.floor(timeLeftMs / (1000 * 60 * 60));
       const minutesLeft = Math.floor((timeLeftMs % (1000 * 60 * 60)) / (1000 * 60));
       const secondsLeft = Math.floor((timeLeftMs % (1000 * 60)) / 1000);
 
@@ -38371,7 +38344,7 @@ app.get('/api/investments/active', protect, async (req, res) => {
           ? '00:00:00'
           : `${String(hoursLeft).padStart(2, '0')}:${String(minutesLeft).padStart(2, '0')}:${String(secondsLeft).padStart(2, '0')}`;
 
-      const daysLeft = Math.floor(hoursLeft / 24);
+      const daysLeft       = Math.floor(hoursLeft / 24);
       const remainingHours = hoursLeft % 24;
       const humanReadableDisplay =
         timeLeftMs <= 0
@@ -38380,27 +38353,23 @@ app.get('/api/investments/active', protect, async (req, res) => {
             ? `${daysLeft}d ${remainingHours}h`
             : `${hoursLeft}h ${minutesLeft}m`;
 
-      // -------------------------------------------------
-      // 4c. CYCLE / MONTH AWARENESS
-      // -------------------------------------------------
-      const currentCycle = Number(investment.currentCycle) || 1;
-      const currentMonth = Number(investment.currentMonth) || 1;
-      const totalCycles = Number(investment.totalCycles) || 1;
-      const cyclesPerMonth = Number(investment.cyclesPerMonth) || 1;
-      const autoCompoundMonths = Number(investment.autoCompoundMonths) || 1;
-      const isAutoCompoundActive = Boolean(investment.isAutoCompoundActive);
+      // ---------------- CYCLE / MONTH POSITION ----------------
+      const currentCycle          = Number(investment.currentCycle)          || 1;
+      const currentMonth          = Number(investment.currentMonth)          || 1;
+      const totalCycles           = Number(investment.totalCycles)           || 1;
+      const cyclesPerMonth        = Number(investment.cyclesPerMonth)        || 1;
+      const autoCompoundMonths    = Number(investment.autoCompoundMonths)    || 1;
+      const isAutoCompoundActive  = Boolean(investment.isAutoCompoundActive);
 
-      // -------------------------------------------------
-      // 4d. PROGRESS — CYCLE-AWARE, NOT NAIVE
-      //
-      // Because this contract advances through discrete cycles
-      // and month boundaries, a naive `elapsed / total` is wrong.
-      // We compute real progress from the cycle numbers instead.
-      // -------------------------------------------------
-      const completedCycles = Math.max(0, currentCycle - 1);
-      const cyclesCompletedTotal =
-        (currentMonth - 1) * cyclesPerMonth + completedCycles;
+      const completedCycles      = Math.max(0, currentCycle - 1);
+      const cyclesCompletedTotal = (currentMonth - 1) * cyclesPerMonth + completedCycles;
+      const remainingCycles      = Math.max(0, totalCycles - cyclesCompletedTotal);
+      const remainingMonths      = Math.max(
+        0,
+        autoCompoundMonths - currentMonth + (currentCycle < cyclesPerMonth ? 1 : 0)
+      );
 
+      // ---------------- PROGRESS ----------------
       const contractProgressPercent =
         totalCycles > 0
           ? Math.min(100, (cyclesCompletedTotal / totalCycles) * 100)
@@ -38411,7 +38380,6 @@ app.get('/api/investments/active', protect, async (req, res) => {
           ? Math.min(100, (completedCycles / cyclesPerMonth) * 100)
           : 0;
 
-      // Within-cycle progress: how far through the current cycle are we?
       const cycleDurationMs = durationHours * 60 * 60 * 1000;
       const elapsedInCycleMs =
         startMs !== null && endMs !== null
@@ -38422,32 +38390,17 @@ app.get('/api/investments/active', protect, async (req, res) => {
           ? Math.min(100, (elapsedInCycleMs / cycleDurationMs) * 100)
           : 0;
 
-      // -------------------------------------------------
-      // 4e. HASHRATE — REAL, FROM THE INVESTMENT RECORD
-      //
-      // The cron job recalculates `currentHashrate` on every
-      // cycle using fresh BTC price and the actual net principal.
-      // We read it directly. No invented numbers.
-      // -------------------------------------------------
+      // ---------------- HASHRATE ----------------
       const currentHashrate = Number(investment.currentHashrate) || 0;
-      const hashrateUnit = plan.hashrateUnit || 'TH/s';
-
-      // Most recent hashrate history entry (for display & trend)
       const hashrateHistory = Array.isArray(investment.hashrateHistory)
         ? investment.hashrateHistory
         : [];
 
       const latestHashrateEntry =
-        hashrateHistory.length > 0
-          ? hashrateHistory[hashrateHistory.length - 1]
-          : null;
-
+        hashrateHistory.length > 0 ? hashrateHistory[hashrateHistory.length - 1] : null;
       const previousHashrateEntry =
-        hashrateHistory.length > 1
-          ? hashrateHistory[hashrateHistory.length - 2]
-          : null;
+        hashrateHistory.length > 1 ? hashrateHistory[hashrateHistory.length - 2] : null;
 
-      // Hashrate change vs. previous cycle
       let hashrateChangePercent = 0;
       if (
         latestHashrateEntry &&
@@ -38460,84 +38413,128 @@ app.get('/api/investments/active', protect, async (req, res) => {
           100;
       }
 
-      // -------------------------------------------------
-      // 4f. PRINCIPAL BREAKDOWN
-      //
-      // amount / amountBTC       = NET principal currently mining
-      // originalAmount / BTC     = GROSS principal the user paid
-      // investmentFee            = first-cycle fee paid
-      // monthStartingPrincipal   = what began the current month
-      // -------------------------------------------------
-      const netPrincipalUSD = Number(investment.amount) || 0;
-      const netPrincipalBTC = Number(investment.amountBTC) || 0;
-      const grossPrincipalUSD = Number(investment.originalAmount) || netPrincipalUSD;
-      const grossPrincipalBTC = Number(investment.originalAmountBTC) || netPrincipalBTC;
-      const investmentFeeUSD = Number(investment.investmentFee) || 0;
-      const investmentFeeBTC = Number(investment.investmentFeeBTC) || 0;
+      // ---------------- PRINCIPAL ----------------
+      const netPrincipalUSD        = Number(investment.amount)            || 0;
+      const netPrincipalBTC        = Number(investment.amountBTC)         || 0;
+      const grossPrincipalUSD      = Number(investment.originalAmount)    || netPrincipalUSD;
+      const grossPrincipalBTC      = Number(investment.originalAmountBTC) || netPrincipalBTC;
+      const investmentFeeUSD       = Number(investment.investmentFee)     || 0;
+      const investmentFeeBTC       = Number(investment.investmentFeeBTC)  || 0;
 
       const monthStartingPrincipalUSD =
         Number(investment.monthStartingPrincipalUSD) || netPrincipalUSD;
       const monthStartingPrincipalBTC =
         Number(investment.monthStartingPrincipalBTC) || netPrincipalBTC;
 
-      // -------------------------------------------------
-      // 4g. RETURNS — REAL, FROM THE INVESTMENT RECORD
-      //
-      // monthToDateReturnUSD      = accumulated this month (swept at month end)
-      // cumulativeReturnUSD       = accumulated whole contract
-      // expectedReturn            = current cycle's expected return
-      // -------------------------------------------------
+      // ---------------- RETURNS ----------------
       const monthToDateReturnUSD = Number(investment.monthToDateReturnUSD) || 0;
       const monthToDateReturnBTC = Number(investment.monthToDateReturnBTC) || 0;
-      const cumulativeReturnUSD = Number(investment.cumulativeReturnUSD) || 0;
-      const cumulativeReturnBTC = Number(investment.cumulativeReturnBTC) || 0;
-      const expectedReturnUSD = Number(investment.expectedReturn) || 0;
-      const expectedReturnBTC = Number(investment.expectedReturnBTC) || 0;
+      const cumulativeReturnUSD  = Number(investment.cumulativeReturnUSD)  || 0;
+      const cumulativeReturnBTC  = Number(investment.cumulativeReturnBTC)  || 0;
+      const expectedReturnUSD    = Number(investment.expectedReturn)       || 0;
+      const expectedReturnBTC    = Number(investment.expectedReturnBTC)    || 0;
 
-      // -------------------------------------------------
-      // 4h. PROFIT MATH
-      //
-      // We express BOTH the current-cycle view and the
-      // whole-contract view. We do NOT invent numbers by
-      // multiplying amount × roi × elapsedFakeProgress.
-      // -------------------------------------------------
+      // ---------------- FEE LEDGER (from cycleHistory) ----------------
+      // Every completed cycle records its own fee. We sum every fee that
+      // has actually been charged so far across the whole contract.
+      const cycleHistory = Array.isArray(investment.cycleHistory)
+        ? investment.cycleHistory
+        : [];
 
-      // Current cycle profit = expected return for this cycle − net principal
+      let totalFeesPaidUSD = 0;
+      let totalFeesPaidBTC = 0;
+      let cyclesCharged    = 0;
+      for (const c of cycleHistory) {
+        const fUSD = Number(c.feeUSD) || 0;
+        const fBTC = Number(c.feeBTC) || 0;
+        totalFeesPaidUSD += fUSD;
+        totalFeesPaidBTC += fBTC;
+        if (fUSD > 0 || fBTC > 0) cyclesCharged += 1;
+      }
+
+      // If no cycle has closed yet, at least account for the creation fee
+      // charged on the very first cycle.
+      if (totalFeesPaidUSD === 0 && investmentFeeUSD > 0) {
+        totalFeesPaidUSD = investmentFeeUSD;
+      }
+      if (totalFeesPaidBTC === 0 && investmentFeeBTC > 0) {
+        totalFeesPaidBTC = investmentFeeBTC;
+      }
+
+      const totalFeesPercent =
+        grossPrincipalUSD > 0 ? (totalFeesPaidUSD / grossPrincipalUSD) * 100 : 0;
+
+      // Fee that will be charged on the NEXT cycle (approximation based on
+      // current net principal — real value is recalculated by the cron).
+      const perCycleFeeUSD = netPrincipalUSD * (cycleFeePercent / 100);
+      const perCycleFeeBTC = netPrincipalBTC * (cycleFeePercent / 100);
+
+      // ---------------- PROFIT MATH ----------------
       const currentCycleProfitUSD = Math.max(0, expectedReturnUSD - netPrincipalUSD);
-      const currentCycleProfitBTC =
-        btcPrice > 0 ? currentCycleProfitUSD / btcPrice : 0;
+      const currentCycleProfitBTC = btcPrice > 0 ? currentCycleProfitUSD / btcPrice : 0;
 
-      // Month-to-date profit = month return − month-starting principal
-      const monthToDateProfitUSD = Math.max(
-        0,
-        monthToDateReturnUSD - monthStartingPrincipalUSD
-      );
-      const monthToDateProfitBTC =
-        btcPrice > 0 ? monthToDateProfitUSD / btcPrice : 0;
+      const monthToDateProfitUSD  = Math.max(0, monthToDateReturnUSD - monthStartingPrincipalUSD);
+      const monthToDateProfitBTC  = btcPrice > 0 ? monthToDateProfitUSD / btcPrice : 0;
 
-      // Whole-contract net profit = cumulative return − gross principal
       const totalNetProfitUSD = cumulativeReturnUSD - grossPrincipalUSD;
-      const totalNetProfitBTC =
-        btcPrice > 0 ? totalNetProfitUSD / btcPrice : 0;
+      const totalNetProfitBTC = btcPrice > 0 ? totalNetProfitUSD / btcPrice : 0;
 
-      // Total ROI (contract lifetime)
       const totalRoiPercent =
         grossPrincipalUSD > 0 ? (totalNetProfitUSD / grossPrincipalUSD) * 100 : 0;
 
-      // Month-to-date ROI
       const monthToDateRoiPercent =
         monthStartingPrincipalUSD > 0
           ? (monthToDateProfitUSD / monthStartingPrincipalUSD) * 100
           : 0;
 
-      // -------------------------------------------------
-      // 4i. STATUS DISPLAY
-      // -------------------------------------------------
-      const isMatured = timeLeftMs <= 0 && investment.status === 'active';
-      const isFinalCycle = currentCycle >= cyclesPerMonth;
-      const isFinalMonth = currentMonth >= autoCompoundMonths;
+      // ---------------- NEXT EVENTS ----------------
+      const isFinalCycle       = currentCycle >= cyclesPerMonth;
+      const isFinalMonth       = currentMonth >= autoCompoundMonths;
       const isContractComplete = isFinalCycle && isFinalMonth;
+      const isMatured          = timeLeftMs <= 0 && investment.status === 'active';
 
+      const nextCycleAt = endDate ? endDate.toISOString() : null;
+
+      let nextMonthResetAt = null;
+      if (!isMatured && !isContractComplete && durationHours > 0) {
+        const cyclesUntilMonthEnd = Math.max(0, cyclesPerMonth - currentCycle);
+        const resetMs = (endMs || nowMs) + cyclesUntilMonthEnd * cycleDurationMs;
+        nextMonthResetAt = new Date(resetMs).toISOString();
+      }
+
+      let contractEndAt = null;
+      if (startMs !== null && durationHours > 0 && totalCycles > 0) {
+        contractEndAt = new Date(
+          startMs + totalCycles * cycleDurationMs
+        ).toISOString();
+      }
+
+      let nextEvent = null;
+      if (investment.status !== 'active') {
+        nextEvent = { type: 'closed', label: 'Contract closed', at: null };
+      } else if (isMatured) {
+        nextEvent = { type: 'matured', label: 'Awaiting settlement', at: null };
+      } else if (isContractComplete) {
+        nextEvent = {
+          type: 'final_payout',
+          label: 'Final payout',
+          at: endDate ? endDate.toISOString() : null
+        };
+      } else if (isFinalCycle) {
+        nextEvent = {
+          type: 'month_reset',
+          label: `Month ${currentMonth} sweep to matured wallet`,
+          at: nextMonthResetAt
+        };
+      } else {
+        nextEvent = {
+          type: 'cycle_payout',
+          label: `Cycle ${currentCycle + 1} payout`,
+          at: nextCycleAt
+        };
+      }
+
+      // ---------------- STATUS DISPLAY ----------------
       let statusText = '';
       let statusClass = '';
 
@@ -38564,49 +38561,30 @@ app.get('/api/investments/active', protect, async (req, res) => {
               : 'pending';
       }
 
-      // -------------------------------------------------
-      // 4j. RECENT CYCLE HISTORY (last 5 cycles only)
-      // -------------------------------------------------
-      const cycleHistory = Array.isArray(investment.cycleHistory)
-        ? investment.cycleHistory
-        : [];
+      // ---------------- RECENT CYCLES (last 5) ----------------
+      const recentCycles = cycleHistory.slice(-5).map((c) => ({
+        cycleNumber: c.cycleNumber,
+        monthNumber: c.monthNumber,
+        incomingBalanceUSD: Number(c.incomingBalanceUSD) || 0,
+        incomingBalanceBTC: Number(c.incomingBalanceBTC) || 0,
+        feeUSD: Number(c.feeUSD) || 0,
+        feeBTC: Number(c.feeBTC) || 0,
+        netPrincipalUSD: Number(c.netPrincipalUSD) || 0,
+        netPrincipalBTC: Number(c.netPrincipalBTC) || 0,
+        returnUSD: Number(c.returnUSD) || 0,
+        returnBTC: Number(c.returnBTC) || 0,
+        btcPriceAtStart: c.btcPriceAtStart || null,
+        btcPriceAtEnd:   c.btcPriceAtEnd   || null,
+        startDate: c.startDate || null,
+        endDate:   c.endDate   || null,
+        status:    c.status    || 'unknown'
+      }));
 
-      const recentCycles = cycleHistory
-        .slice(-5)
-        .map((c) => ({
-          cycleNumber: c.cycleNumber,
-          monthNumber: c.monthNumber,
-          incomingBalanceUSD: Number(c.incomingBalanceUSD) || 0,
-          incomingBalanceBTC: Number(c.incomingBalanceBTC) || 0,
-          feeUSD: Number(c.feeUSD) || 0,
-          feeBTC: Number(c.feeBTC) || 0,
-          netPrincipalUSD: Number(c.netPrincipalUSD) || 0,
-          netPrincipalBTC: Number(c.netPrincipalBTC) || 0,
-          returnUSD: Number(c.returnUSD) || 0,
-          returnBTC: Number(c.returnBTC) || 0,
-          btcPriceAtStart: c.btcPriceAtStart || null,
-          btcPriceAtEnd: c.btcPriceAtEnd || null,
-          startDate: c.startDate || null,
-          endDate: c.endDate || null,
-          status: c.status || 'unknown'
-        }));
-
-      // -------------------------------------------------
-      // 4k. NEXT EVENTS
-      // -------------------------------------------------
-      const nextCycleAt = endDate ? endDate.toISOString() : null;
-
-      // Month reset happens when the last cycle of the month completes.
-      let nextMonthResetAt = null;
-      if (!isMatured && isFinalCycle && endDate) {
-        nextMonthResetAt = endDate.toISOString();
-      }
-
-      // -------------------------------------------------
-      // 4l. ASSEMBLE THE PAYLOAD
-      // -------------------------------------------------
+      // ============================================================
+      // 5. ASSEMBLE THE PAYLOAD
+      // ============================================================
       return {
-        // ---- Identity ----
+        // ---------- Identity ----------
         id: investment._id,
         _id: investment._id,
         planName,
@@ -38620,7 +38598,7 @@ app.get('/api/investments/active', protect, async (req, res) => {
           hashrateUnit
         },
 
-        // ---- Principal breakdown ----
+        // ---------- Principal ----------
         principal: {
           grossUSD: grossPrincipalUSD,
           grossBTC: grossPrincipalBTC,
@@ -38633,13 +38611,38 @@ app.get('/api/investments/active', protect, async (req, res) => {
           investmentFeePercent: cycleFeePercent
         },
 
-        // ---- Time / cycle position ----
+        // ---------- Fees Paid So Far ----------
+        fees: {
+          // Every fee actually charged across the lifetime of the contract.
+          totalPaidUSD: parseFloat(totalFeesPaidUSD.toFixed(2)),
+          totalPaidBTC: parseFloat(totalFeesPaidBTC.toFixed(8)),
+          totalPaidPercent: parseFloat(totalFeesPercent.toFixed(4)),
+
+          // Structure of the fee that will be charged each cycle.
+          perCyclePercent: cycleFeePercent,
+          perCycleUSD: parseFloat(perCycleFeeUSD.toFixed(2)),
+          perCycleBTC: parseFloat(perCycleFeeBTC.toFixed(8)),
+
+          // Fee that was charged on the very first cycle at creation.
+          creationFeeUSD: parseFloat(investmentFeeUSD.toFixed(2)),
+          creationFeeBTC: parseFloat(investmentFeeBTC.toFixed(8)),
+
+          // How many cycles have had a fee captured in the ledger.
+          cyclesCharged
+        },
+
+        // ---------- Timing ----------
         timing: {
           startDate,
           endDate,
           maturityDate: formatDate(endDate),
           nextCycleAt,
+          nextCycleAtLabel: formatDateTime(nextCycleAt),
           nextMonthResetAt,
+          nextMonthResetAtLabel: formatDateTime(nextMonthResetAt),
+          contractEndAt,
+          contractEndAtLabel: formatDateTime(contractEndAt),
+          contractEndDate: formatDate(contractEndAt),
           durationHours,
           timeRemaining: {
             milliseconds: timeLeftMs,
@@ -38652,7 +38655,7 @@ app.get('/api/investments/active', protect, async (req, res) => {
           }
         },
 
-        // ---- Cycle / month position ----
+        // ---------- Cycle / Month Position ----------
         cycleInfo: {
           currentCycle,
           currentMonth,
@@ -38662,17 +38665,20 @@ app.get('/api/investments/active', protect, async (req, res) => {
           isAutoCompoundActive,
           isFinalCycle,
           isFinalMonth,
-          isContractComplete
+          isContractComplete,
+          completedCyclesTotal: cyclesCompletedTotal,
+          remainingCycles,
+          remainingMonths
         },
 
-        // ---- Progress ----
+        // ---------- Progress ----------
         progress: {
           contractPercent: parseFloat(contractProgressPercent.toFixed(2)),
           monthPercent: parseFloat(monthProgressPercent.toFixed(2)),
           cyclePercent: parseFloat(cycleProgressPercent.toFixed(2))
         },
 
-        // ---- Hashrate (real, from record) ----
+        // ---------- Hashrate ----------
         hashrate: {
           value: currentHashrate,
           unit: hashrateUnit,
@@ -38683,7 +38689,7 @@ app.get('/api/investments/active', protect, async (req, res) => {
             latestHashrateEntry?.btcPriceAtCalculation || null
         },
 
-        // ---- Returns / profit (real, from record) ----
+        // ---------- Returns ----------
         returns: {
           currentCycle: {
             expectedReturnUSD,
@@ -38707,14 +38713,17 @@ app.get('/api/investments/active', protect, async (req, res) => {
           }
         },
 
-        // ---- Status ----
+        // ---------- Status ----------
         status: investment.status,
         statusText,
         statusClass,
         isMatured,
         readyToAdvance: isMatured && !isContractComplete,
 
-        // ---- BTC price context ----
+        // ---------- Next Event ----------
+        nextEvent,
+
+        // ---------- BTC Price Context ----------
         btcPrice: {
           current: btcPrice,
           lockedAtInvestment: investment.btcPriceAtInvestment || null,
@@ -38722,19 +38731,57 @@ app.get('/api/investments/active', protect, async (req, res) => {
           source: priceStale ? 'locked' : 'live'
         },
 
-        // ---- Recent cycles (last 5) ----
+        // ---------- Recent Cycles ----------
         recentCycles,
 
-        // ---- Misc ----
+        // ---------- Misc ----------
         lastUpdated: formatTime(now),
         generatedAt: now.toISOString(),
-        balanceType: investment.balanceType || 'main'
+        balanceType: investment.balanceType || 'main',
+
+        // ============================================================
+        // 6. FLAT BACKWARD-COMPAT BLOCK
+        //    The current HTML reads these exact key names. Keeping them
+        //    in sync means the existing card starts displaying real
+        //    numbers immediately, with zero frontend change.
+        // ============================================================
+        amount: parseFloat(netPrincipalUSD.toFixed(2)),
+        amountBTC: parseFloat(netPrincipalBTC.toFixed(8)),
+        originalAmount: parseFloat(grossPrincipalUSD.toFixed(2)),
+        originalAmountBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
+        durationHours,
+        profitPercentage: planPercentage,
+        currentProfitUSD: parseFloat(currentCycleProfitUSD.toFixed(2)),
+        currentProfitBTC: parseFloat(currentCycleProfitBTC.toFixed(8)),
+        expectedProfitUSD: parseFloat(currentCycleProfitUSD.toFixed(2)),
+        expectedProfitBTC: parseFloat(currentCycleProfitBTC.toFixed(8)),
+        profitEarnedUSD: parseFloat(monthToDateProfitUSD.toFixed(2)),
+        profitEarnedBTC: parseFloat(monthToDateProfitBTC.toFixed(8)),
+        totalProfitUSD: parseFloat(totalNetProfitUSD.toFixed(2)),
+        totalProfitBTC: parseFloat(totalNetProfitBTC.toFixed(8)),
+        totalFeesPaidUSD: parseFloat(totalFeesPaidUSD.toFixed(2)),
+        totalFeesPaidBTC: parseFloat(totalFeesPaidBTC.toFixed(8)),
+        progressPercentage: parseFloat(contractProgressPercent.toFixed(2)),
+        monthProgressPercentage: parseFloat(monthProgressPercent.toFixed(2)),
+        cycleProgressPercentage: parseFloat(cycleProgressPercent.toFixed(2)),
+        endDate: endDate ? endDate.toISOString() : null,
+        nextCycleAt,
+        nextMonthResetAt,
+        contractEndAt,
+        currentCycle,
+        currentMonth,
+        totalCycles,
+        cyclesPerMonth,
+        autoCompoundMonths,
+        isAutoCompoundActive,
+        remainingCycles,
+        remainingMonths
       };
     });
 
-    // =============================================
-    // 5. RESPONSE
-    // =============================================
+    // ============================================================
+    // 7. RESPONSE
+    // ============================================================
     return res.json({
       status: 'success',
       data: {
@@ -38753,10 +38800,10 @@ app.get('/api/investments/active', protect, async (req, res) => {
         generatedAt: now.toISOString()
       }
     });
+
   } catch (err) {
     console.error('[investments/active] Fatal error:', err);
 
-    // Attempt to write a SystemLog entry so failures are auditable.
     try {
       await SystemLog.create({
         action: 'investments_active_error',
