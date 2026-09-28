@@ -20827,6 +20827,11 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
+
+
+
 // =============================================
 // CREATE INVESTMENT (with optional auto-compounding)
 // POST /api/investments
@@ -21444,40 +21449,40 @@ app.post('/api/investments', protect, [
             <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${plan.name}</strong> plan has been successfully activated.</p>
 
             <!-- Contract Summary -->
-            <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
+            <div style="background: #F8F9FA; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #E2E8F0;">
+                <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 16px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Contract Summary</h3>
                 <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                     <tr>
-                        <td style="padding: 8px 0;"><strong>Gross Investment:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${formatted.grossBTC} BTC (≈ $${formatted.grossUSD})</td>
+                        <td style="padding: 8px 0; color: #64748B;">Gross Investment</td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: 600;">${formatted.grossBTC} BTC <span style="color:#6B7280; font-weight: 400;">(≈ $${formatted.grossUSD})</span></td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Total Estimated Fees (${projection.cycleFeePercent}%):</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">- ${formatted.feeBTC} BTC (≈ $${formatted.feeUSD})</td>
+                        <td style="padding: 8px 0; color: #EF4444;">Total Fees (${projection.cycleFeePercent}%)</td>
+                        <td style="padding: 8px 0; text-align: right; color: #EF4444; font-weight: 600;">- ${formatted.feeBTC} BTC <span style="color:#EF4444; font-weight: 400;">(≈ $${formatted.feeUSD})</span></td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Initial Net Principal:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})</td>
+                        <td style="padding: 8px 0; color: #64748B;">Initial Net Principal</td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: 600;">${formatted.netPrincipalBTC} BTC <span style="color:#6B7280; font-weight: 400;">(≈ $${formatted.netPrincipalUSD})</span></td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-weight: bold;">${projection.hashpower.toLocaleString()} TH/s</td>
+                        <td style="padding: 8px 0; color: #64748B;">Assigned Hashpower</td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: 600;">${projection.hashpower.toLocaleString()} TH/s</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Contract Duration:</strong></td>
-                        <td style="padding: 8px 0; text-align: right;">${isSingleCycle ? 'Single Cycle' : `${requestedMonths} Month(s)`} (${projection.cyclesPerMonth} cycles/month)</td>
+                        <td style="padding: 8px 0; color: #64748B;">Contract Duration</td>
+                        <td style="padding: 8px 0; text-align: right;">${isSingleCycle ? `Single Cycle (${projection.cyclesPerMonth} cycles/month)` : `${requestedMonths} Month(s) (${projection.cyclesPerMonth} cycles/month)`}</td>
                     </tr>
                      <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Cycle Start:</strong></td>
+                        <td style="padding: 8px 0; color: #64748B;">Cycle Start</td>
                         <td style="padding: 8px 0; text-align: right;">${formattedStartDate}</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Final Payout Date:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; color: #F7A600; font-weight: bold;">${formattedFinalEndDate}</td>
+                        <td style="padding: 8px 0; color: #64748B;">Final Payout Date</td>
+                        <td style="padding: 8px 0; text-align: right; font-weight: 600; color: #F7A600;">${formattedFinalEndDate}</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
-                        <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
-                        <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
+                        <td style="padding: 8px 0; color: #64748B;">Contract ID</td>
+                        <td style="padding: 8px 0; text-align: right; font-size: 12px;">${transaction.reference}</td>
                     </tr>
                 </table>
             </div>
@@ -21496,11 +21501,11 @@ app.post('/api/investments', protect, [
               <div style="border-top: 1px solid #A7F3D0; padding-top: 16px; margin-top: 16px;">
                 <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                   <tr>
-                    <td style="padding: 6px 0; color: #065F46;"><strong>Net Profit:</strong></td>
+                    <td style="padding: 6px 0; color: #065F46;">Net Profit</td>
                     <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">+$${formatted.totalProfitUSD} USD</td>
                   </tr>
                   <tr>
-                    <td style="padding: 6px 0; color: #065F46;"><strong>Return on Investment (ROI):</strong></td>
+                    <td style="padding: 6px 0; color: #065F46;">Return on Investment (ROI)</td>
                     <td style="padding: 6px 0; text-align: right; color: #10B981; font-weight: bold;">${formatted.roiPercent}%</td>
                   </tr>
                 </table>
@@ -22697,21 +22702,6 @@ cron.schedule('*/10 * * * * *', async () => {
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
 console.log('⏰ Handles single-cycle contracts, per-cycle fee (plan-driven), month-boundary sweep+reset, and final payout\n');
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
