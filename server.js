@@ -19333,7 +19333,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
   const userAgentHeader = req.headers['user-agent'] || 'Unknown';
@@ -19509,6 +19508,11 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     /**
      * Hashpower (TH/s) from net principal.
+     *
+     * The investment endpoint derives hashpower from the NET principal
+     * that actually mines during cycle 1 (gross − first-cycle fee). The
+     * calculator must use the same basis so the two surfaces agree.
+     *
      * hashpower = (netPrincipalUSD × (planPercentage / 100) / btcPrice)
      *           / (BTC_PER_TH_PER_HOUR × durationHours)
      */
@@ -19540,44 +19544,47 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     /**
      * ------------------------------------------------------------------
-     * CONTRACT PROJECTION — MONTHLY RESET MODEL
+     * CONTRACT PROJECTION — CORRECTED MONTHLY RESET MODEL
      * ------------------------------------------------------------------
-     * This is the canonical implementation. It is mathematically identical
-     * to the projection used by POST /api/investments and by the client-
-     * side calculateMultiMonthProjection() on cloudmining.html.
+     * This implementation is now mathematically identical to:
+     *   • POST /api/investments (investment creation)
+     *   • completeMaturedInvestmentsCron (monthly reset + payout)
      *
-     * Model:
-     *   1. The gross principal is the user's deposit (e.g. $1,000).
-     *   2. The 3% cycle fee is charged on the incoming balance of EVERY
-     *      cycle — including cycle 1. There is no "outside the loop"
-     *      fee. The fee is the ONLY cost on the contract.
-     *   3. Within a month, each cycle's post-fee return becomes the next
-     *      cycle's incoming balance (in-month compounding).
-     *   4. At the month boundary, the compounded month-end value is the
-     *      month's payout. The principal RESETS to the ORIGINAL NET
-     *      principal (gross − firstCycleFee) for the next month.
-     *      This produces linear month-over-month growth rather than
-     *      exponential growth across months.
+     * Model (matches the investment endpoint exactly):
      *
-     * Fees accounting:
-     *   totalFeesUSD starts at the first-cycle fee (charged on the gross
-     *   principal), then accumulates every subsequent cycle's fee.
+     *   1. The gross principal is the user's deposit ($1,000).
+     *
+     *   2. MONTH 1 STARTS FROM THE GROSS PRINCIPAL.
+     *      Cycle 1 incoming = $1,000.00, fee = $30.00, net = $970.00.
+     *
+     *   3. WITHIN A MONTH, each cycle's post-fee return becomes the
+     *      next cycle's incoming balance (in-month compounding).
+     *
+     *   4. AT THE MONTH BOUNDARY (months 2..N), the principal resets
+     *      to the ORIGINAL NET principal (gross − first-cycle fee).
+     *      This is exactly what the investment endpoint stores in
+     *      `monthStartingPrincipalUSD` at investment creation time.
+     *
+     *   5. The fee is charged on the incoming balance of EVERY cycle,
+     *      including cycle 1 of month 1. The loop below charges each
+     *      fee exactly once — there is no pre-seeded first-cycle fee.
+     *
+     * Fee accounting:
+     *   totalFeesUSD accumulates `monthFeesUSD` for every month, with no
+     *   special-casing. Cycle 1 of month 1 contributes its $30.00 fee
+     *   through the loop, not through a seed.
      *
      * Profit accounting:
-     *   totalProfitUSD = totalReturnUSD − grossPrincipalUSD
-     *   (gross principal, not net principal — the fee is already
-     *   included in the cycle math, so subtracting net principal would
-     *   understate the cost basis and inflate profit by exactly the
-     *   first-cycle fee.)
+     *   totalProfitUSD = totalReturnUSD − grossPrincipalUSD.
      *
      * For $1,000 on a 1-month plan with 15 cycles and 3% fee:
-     *   First cycle incoming = $1,000.00, fee = $30.00, net = $970.00
-     *   Cycle 2 incoming     = $1,022.83, fee = $30.68, ...
+     *   Month 1 cycle 1 incoming = $1,000.00, fee = $30.00, net = $970.00
+     *   Month 1 cycle 2 incoming = $1,083.49, fee = $32.50, ...
      *   ...
-     *   Month-end return     = $2,141.47
-     *   Total fees           = $678.23
-     *   Net profit           = $2,141.47 − $1,000 = $1,141.47
-     *   ROI                  = 114.15%
+     *   Month-end return         = $2,141.47
+     *   Total fees               = $648.23
+     *   Net profit               = $2,141.47 − $1,000 = $1,141.47
+     *   ROI                      = 114.15%
      * ------------------------------------------------------------------
      */
     const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
@@ -19592,14 +19599,17 @@ app.post('/api/mining/calculator', async (req, res) => {
       const grossPrincipalUSD = principalUSD;
       const grossPrincipalBTC = principalUSD / currentBtcPrice;
 
-      // ----- First cycle net principal (gross minus the first-cycle fee) -----
-      //      Used to derive hashpower and to seed the month-reset base.
+      // ----- First-cycle net principal (gross minus the first-cycle fee) -----
+      //      Used to derive hashpower and to seed the MONTH-RESET base
+      //      for months 2..N. It must NOT be used as the starting point
+      //      for month 1 — that was the bug.
       const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
       const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
       const firstNetPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
       const firstNetPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
 
       // ----- Hashpower based on the net principal that actually mines -----
+      //      (matches the investment endpoint's `initialHashpower`)
       const initialHashpower = calculateHashpower(
         firstNetPrincipalUSD,
         plan.percentage,
@@ -19608,11 +19618,11 @@ app.post('/api/mining/calculator', async (req, res) => {
       );
 
       // ----- Accumulators -----
-      // CRITICAL: seed the fee accumulator with the first-cycle fee,
-      //           since that fee is charged inside the cycle loop below.
-      //           Seeding at 0 is what caused the $30 under-report.
-      let totalFeesUSD = firstCycleFeeUSD;
-      let totalFeesBTC = firstCycleFeeBTC;
+      // NOTE: fee accumulator is NOT pre-seeded. The cycle loop below
+      //       charges the first-cycle fee itself, on the gross principal,
+      //       which is exactly what the investment endpoint does.
+      let totalFeesUSD = 0;
+      let totalFeesBTC = 0;
 
       let totalReturnUSD = 0;
       let totalReturnBTC = 0;
@@ -19620,11 +19630,10 @@ app.post('/api/mining/calculator', async (req, res) => {
       const monthlyBreakdown = [];
 
       // ----- Month loop (reset model) -----
-      // At the start of each month, incoming = original net principal.
-      // That means cycle 1 of every month pays the same $30 fee on the
-      // same $970 base, which matches the investment endpoint.
-      let monthStartingPrincipalUSD = firstNetPrincipalUSD;
-      let monthStartingPrincipalBTC = firstNetPrincipalBTC;
+      // Month 1 starts at GROSS principal.
+      // Months 2..N start at the original NET principal.
+      let monthStartingPrincipalUSD = grossPrincipalUSD;
+      let monthStartingPrincipalBTC = grossPrincipalBTC;
 
       for (let month = 1; month <= totalMonths; month++) {
         let monthIncomingUSD = monthStartingPrincipalUSD;
@@ -19637,6 +19646,7 @@ app.post('/api/mining/calculator', async (req, res) => {
 
         for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
           // Fee is charged at the start of EVERY cycle on the incoming balance.
+          // Month 1 cycle 1: incoming = $1,000.00 → fee = $30.00 (correct).
           const cycleFeeUSD = monthIncomingUSD * feeDecimal;
           const cycleFeeBTC = monthIncomingBTC * feeDecimal;
 
@@ -19660,20 +19670,13 @@ app.post('/api/mining/calculator', async (req, res) => {
           monthReturnBTC = cycleReturnBTC;
         }
 
-        // Month-end: compound result is the payout. Track it.
+        // Month-end: compounded result is the payout. Track it.
         totalReturnUSD += monthReturnUSD;
         totalReturnBTC += monthReturnBTC;
 
-        // Only the cycles inside this month contribute to the fee totals
-        // (the first-cycle fee was already seeded into totalFeesUSD).
-        if (month > 1) {
-          totalFeesUSD += monthFeesUSD;
-          totalFeesBTC += monthFeesBTC;
-        } else {
-          // Month 1: the first-cycle fee is already seeded; add the rest.
-          totalFeesUSD += (monthFeesUSD - firstCycleFeeUSD);
-          totalFeesBTC += (monthFeesBTC - firstCycleFeeBTC);
-        }
+        // Every month contributes its full fee total. No special-casing.
+        totalFeesUSD += monthFeesUSD;
+        totalFeesBTC += monthFeesBTC;
 
         // Month-level profit: month-end value minus the principal that
         // started the month.
@@ -19694,7 +19697,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         });
 
         // Month-boundary reset: principal returns to the ORIGINAL NET
-        // principal (NOT the compounded result).
+        // principal for every subsequent month.
         monthStartingPrincipalUSD = firstNetPrincipalUSD;
         monthStartingPrincipalBTC = firstNetPrincipalBTC;
       }
@@ -19703,9 +19706,7 @@ app.post('/api/mining/calculator', async (req, res) => {
       const finalPayoutUSD = monthlyBreakdown[monthlyBreakdown.length - 1].endingValueUSD;
       const finalPayoutBTC = monthlyBreakdown[monthlyBreakdown.length - 1].endingValueBTC;
 
-      // Profit is measured against the GROSS principal. The fee is already
-      // inside the cycle math, so subtracting net principal would add the
-      // first-cycle fee to the profit — that was the second half of the bug.
+      // Profit is measured against the GROSS principal.
       const totalProfitUSD = totalReturnUSD - grossPrincipalUSD;
       const totalProfitBTC = totalReturnBTC - grossPrincipalBTC;
 
@@ -19818,6 +19819,15 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     // =============================================
     // CASE 1: HASHRATE-BASED CALCULATION
+    //
+    // Reverse-engineer the required gross investment so that the user's
+    // requested TH/s is achieved. The reverse math must invert the SAME
+    // chain used forward:
+    //
+    //   gross → fee → net → returnUSD → returnBTC → hashpower
+    //
+    // so the inverse is:
+    //   hashpower → returnBTC → returnUSD → net → gross
     // =============================================
     if (calculationType === 'hashrate' && hashrateTH !== undefined) {
       const requestedTH = parseFloat(hashrateTH);
@@ -19831,21 +19841,27 @@ app.post('/api/mining/calculator', async (req, res) => {
       }
 
       const hashrateOptions = targetPlans.map(plan => {
-        // Reverse-engineer the required gross investment.
+        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
+        const feePercent = resolveCycleFeePercent(sourcePlan);
+        const feeDecimal = feePercent / 100;
+
+        // Forward: hashpower = (net × (pct/100) / btcPrice) / (BTC_PER_TH_PER_HOUR × durationHours)
+        // Invert:  net = hashpower × BTC_PER_TH_PER_HOUR × durationHours × btcPrice / (pct/100)
         const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.durationHours;
         const btcReturnNeeded = requestedTH * btcMinedPerTH;
         const usdReturnNeeded = btcReturnNeeded * btcPrice;
         const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
 
         // Gross investment backs out the first-cycle fee.
-        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
-        const feePercent = resolveCycleFeePercent(sourcePlan);
-        const grossInvestment = netPrincipalNeeded / (1 - feePercent / 100);
+        const grossInvestment = netPrincipalNeeded / (1 - feeDecimal);
 
         const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
         const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
 
-        const effectiveFee = effectiveInvestment * (feePercent / 100);
+        // Re-derive the hashpower that this effective investment
+        // will actually produce. Do this the exact same way the
+        // forward calculator does — on the net principal.
+        const effectiveFee = effectiveInvestment * feeDecimal;
         const effectiveNet = effectiveInvestment - effectiveFee;
         const effectiveHashpower = calculateHashpower(
           effectiveNet,
@@ -19863,9 +19879,15 @@ app.post('/api/mining/calculator', async (req, res) => {
           effectiveInvestmentUSD: parseFloat(effectiveInvestment.toFixed(2)),
           effectiveInvestmentBTC: parseFloat((effectiveInvestment / btcPrice).toFixed(8)),
           effectiveHashpower,
-          hashpowerPerDollar: parseFloat((effectiveHashpower / effectiveInvestment).toFixed(6)),
-          costPerTHUSD: parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2)),
-          costPerTHBTC: parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8)),
+          hashpowerPerDollar: effectiveHashpower > 0
+            ? parseFloat((effectiveHashpower / effectiveInvestment).toFixed(6))
+            : 0,
+          costPerTHUSD: effectiveHashpower > 0
+            ? parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2))
+            : 0,
+          costPerTHBTC: effectiveHashpower > 0
+            ? parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8))
+            : 0,
           isWithinRange,
           rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum' :
                        grossInvestment > plan.maxAmount ? 'above_maximum' : 'within_range',
@@ -20388,8 +20410,6 @@ console.log('   - Real-time BTC price (not displayed)');
 console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
 console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
 console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
-
-
 
 
 
