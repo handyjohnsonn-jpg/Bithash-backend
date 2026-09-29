@@ -21368,1440 +21368,6 @@ console.log('💰 PAYOUT MODEL: profit-only for non-final months, principal + pr
 
 
 
-// =============================================
-// MINING CALCULATOR ENDPOINT
-// POST /api/mining/calculator
-//
-// ============================================================
-// PAYOUT MODEL — "PROFIT-ONLY UNTIL FINAL MONTH"
-// ============================================================
-//   • Non-final months → user receives PROFIT ONLY.
-//                        Principal stays locked in the contract.
-//   • Final month      → user receives PRINCIPAL + PROFIT.
-//                        Contract completes.
-//   • Single cycle     → same as FINAL month: principal + profit.
-//
-// The fee is charged on the incoming balance of EVERY cycle. It is
-// already baked into the net principal that mines and is NOT deducted
-// a second time at the month boundary.
-//
-// totalReturnUSD in every projection object represents the ACTUAL CASH
-// the user receives across the life of the contract.
-//
-// ============================================================
-// SINGLE-CYCLE SUPPORT
-// ============================================================
-//   • Single-cycle is measured in HOURS (matching plan.duration from DB),
-//     NOT months.
-//   • Accepted via `durationHours` OR by omitting `durationMonths`
-//     when the user only supplies `investmentAmount` (defaults to
-//     single-cycle for the matching plan).
-//   • `durationMonths` and `durationHours` are mutually exclusive.
-// ============================================================
-app.post('/api/mining/calculator', async (req, res) => {
-  const startTime = Date.now();
-  const userAgentHeader = req.headers['user-agent'] || 'Unknown';
-
-  try {
-    // =============================================
-    // EXTRACT INPUTS
-    // =============================================
-    const {
-      investmentAmount,
-      durationMonths,
-      durationHours,
-      hashrateTH,
-      calculationType
-    } = req.body || {};
-
-    // =============================================
-    // VALIDATE INPUTS
-    // =============================================
-    const errors = [];
-
-    // calculationType — extended with 'single_cycle'
-    if (calculationType && !['investment', 'hashrate', 'duration', 'single_cycle'].includes(calculationType)) {
-      errors.push('Invalid calculation type. Must be: investment, hashrate, duration, or single_cycle');
-    }
-
-    // investmentAmount validation
-    if (investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== '') {
-      const amount = parseFloat(investmentAmount);
-      if (isNaN(amount) || amount < 50) {
-        errors.push('Minimum investment amount is $50');
-      }
-      if (amount > 1000000) {
-        errors.push('Maximum investment amount is $1,000,000');
-      }
-    }
-
-    // durationMonths validation (multi-month contracts)
-    if (durationMonths !== undefined && durationMonths !== null && durationMonths !== '') {
-      const months = parseInt(durationMonths);
-      if (isNaN(months) || ![1, 3, 6, 9, 12].includes(months)) {
-        errors.push('Duration in months must be 1, 3, 6, 9, or 12');
-      }
-    }
-
-    // durationHours validation (single-cycle contracts)
-    if (durationHours !== undefined && durationHours !== null && durationHours !== '') {
-      const hours = parseFloat(durationHours);
-      if (isNaN(hours) || hours <= 0) {
-        errors.push('Duration in hours must be a positive number');
-      }
-    }
-
-    // Mutual exclusivity: cannot supply both
-    const hasMonths = durationMonths !== undefined && durationMonths !== null && durationMonths !== '';
-    const hasHours = durationHours !== undefined && durationHours !== null && durationHours !== '';
-    if (hasMonths && hasHours) {
-      errors.push('Provide either durationMonths or durationHours, not both');
-    }
-
-    // Single-cycle type requires durationHours
-    if (calculationType === 'single_cycle' && !hasHours) {
-      errors.push('single_cycle calculation requires durationHours');
-    }
-
-    // hashrateTH validation
-    if (hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '') {
-      const th = parseFloat(hashrateTH);
-      if (isNaN(th) || th <= 0) {
-        errors.push('Hashrate must be a positive number');
-      }
-    }
-
-    if (errors.length > 0) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Validation failed',
-        errors: errors,
-        success: false
-      });
-    }
-
-    // =============================================
-    // FETCH REAL-TIME BTC PRICE
-    // =============================================
-    let btcPrice;
-    try {
-      btcPrice = await getRealTimeBitcoinPrice();
-    } catch (priceError) {
-      console.error('Failed to fetch BTC price for calculator:', priceError.message);
-      return res.status(503).json({
-        status: 'error',
-        message: 'Unable to fetch current market data. Please try again later.',
-        success: false,
-        retryAfter: 10
-      });
-    }
-
-    if (!btcPrice || btcPrice <= 0) {
-      return res.status(503).json({
-        status: 'error',
-        message: 'Unable to fetch current market data. Please try again later.',
-        success: false,
-        retryAfter: 10
-      });
-    }
-
-    // =============================================
-    // FETCH ALL ACTIVE PLANS
-    // =============================================
-    const plans = await Plan.find({ isActive: true }).sort({ minAmount: 1 }).lean();
-
-    if (!plans || plans.length === 0) {
-      return res.status(503).json({
-        status: 'error',
-        message: 'No mining contracts available at this time.',
-        success: false
-      });
-    }
-
-    // =============================================
-    // RESOLVE THE ACTOR (LOGGED-IN USER vs GUEST)
-    // =============================================
-    const resolveCalculatorActor = async (req) => {
-      const actor = {
-        isLoggedIn: false,
-        userId: null,
-        user: null,
-        performedBy: null,
-        performedByModel: 'System',
-        performedByName: 'Guest User',
-        performedByEmail: 'guest@bithash.com'
-      };
-
-      const authHeader = req.headers.authorization;
-      const headerToken = authHeader && authHeader.startsWith('Bearer ')
-        ? authHeader.split(' ')[1]
-        : null;
-      const cookieToken = req.cookies && req.cookies.jwt ? req.cookies.jwt : null;
-      const token = headerToken || cookieToken;
-
-      if (!token) return actor;
-
-      try {
-        const decoded = verifyJWT(token);
-        if (!decoded || !decoded.id) return actor;
-
-        const dbUser = await User.findById(decoded.id)
-          .select('firstName lastName email balances status isVerified')
-          .lean();
-
-        if (!dbUser) return actor;
-
-        const fullName = [dbUser.firstName, dbUser.lastName]
-          .filter(Boolean)
-          .join(' ')
-          .trim();
-
-        actor.isLoggedIn = true;
-        actor.userId = dbUser._id;
-        actor.user = dbUser;
-        actor.performedBy = dbUser._id;
-        actor.performedByModel = 'User';
-        actor.performedByName = fullName || dbUser.email || 'User';
-        actor.performedByEmail = dbUser.email || 'unknown@bithash.com';
-
-        return actor;
-      } catch (authErr) {
-        return actor;
-      }
-    };
-
-    const actor = await resolveCalculatorActor(req);
-    const isLoggedIn = actor.isLoggedIn;
-    const userId = actor.userId;
-    const user = actor.user;
-
-    // =============================================
-    // HELPER FUNCTIONS FOR CALCULATIONS
-    // =============================================
-
-    /**
-     * Cycles per 30-day month for a given plan duration (hours).
-     */
-    const calculateCyclesPerMonth = (planDurationHours) => {
-      if (!planDurationHours || planDurationHours <= 0) return 1;
-      const monthHours = 30 * 24; // 720 hours
-      return Math.max(1, Math.floor(monthHours / planDurationHours));
-    };
-
-    /**
-     * Total cycles across the whole contract life (multi-month).
-     */
-    const calculateTotalCycles = (autoCompoundMonths, planDurationHours) => {
-      const months = autoCompoundMonths && autoCompoundMonths > 0 ? autoCompoundMonths : 1;
-      return months * calculateCyclesPerMonth(planDurationHours);
-    };
-
-    /**
-     * Hashpower (TH/s) from net principal.
-     *
-     *   hashpower = (netPrincipalUSD × (planPercentage / 100) / btcPrice)
-     *             / (BTC_PER_TH_PER_HOUR × durationHours)
-     */
-    const calculateHashpower = (netPrincipalUSD, planPercentage, durationHours, currentBtcPrice) => {
-      if (!netPrincipalUSD || netPrincipalUSD <= 0) return 0;
-      if (!planPercentage || planPercentage <= 0) return 0;
-      if (!durationHours || durationHours <= 0) return 0;
-      if (!currentBtcPrice || currentBtcPrice <= 0) return 0;
-
-      const cycleReturnUSD = netPrincipalUSD * (planPercentage / 100);
-      const cycleReturnBTC = cycleReturnUSD / currentBtcPrice;
-      const btcMinedPerTH = BTC_PER_TH_PER_HOUR * durationHours;
-      if (btcMinedPerTH <= 0) return 0;
-
-      const hashpower = cycleReturnBTC / btcMinedPerTH;
-      return Math.max(0, parseFloat(hashpower.toFixed(4)));
-    };
-
-    /**
-     * Resolve the cycle fee percent for a plan. Per-plan override wins.
-     */
-    const resolveCycleFeePercent = (plan) => {
-      if (plan && typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0) {
-        return plan.cycleFeePercent;
-      }
-      return CYCLE_FEE_PERCENT;
-    };
-
-    /**
-     * ------------------------------------------------------------------
-     * SINGLE-CYCLE PROJECTION
-     * ------------------------------------------------------------------
-     * A single cycle is measured in HOURS, not months.
-     *
-     *   • Fee is charged once on the gross principal.
-     *   • Net principal = gross − fee.
-     *   • Return = net principal × (1 + planPercentage / 100).
-     *   • Payout = full return (principal + profit).
-     *   • Net Profit is measured against the NET principal.
-     *   • ROI is measured against the GROSS principal (what the user paid).
-     * ------------------------------------------------------------------
-     */
-    const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
-      const planPercentageDecimal = plan.percentage / 100;
-      const durationHours = plan.duration;
-      const feePercent = resolveCycleFeePercent(plan);
-      const feeDecimal = feePercent / 100;
-
-      const grossPrincipalUSD = principalUSD;
-      const grossPrincipalBTC = principalUSD / currentBtcPrice;
-
-      // First-cycle fee (charged once)
-      const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
-      const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
-
-      // Net principal that actually mines
-      const netPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
-      const netPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
-
-      // Hashpower from the net principal
-      const hashpower = calculateHashpower(
-        netPrincipalUSD,
-        plan.percentage,
-        durationHours,
-        currentBtcPrice
-      );
-
-      // Final return = net principal × (1 + return%)
-      const totalReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
-      const totalReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
-
-      // Net profit measured against net principal (this is what the
-      // user actually earned — their principal is returned as part of
-      // the payout, so profit is only the excess).
-      const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
-      const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
-
-      // ROI measured against gross principal (what the user actually paid)
-      const roiPercent = grossPrincipalUSD > 0
-        ? (totalProfitUSD / grossPrincipalUSD) * 100
-        : 0;
-
-      return {
-        payoutModel: 'single_cycle',
-        principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
-        principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
-        firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
-        firstCycleFeeBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
-        netPrincipalUSD: parseFloat(netPrincipalUSD.toFixed(2)),
-        netPrincipalBTC: parseFloat(netPrincipalBTC.toFixed(8)),
-        hashpower,
-
-        totalReturnUSD: parseFloat(totalReturnUSD.toFixed(2)),
-        totalReturnBTC: parseFloat(totalReturnBTC.toFixed(8)),
-        totalPayoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
-        totalPayoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
-        totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
-        totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
-        finalPayoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
-        finalPayoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
-
-        totalFeesUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
-        totalFeesBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
-
-        cyclesPerMonth: calculateCyclesPerMonth(durationHours),
-        totalCycles: 1,
-        durationMonths: 0,
-        durationHours,
-        cycleDurationHours: durationHours,
-        cycleFeePercent: feePercent,
-
-        roiPercent: parseFloat(roiPercent.toFixed(2)),
-        roiPerMonth: 0,
-
-        monthlyBreakdown: [],
-        payoutPerMonth: [{
-          month: 1,
-          isFinalMonth: true,
-          payoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
-          payoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
-          profitUSD: parseFloat(totalProfitUSD.toFixed(2)),
-          profitBTC: parseFloat(totalProfitBTC.toFixed(8)),
-          note: 'Single-cycle contract pays principal + profit at cycle end'
-        }]
-      };
-    };
-
-    /**
-     * ------------------------------------------------------------------
-     * MULTI-MONTH PROJECTION — "PROFIT-ONLY UNTIL FINAL MONTH"
-     * ------------------------------------------------------------------
-     * Matches POST /api/investments and completeMaturedInvestmentsCron.
-     *
-     *   1. Gross principal is the user's deposit.
-     *   2. Month 1 starts from the GROSS principal.
-     *   3. Cycle fee is charged on the incoming balance of EVERY cycle.
-     *   4. Within a month, each cycle's return is the next cycle's incoming.
-     *   5. At each month boundary:
-     *        • Non-final → user receives PROFIT ONLY (ending − starting)
-     *        • Final     → user receives PRINCIPAL + PROFIT (ending)
-     *   6. `monthStartingPrincipal` is FIXED at the original net
-     *      principal (gross − first-cycle fee) for months 2..N.
-     *
-     * totalReturnUSD = SUM of actual payouts (profit for non-final,
-     *                  principal + profit for final).
-     * ------------------------------------------------------------------
-     */
-    const calculateMultiMonthProjection = (principalUSD, plan, months, currentBtcPrice) => {
-      const planPercentageDecimal = plan.percentage / 100;
-      const durationHours = plan.duration;
-      const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
-      const totalMonths = months;
-      const feePercent = resolveCycleFeePercent(plan);
-      const feeDecimal = feePercent / 100;
-
-      const grossPrincipalUSD = principalUSD;
-      const grossPrincipalBTC = principalUSD / currentBtcPrice;
-
-      // First-cycle net principal — this is the base that mines months 2..N
-      const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
-      const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
-      const firstNetPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
-      const firstNetPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
-
-      // Hashpower from net principal
-      const initialHashpower = calculateHashpower(
-        firstNetPrincipalUSD,
-        plan.percentage,
-        durationHours,
-        currentBtcPrice
-      );
-
-      let totalFeesUSD = 0;
-      let totalFeesBTC = 0;
-
-      // totalPayoutUSD accumulates ACTUAL cash paid to the user
-      let totalPayoutUSD = 0;
-      let totalPayoutBTC = 0;
-
-      const monthlyBreakdown = [];
-      const payoutPerMonth = [];
-
-      // Month 1 starts at gross; months 2..N start at the net principal.
-      let monthStartingPrincipalUSD = grossPrincipalUSD;
-      let monthStartingPrincipalBTC = grossPrincipalBTC;
-
-      for (let month = 1; month <= totalMonths; month++) {
-        const isFinalMonth = month === totalMonths;
-
-        let monthIncomingUSD = monthStartingPrincipalUSD;
-        let monthIncomingBTC = monthStartingPrincipalBTC;
-
-        let monthReturnUSD = 0;
-        let monthReturnBTC = 0;
-        let monthFeesUSD = 0;
-        let monthFeesBTC = 0;
-
-        for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
-          // Fee on incoming balance
-          const cycleFeeUSD = monthIncomingUSD * feeDecimal;
-          const cycleFeeBTC = monthIncomingBTC * feeDecimal;
-
-          monthFeesUSD += cycleFeeUSD;
-          monthFeesBTC += cycleFeeBTC;
-
-          const netPrincipalUSD = monthIncomingUSD - cycleFeeUSD;
-          const netPrincipalBTC = monthIncomingBTC - cycleFeeBTC;
-
-          const cycleReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
-          const cycleReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
-
-          monthIncomingUSD = cycleReturnUSD;
-          monthIncomingBTC = cycleReturnBTC;
-
-          monthReturnUSD = cycleReturnUSD;
-          monthReturnBTC = cycleReturnBTC;
-        }
-
-        totalFeesUSD += monthFeesUSD;
-        totalFeesBTC += monthFeesBTC;
-
-        const monthProfitUSD = monthReturnUSD - monthStartingPrincipalUSD;
-        const monthProfitBTC = monthReturnBTC - monthStartingPrincipalBTC;
-
-        // Payout composition
-        const monthPayoutUSD = isFinalMonth ? monthReturnUSD : monthProfitUSD;
-        const monthPayoutBTC = isFinalMonth ? monthReturnBTC : monthProfitBTC;
-
-        totalPayoutUSD += monthPayoutUSD;
-        totalPayoutBTC += monthPayoutBTC;
-
-        monthlyBreakdown.push({
-          month,
-          isFinalMonth,
-          startingPrincipalUSD: parseFloat(monthStartingPrincipalUSD.toFixed(2)),
-          startingPrincipalBTC: parseFloat(monthStartingPrincipalBTC.toFixed(8)),
-          endingValueUSD: parseFloat(monthReturnUSD.toFixed(2)),
-          endingValueBTC: parseFloat(monthReturnBTC.toFixed(8)),
-          payoutUSD: parseFloat(monthPayoutUSD.toFixed(2)),
-          payoutBTC: parseFloat(monthPayoutBTC.toFixed(8)),
-          profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
-          profitBTC: parseFloat(monthProfitBTC.toFixed(8)),
-          cyclesInMonth: cyclesPerMonth,
-          feesPaidUSD: parseFloat(monthFeesUSD.toFixed(2)),
-          feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
-        });
-
-        payoutPerMonth.push({
-          month,
-          isFinalMonth,
-          payoutUSD: parseFloat(monthPayoutUSD.toFixed(2)),
-          payoutBTC: parseFloat(monthPayoutBTC.toFixed(8)),
-          profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
-          profitBTC: parseFloat(monthProfitBTC.toFixed(8)),
-          note: isFinalMonth
-            ? 'Final month: principal + profit'
-            : 'Non-final month: profit only'
-        });
-
-        // CRITICAL: Month-boundary reset for months 2..N.
-        // The principal that mines each subsequent month is the original
-        // NET principal — it does NOT change based on the ending balance.
-        monthStartingPrincipalUSD = firstNetPrincipalUSD;
-        monthStartingPrincipalBTC = firstNetPrincipalBTC;
-      }
-
-      const finalPayoutUSD = monthlyBreakdown[monthlyBreakdown.length - 1].payoutUSD;
-      const finalPayoutBTC = monthlyBreakdown[monthlyBreakdown.length - 1].payoutBTC;
-
-      // Profit measured against gross principal
-      const totalProfitUSD = totalPayoutUSD - grossPrincipalUSD;
-      const totalProfitBTC = totalPayoutBTC - grossPrincipalBTC;
-
-      const roiPercent = grossPrincipalUSD > 0
-        ? (totalProfitUSD / grossPrincipalUSD) * 100
-        : 0;
-      const roiPerMonth = totalMonths > 0 ? roiPercent / totalMonths : 0;
-
-      return {
-        payoutModel: 'profit_only_until_final_month',
-        principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
-        principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
-        firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
-        firstCycleFeeBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
-        netPrincipalUSD: parseFloat(firstNetPrincipalUSD.toFixed(2)),
-        netPrincipalBTC: parseFloat(firstNetPrincipalBTC.toFixed(8)),
-        hashpower: initialHashpower,
-
-        totalReturnUSD: parseFloat(totalPayoutUSD.toFixed(2)),
-        totalReturnBTC: parseFloat(totalPayoutBTC.toFixed(8)),
-        totalPayoutUSD: parseFloat(totalPayoutUSD.toFixed(2)),
-        totalPayoutBTC: parseFloat(totalPayoutBTC.toFixed(8)),
-        totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
-        totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
-        finalPayoutUSD: parseFloat(finalPayoutUSD.toFixed(2)),
-        finalPayoutBTC: parseFloat(finalPayoutBTC.toFixed(8)),
-
-        totalFeesUSD: parseFloat(totalFeesUSD.toFixed(2)),
-        totalFeesBTC: parseFloat(totalFeesBTC.toFixed(8)),
-
-        cyclesPerMonth,
-        totalCycles: cyclesPerMonth * totalMonths,
-        durationMonths: totalMonths,
-        durationHours,
-        cycleDurationHours: durationHours,
-        cycleFeePercent: feePercent,
-
-        roiPercent: parseFloat(roiPercent.toFixed(2)),
-        roiPerMonth: parseFloat(roiPerMonth.toFixed(2)),
-
-        monthlyBreakdown,
-        payoutPerMonth
-      };
-    };
-
-    /**
-     * ------------------------------------------------------------------
-     * UNIFIED CONTRACT PROJECTION
-     * ------------------------------------------------------------------
-     * Routes to the correct model based on `months`:
-     *   • months === 0 → single-cycle (hours-based)
-     *   • months >= 1  → multi-month (profit-only until final month)
-     *
-     * Kept as a single entry point so all callers (hashrate / investment
-     * / duration branches) use the same math.
-     * ------------------------------------------------------------------
-     */
-    const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
-      if (!months || months === 0) {
-        return calculateSingleCycleProjection(principalUSD, plan, currentBtcPrice);
-      }
-      return calculateMultiMonthProjection(principalUSD, plan, months, currentBtcPrice);
-    };
-
-    // =============================================
-    // COST PER TH/S FOR EACH PLAN
-    // =============================================
-    const calculateCostPerTH = (plan, currentBtcPrice) => {
-      const minInvestment = plan.minAmount;
-      const feePercent = resolveCycleFeePercent(plan);
-      const feeUSD = minInvestment * (feePercent / 100);
-      const netPrincipalUSD = minInvestment - feeUSD;
-
-      const hashpower = calculateHashpower(
-        netPrincipalUSD,
-        plan.percentage,
-        plan.duration,
-        currentBtcPrice
-      );
-
-      if (hashpower <= 0) return null;
-
-      const costPerTHUSD = minInvestment / hashpower;
-
-      return {
-        minInvestment,
-        hashpowerAtMin: hashpower,
-        costPerTHUSD: parseFloat(costPerTHUSD.toFixed(2)),
-        costPerTHBTC: parseFloat((costPerTHUSD / currentBtcPrice).toFixed(8))
-      };
-    };
-
-    // =============================================
-    // PLAN METRICS (used by duration + overview branches)
-    // =============================================
-    const planMetrics = plans.map(plan => {
-      const costData = calculateCostPerTH(plan, btcPrice);
-      const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
-
-      return {
-        planId: plan._id.toString(),
-        name: plan.name,
-        description: plan.description,
-        percentage: plan.percentage,
-        durationHours: plan.duration,
-        durationDays: parseFloat((plan.duration / 24).toFixed(2)),
-        cyclesPerMonth,
-        minAmount: plan.minAmount,
-        maxAmount: plan.maxAmount,
-        minAmountBTC: parseFloat((plan.minAmount / btcPrice).toFixed(8)),
-        maxAmountBTC: parseFloat((plan.maxAmount / btcPrice).toFixed(8)),
-        costPerTH: costData
-      };
-    });
-
-    // =============================================
-    // CALCULATION TYPE HANDLERS
-    // =============================================
-    let result = {
-      calculationType: calculationType || 'investment',
-      timestamp: new Date().toISOString(),
-      success: true
-    };
-
-    // =============================================
-    // CASE 0: SINGLE-CYCLE CALCULATION (NEW)
-    //
-    // Requires:
-    //   • investmentAmount (or hashrateTH)
-    //   • durationHours (must match a plan's duration)
-    // =============================================
-    if (calculationType === 'single_cycle') {
-      const hours = parseFloat(durationHours);
-
-      // Find plans whose duration matches the requested hours
-      const matchingPlans = plans.filter(p => Number(p.duration) === hours);
-
-      if (matchingPlans.length === 0) {
-        const availableDurations = [...new Set(plans.map(p => p.duration))].sort((a, b) => a - b);
-        return res.status(400).json({
-          status: 'fail',
-          success: false,
-          message: `No active plan supports a ${hours}-hour cycle. Available single-cycle durations: ${availableDurations.join(', ')} hours.`,
-          availableDurations
-        });
-      }
-
-      // If hashrateTH was supplied, reverse-engineer the investment for each plan
-      if (hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '') {
-        const requestedTH = parseFloat(hashrateTH);
-
-        const hashrateOptions = matchingPlans.map(plan => {
-          const feePercent = resolveCycleFeePercent(plan);
-          const feeDecimal = feePercent / 100;
-
-          // Forward: hashpower = (net × (pct/100) / btcPrice) / (BTC_PER_TH_PER_HOUR × durationHours)
-          // Invert:  net = hashpower × BTC_PER_TH_PER_HOUR × durationHours × btcPrice / (pct/100)
-          const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.duration;
-          const btcReturnNeeded = requestedTH * btcMinedPerTH;
-          const usdReturnNeeded = btcReturnNeeded * btcPrice;
-          const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
-          const grossInvestment = netPrincipalNeeded / (1 - feeDecimal);
-
-          const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
-          const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
-
-          const effectiveFee = effectiveInvestment * feeDecimal;
-          const effectiveNet = effectiveInvestment - effectiveFee;
-          const effectiveHashpower = calculateHashpower(
-            effectiveNet,
-            plan.percentage,
-            plan.duration,
-            btcPrice
-          );
-
-          const projection = calculateSingleCycleProjection(
-            effectiveInvestment,
-            plan,
-            btcPrice
-          );
-
-          return {
-            planId: plan._id.toString(),
-            planName: plan.name,
-            requestedTH,
-            requiredInvestmentUSD: parseFloat(grossInvestment.toFixed(2)),
-            requiredInvestmentBTC: parseFloat((grossInvestment / btcPrice).toFixed(8)),
-            effectiveInvestmentUSD: parseFloat(effectiveInvestment.toFixed(2)),
-            effectiveInvestmentBTC: parseFloat((effectiveInvestment / btcPrice).toFixed(8)),
-            effectiveHashpower,
-            costPerTHUSD: effectiveHashpower > 0
-              ? parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2))
-              : 0,
-            costPerTHBTC: effectiveHashpower > 0
-              ? parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8))
-              : 0,
-            isWithinRange,
-            rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum'
-              : grossInvestment > plan.maxAmount ? 'above_maximum'
-              : 'within_range',
-            minAmount: plan.minAmount,
-            maxAmount: plan.maxAmount,
-            planDurationHours: plan.duration,
-            planPercentage: plan.percentage,
-            projection
-          };
-        });
-
-        hashrateOptions.sort((a, b) => a.costPerTHUSD - b.costPerTHUSD);
-        const bestOption = hashrateOptions.find(o => o.isWithinRange) || hashrateOptions[0];
-
-        result.singleCycleCalculation = {
-          durationHours: hours,
-          requestedTH,
-          options: hashrateOptions,
-          recommendedPlan: bestOption ? {
-            planId: bestOption.planId,
-            planName: bestOption.planName,
-            investmentUSD: bestOption.effectiveInvestmentUSD,
-            investmentBTC: bestOption.effectiveInvestmentBTC,
-            hashpower: bestOption.effectiveHashpower,
-            costPerTHUSD: bestOption.costPerTHUSD,
-            costPerTHBTC: bestOption.costPerTHBTC,
-            totalPayoutUSD: bestOption.projection.totalPayoutUSD,
-            totalPayoutBTC: bestOption.projection.totalPayoutBTC,
-            totalProfitUSD: bestOption.projection.totalProfitUSD,
-            totalProfitBTC: bestOption.projection.totalProfitBTC,
-            roiPercent: bestOption.projection.roiPercent,
-            reason: `Best cost efficiency at $${bestOption.costPerTHUSD}/TH/s`
-          } : null
-        };
-      } else {
-        // Investment-based single-cycle projection
-        if (investmentAmount === undefined || investmentAmount === null || investmentAmount === '') {
-          return res.status(400).json({
-            status: 'fail',
-            success: false,
-            message: 'single_cycle calculation requires either investmentAmount or hashrateTH'
-          });
-        }
-
-        const amount = parseFloat(investmentAmount);
-
-        // Filter to plans that both match the hours AND accept the amount
-        const eligiblePlans = matchingPlans.filter(plan =>
-          amount >= plan.minAmount && amount <= plan.maxAmount
-        );
-
-        const projections = matchingPlans.map(plan => {
-          const projection = calculateSingleCycleProjection(amount, plan, btcPrice);
-          return {
-            planId: plan._id.toString(),
-            planName: plan.name,
-            planDescription: plan.description,
-            planPercentage: plan.percentage,
-            planDurationHours: plan.duration,
-            planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
-            cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
-            isEligible: amount >= plan.minAmount && amount <= plan.maxAmount,
-            minAmount: plan.minAmount,
-            maxAmount: plan.maxAmount,
-            ...projection
-          };
-        });
-
-        projections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
-
-        const eligibleSorted = projections.filter(p => p.isEligible);
-        const bestPlan = eligibleSorted[0] || projections[0];
-
-        result.singleCycleCalculation = {
-          durationHours: hours,
-          investmentAmount: amount,
-          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
-          eligiblePlansCount: eligiblePlans.length,
-          projections,
-          recommendedPlan: {
-            planId: bestPlan.planId,
-            planName: bestPlan.planName,
-            planPercentage: bestPlan.planPercentage,
-            planDurationHours: bestPlan.planDurationHours,
-            cyclesPerMonth: bestPlan.cyclesPerMonth,
-            cycleFeePercent: bestPlan.cycleFeePercent,
-            investmentUSD: amount,
-            investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
-            hashpower: bestPlan.hashpower,
-            totalPayoutUSD: bestPlan.totalPayoutUSD,
-            totalPayoutBTC: bestPlan.totalPayoutBTC,
-            totalProfitUSD: bestPlan.totalProfitUSD,
-            totalProfitBTC: bestPlan.totalProfitBTC,
-            totalReturnUSD: bestPlan.totalReturnUSD,
-            totalReturnBTC: bestPlan.totalReturnBTC,
-            finalPayoutUSD: bestPlan.finalPayoutUSD,
-            finalPayoutBTC: bestPlan.finalPayoutBTC,
-            roiPercent: bestPlan.roiPercent,
-            totalFeesUSD: bestPlan.totalFeesUSD,
-            totalFeesBTC: bestPlan.totalFeesBTC,
-            reason: `Best single-cycle profit: $${bestPlan.totalProfitUSD.toLocaleString()} (${bestPlan.roiPercent}% ROI over ${bestPlan.durationHours}h)`
-          }
-        };
-      }
-    }
-
-    // =============================================
-    // CASE 1: HASHRATE-BASED CALCULATION (multi-month)
-    // =============================================
-    else if (calculationType === 'hashrate' && hashrateTH !== undefined) {
-      const requestedTH = parseFloat(hashrateTH);
-
-      let targetPlans = planMetrics;
-      if (durationMonths) {
-        targetPlans = planMetrics.filter(p => {
-          const maxCycles = (durationMonths * 30 * 24) / p.durationHours;
-          return maxCycles >= 1;
-        });
-      }
-
-      const hashrateOptions = targetPlans.map(plan => {
-        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
-        const feePercent = resolveCycleFeePercent(sourcePlan);
-        const feeDecimal = feePercent / 100;
-
-        const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.durationHours;
-        const btcReturnNeeded = requestedTH * btcMinedPerTH;
-        const usdReturnNeeded = btcReturnNeeded * btcPrice;
-        const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
-        const grossInvestment = netPrincipalNeeded / (1 - feeDecimal);
-
-        const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
-        const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
-
-        const effectiveFee = effectiveInvestment * feeDecimal;
-        const effectiveNet = effectiveInvestment - effectiveFee;
-        const effectiveHashpower = calculateHashpower(
-          effectiveNet,
-          plan.percentage,
-          plan.durationHours,
-          btcPrice
-        );
-
-        return {
-          planId: plan.planId,
-          planName: plan.name,
-          requestedTH,
-          requiredInvestmentUSD: parseFloat(grossInvestment.toFixed(2)),
-          requiredInvestmentBTC: parseFloat((grossInvestment / btcPrice).toFixed(8)),
-          effectiveInvestmentUSD: parseFloat(effectiveInvestment.toFixed(2)),
-          effectiveInvestmentBTC: parseFloat((effectiveInvestment / btcPrice).toFixed(8)),
-          effectiveHashpower,
-          hashpowerPerDollar: effectiveHashpower > 0
-            ? parseFloat((effectiveHashpower / effectiveInvestment).toFixed(6))
-            : 0,
-          costPerTHUSD: effectiveHashpower > 0
-            ? parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2))
-            : 0,
-          costPerTHBTC: effectiveHashpower > 0
-            ? parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8))
-            : 0,
-          isWithinRange,
-          rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum'
-            : grossInvestment > plan.maxAmount ? 'above_maximum'
-            : 'within_range',
-          minAmount: plan.minAmount,
-          maxAmount: plan.maxAmount,
-          planDurationHours: plan.durationHours,
-          planPercentage: plan.percentage
-        };
-      });
-
-      hashrateOptions.sort((a, b) => a.costPerTHUSD - b.costPerTHUSD);
-      const bestOption = hashrateOptions.find(o => o.isWithinRange) || hashrateOptions[0];
-
-      result.hashrateCalculation = {
-        requestedTH,
-        options: hashrateOptions,
-        recommendedPlan: bestOption ? {
-          planId: bestOption.planId,
-          planName: bestOption.planName,
-          investmentUSD: bestOption.effectiveInvestmentUSD,
-          investmentBTC: bestOption.effectiveInvestmentBTC,
-          hashpower: bestOption.effectiveHashpower,
-          costPerTHUSD: bestOption.costPerTHUSD,
-          costPerTHBTC: bestOption.costPerTHBTC,
-          reason: `Best cost efficiency at $${bestOption.costPerTHUSD}/TH/s`
-        } : null
-      };
-
-      if (bestOption && durationMonths) {
-        const plan = plans.find(p => p._id.toString() === bestOption.planId);
-        if (plan) {
-          result.hashrateCalculation.projection = calculateContractProjection(
-            bestOption.effectiveInvestmentUSD,
-            plan,
-            durationMonths,
-            btcPrice
-          );
-        }
-      }
-    }
-
-    // =============================================
-    // CASE 2: INVESTMENT-BASED CALCULATION (multi-month)
-    // Returns projections for eligible plans AND single-cycle alternatives.
-    // =============================================
-    else if (calculationType === 'investment' && investmentAmount !== undefined) {
-      const amount = parseFloat(investmentAmount);
-
-      const eligiblePlans = plans.filter(plan =>
-        amount >= plan.minAmount && amount <= plan.maxAmount
-      );
-
-      if (eligiblePlans.length === 0) {
-        const plansByRange = [...plans].sort((a, b) => {
-          const aDist = Math.min(Math.abs(amount - a.minAmount), Math.abs(amount - a.maxAmount));
-          const bDist = Math.min(Math.abs(amount - b.minAmount), Math.abs(amount - b.maxAmount));
-          return aDist - bDist;
-        });
-
-        const closestPlan = plansByRange[0];
-        const isBelowMin = amount < closestPlan.minAmount;
-
-        result.investmentCalculation = {
-          investmentAmount: amount,
-          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
-          eligiblePlans: [],
-          recommendation: {
-            type: isBelowMin ? 'increase_investment' : 'reduce_investment',
-            message: isBelowMin
-              ? `Minimum investment for ${closestPlan.name} is $${closestPlan.minAmount.toLocaleString()}. You need $${(closestPlan.minAmount - amount).toLocaleString()} more.`
-              : `Maximum investment for ${closestPlan.name} is $${closestPlan.maxAmount.toLocaleString()}. Consider reducing by $${(amount - closestPlan.maxAmount).toLocaleString()}.`,
-            closestPlan: {
-              planId: closestPlan._id.toString(),
-              planName: closestPlan.name,
-              minAmount: closestPlan.minAmount,
-              maxAmount: closestPlan.maxAmount,
-              requiredAdjustment: isBelowMin ? closestPlan.minAmount - amount : -(amount - closestPlan.maxAmount)
-            }
-          }
-        };
-      } else {
-        // Multi-month projections (default 1 month if no duration supplied)
-        const monthsToUse = durationMonths ? parseInt(durationMonths) : 1;
-
-        const planProjections = eligiblePlans.map(plan => {
-          const projection = calculateContractProjection(
-            amount,
-            plan,
-            monthsToUse,
-            btcPrice
-          );
-
-          return {
-            planId: plan._id.toString(),
-            planName: plan.name,
-            planDescription: plan.description,
-            planPercentage: plan.percentage,
-            planDurationHours: plan.duration,
-            planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
-            cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
-            ...projection
-          };
-        });
-
-        planProjections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
-        const bestPlan = planProjections[0];
-
-        result.investmentCalculation = {
-          investmentAmount: amount,
-          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
-          eligiblePlansCount: eligiblePlans.length,
-          projections: planProjections,
-          recommendedPlan: {
-            planId: bestPlan.planId,
-            planName: bestPlan.planName,
-            planPercentage: bestPlan.planPercentage,
-            planDurationHours: bestPlan.planDurationHours,
-            cyclesPerMonth: bestPlan.cyclesPerMonth,
-            cycleFeePercent: bestPlan.cycleFeePercent,
-            investmentUSD: amount,
-            investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
-            hashpower: bestPlan.hashpower,
-            totalPayoutUSD: bestPlan.totalPayoutUSD,
-            totalPayoutBTC: bestPlan.totalPayoutBTC,
-            totalProfitUSD: bestPlan.totalProfitUSD,
-            totalProfitBTC: bestPlan.totalProfitBTC,
-            totalReturnUSD: bestPlan.totalReturnUSD,
-            totalReturnBTC: bestPlan.totalReturnBTC,
-            finalPayoutUSD: bestPlan.finalPayoutUSD,
-            finalPayoutBTC: bestPlan.finalPayoutBTC,
-            roiPercent: bestPlan.roiPercent,
-            roiPerMonth: bestPlan.roiPerMonth,
-            totalFeesUSD: bestPlan.totalFeesUSD,
-            totalFeesBTC: bestPlan.totalFeesBTC,
-            monthlyBreakdown: bestPlan.monthlyBreakdown,
-            payoutPerMonth: bestPlan.payoutPerMonth,
-            reason: `Highest profit: $${bestPlan.totalProfitUSD.toLocaleString()} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`
-          }
-        };
-
-        // Also expose single-cycle alternatives for the same amount
-        // (only if the user did not explicitly request months).
-        if (!durationMonths) {
-          const singleCycleProjections = eligiblePlans.map(plan => {
-            const projection = calculateSingleCycleProjection(amount, plan, btcPrice);
-            return {
-              planId: plan._id.toString(),
-              planName: plan.name,
-              planDescription: plan.description,
-              planPercentage: plan.percentage,
-              planDurationHours: plan.duration,
-              planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
-              cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
-              ...projection
-            };
-          }).sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
-
-          result.investmentCalculation.singleCycleProjections = singleCycleProjections;
-        }
-      }
-    }
-
-    // =============================================
-    // CASE 3: DURATION-BASED CALCULATION (multi-month)
-    // =============================================
-    else if (calculationType === 'duration' && durationMonths !== undefined) {
-      const months = parseInt(durationMonths);
-
-      const durationOptions = planMetrics.map(plan => {
-        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
-        const projection = calculateContractProjection(
-          plan.minAmount,
-          sourcePlan,
-          months,
-          btcPrice
-        );
-
-        return {
-          planId: plan.planId,
-          planName: plan.name,
-          planPercentage: plan.percentage,
-          planDurationHours: plan.durationHours,
-          planDurationDays: plan.durationDays,
-          cyclesPerMonth: plan.cyclesPerMonth,
-          minInvestmentUSD: plan.minAmount,
-          minInvestmentBTC: plan.minAmountBTC,
-          ...projection
-        };
-      });
-
-      durationOptions.sort((a, b) => b.roiPerMonth - a.roiPerMonth);
-      const bestPlan = durationOptions[0];
-
-      result.durationCalculation = {
-        durationMonths: months,
-        options: durationOptions,
-        recommendedPlan: {
-          planId: bestPlan.planId,
-          planName: bestPlan.planName,
-          planPercentage: bestPlan.planPercentage,
-          planDurationHours: bestPlan.planDurationHours,
-          cyclesPerMonth: bestPlan.cyclesPerMonth,
-          cycleFeePercent: bestPlan.cycleFeePercent,
-          minInvestmentUSD: bestPlan.minInvestmentUSD,
-          minInvestmentBTC: bestPlan.minInvestmentBTC,
-          hashpower: bestPlan.hashpower,
-          totalPayoutUSD: bestPlan.totalPayoutUSD,
-          totalPayoutBTC: bestPlan.totalPayoutBTC,
-          totalProfitUSD: bestPlan.totalProfitUSD,
-          totalProfitBTC: bestPlan.totalProfitBTC,
-          totalReturnUSD: bestPlan.totalReturnUSD,
-          totalReturnBTC: bestPlan.totalReturnBTC,
-          finalPayoutUSD: bestPlan.finalPayoutUSD,
-          finalPayoutBTC: bestPlan.finalPayoutBTC,
-          roiPercent: bestPlan.roiPercent,
-          roiPerMonth: bestPlan.roiPerMonth,
-          totalFeesUSD: bestPlan.totalFeesUSD,
-          totalFeesBTC: bestPlan.totalFeesBTC,
-          monthlyBreakdown: bestPlan.monthlyBreakdown,
-          payoutPerMonth: bestPlan.payoutPerMonth,
-          reason: `Best ROI per month: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`
-        }
-      };
-    }
-
-    // =============================================
-    // DEFAULT: OVERVIEW
-    // =============================================
-    else {
-      const planComparisons = planMetrics.map(plan => {
-        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
-        const projection = calculateContractProjection(
-          plan.minAmount,
-          sourcePlan,
-          1,
-          btcPrice
-        );
-
-        return {
-          planId: plan.planId,
-          planName: plan.name,
-          planDescription: plan.description,
-          planPercentage: plan.percentage,
-          planDurationHours: plan.durationHours,
-          planDurationDays: plan.durationDays,
-          cyclesPerMonth: plan.cyclesPerMonth,
-          minAmount: plan.minAmount,
-          maxAmount: plan.maxAmount,
-          minAmountBTC: plan.minAmountBTC,
-          maxAmountBTC: plan.maxAmountBTC,
-          costPerTH: plan.costPerTH,
-          minInvestmentHashpower: projection.hashpower,
-          minInvestmentMonthlyProfit: projection.totalProfitUSD,
-          minInvestmentMonthlyROI: projection.roiPercent
-        };
-      });
-
-      planComparisons.sort((a, b) => {
-        if (!a.costPerTH || !b.costPerTH) return 0;
-        return a.costPerTH.costPerTHUSD - b.costPerTH.costPerTHUSD;
-      });
-
-      const mostCostEffective = planComparisons[0];
-
-      result.overview = {
-        totalPlans: planComparisons.length,
-        plans: planComparisons,
-        mostCostEffectivePlan: {
-          planId: mostCostEffective.planId,
-          planName: mostCostEffective.planName,
-          costPerTHUSD: mostCostEffective.costPerTH.costPerTHUSD,
-          costPerTHBTC: mostCostEffective.costPerTH.costPerTHBTC,
-          minInvestment: mostCostEffective.minAmount,
-          hashpowerAtMin: mostCostEffective.costPerTH.hashpowerAtMin,
-          reason: `Lowest cost per TH/s at $${mostCostEffective.costPerTH.costPerTHUSD}/TH/s`
-        }
-      };
-    }
-
-    // =============================================
-    // USER CONTEXT
-    // =============================================
-    if (isLoggedIn && user) {
-      let userMainBalanceUSD = 0;
-      let userMaturedBalanceUSD = 0;
-
-      try {
-        if (user.balances) {
-          if (user.balances.main) {
-            for (const [asset, balance] of user.balances.main.entries()) {
-              if (balance > 0 && asset !== 'usd') {
-                const price = await getCryptoPrice(asset.toUpperCase());
-                if (price && price > 0) {
-                  userMainBalanceUSD += balance * price;
-                }
-              }
-            }
-          }
-          if (user.balances.matured) {
-            for (const [asset, balance] of user.balances.matured.entries()) {
-              if (balance > 0 && asset !== 'usd') {
-                const price = await getCryptoPrice(asset.toUpperCase());
-                if (price && price > 0) {
-                  userMaturedBalanceUSD += balance * price;
-                }
-              }
-            }
-          }
-        }
-      } catch (balErr) {
-        console.warn('Could not compute user balance for calculator:', balErr.message);
-      }
-
-      result.userContext = {
-        isLoggedIn: true,
-        firstName: user.firstName || null,
-        lastName: user.lastName || null,
-        totalAvailableUSD: parseFloat((userMainBalanceUSD + userMaturedBalanceUSD).toFixed(2)),
-        mainBalanceUSD: parseFloat(userMainBalanceUSD.toFixed(2)),
-        maturedBalanceUSD: parseFloat(userMaturedBalanceUSD.toFixed(2))
-      };
-    } else {
-      result.userContext = {
-        isLoggedIn: false
-      };
-    }
-
-    // =============================================
-    // LOG ACTIVITY TO SYSTEMLOG
-    // =============================================
-    try {
-      const deviceInfo = await getUserDeviceInfo(req);
-      const calculationTypeResolved = calculationType || 'overview';
-
-      let calculationSummary = null;
-      let recommendedPlanName = null;
-      let recommendedPlanId = null;
-      let recommendedProfitUSD = null;
-      let recommendedROIPercent = null;
-      let recommendedHashpower = null;
-      let recommendedInvestmentUSD = null;
-
-      if (calculationType === 'single_cycle' && result.singleCycleCalculation) {
-        calculationSummary = {
-          durationHours: result.singleCycleCalculation.durationHours,
-          investmentAmount: result.singleCycleCalculation.investmentAmount || null,
-          requestedTH: result.singleCycleCalculation.requestedTH || null,
-          optionsCount: result.singleCycleCalculation.options?.length
-            || result.singleCycleCalculation.projections?.length || 0,
-          recommendedPlan: result.singleCycleCalculation.recommendedPlan?.planName || null
-        };
-        recommendedPlanName = result.singleCycleCalculation.recommendedPlan?.planName || null;
-        recommendedPlanId = result.singleCycleCalculation.recommendedPlan?.planId || null;
-        recommendedProfitUSD = result.singleCycleCalculation.recommendedPlan?.totalProfitUSD || null;
-        recommendedROIPercent = result.singleCycleCalculation.recommendedPlan?.roiPercent || null;
-        recommendedHashpower = result.singleCycleCalculation.recommendedPlan?.hashpower || null;
-        recommendedInvestmentUSD = result.singleCycleCalculation.recommendedPlan?.investmentUSD || null;
-      } else if (calculationType === 'hashrate' && result.hashrateCalculation) {
-        calculationSummary = {
-          requestedTH: result.hashrateCalculation.requestedTH,
-          optionsCount: result.hashrateCalculation.options?.length || 0,
-          recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
-          recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
-          recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
-          hasProjection: !!result.hashrateCalculation.projection
-        };
-        recommendedPlanName = result.hashrateCalculation.recommendedPlan?.planName || null;
-        recommendedPlanId = result.hashrateCalculation.recommendedPlan?.planId || null;
-        recommendedInvestmentUSD = result.hashrateCalculation.recommendedPlan?.investmentUSD || null;
-        recommendedHashpower = result.hashrateCalculation.recommendedPlan?.hashpower || null;
-      } else if (calculationType === 'investment' && result.investmentCalculation) {
-        calculationSummary = {
-          investmentAmount: result.investmentCalculation.investmentAmount,
-          eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
-          projectionsCount: result.investmentCalculation.projections?.length || 0,
-          recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
-          recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
-          recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
-          recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
-        };
-        recommendedPlanName = result.investmentCalculation.recommendedPlan?.planName || null;
-        recommendedPlanId = result.investmentCalculation.recommendedPlan?.planId || null;
-        recommendedProfitUSD = result.investmentCalculation.recommendedPlan?.totalProfitUSD || null;
-        recommendedROIPercent = result.investmentCalculation.recommendedPlan?.roiPercent || null;
-        recommendedHashpower = result.investmentCalculation.recommendedPlan?.hashpower || null;
-        recommendedInvestmentUSD = result.investmentCalculation.recommendedPlan?.investmentUSD || null;
-      } else if (calculationType === 'duration' && result.durationCalculation) {
-        calculationSummary = {
-          durationMonths: result.durationCalculation.durationMonths,
-          optionsCount: result.durationCalculation.options?.length || 0,
-          recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
-          recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
-          recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
-        };
-        recommendedPlanName = result.durationCalculation.recommendedPlan?.planName || null;
-        recommendedPlanId = result.durationCalculation.recommendedPlan?.planId || null;
-        recommendedProfitUSD = result.durationCalculation.recommendedPlan?.totalProfitUSD || null;
-        recommendedROIPercent = result.durationCalculation.recommendedPlan?.roiPercent || null;
-        recommendedHashpower = result.durationCalculation.recommendedPlan?.hashpower || null;
-        recommendedInvestmentUSD = result.durationCalculation.recommendedPlan?.minInvestmentUSD || null;
-      } else if (result.overview) {
-        calculationSummary = {
-          totalPlans: result.overview.totalPlans,
-          mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
-          costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
-          minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
-        };
-        recommendedPlanName = result.overview.mostCostEffectivePlan?.planName || null;
-        recommendedPlanId = result.overview.mostCostEffectivePlan?.planId || null;
-        recommendedInvestmentUSD = result.overview.mostCostEffectivePlan?.minInvestment || null;
-      }
-
-      const parsedInvestmentAmount = investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== ''
-        ? parseFloat(investmentAmount)
-        : null;
-      const parsedDurationMonths = durationMonths !== undefined && durationMonths !== null && durationMonths !== ''
-        ? parseInt(durationMonths)
-        : null;
-      const parsedDurationHours = durationHours !== undefined && durationHours !== null && durationHours !== ''
-        ? parseFloat(durationHours)
-        : null;
-      const parsedHashrateTH = hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== ''
-        ? parseFloat(hashrateTH)
-        : null;
-
-      let description = 'Mining calculator used';
-      if (calculationType === 'single_cycle' && parsedDurationHours !== null) {
-        description = `Calculated single-cycle projection for ${parsedDurationHours}h${parsedInvestmentAmount ? ` with $${parsedInvestmentAmount.toLocaleString('en-US')}` : ''}${parsedHashrateTH ? ` at ${parsedHashrateTH.toLocaleString('en-US')} TH/s` : ''}`;
-      } else if (calculationType === 'investment' && parsedInvestmentAmount !== null) {
-        description = `Calculated investment projection for $${parsedInvestmentAmount.toLocaleString('en-US')}${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
-      } else if (calculationType === 'hashrate' && parsedHashrateTH !== null) {
-        description = `Calculated cost for ${parsedHashrateTH.toLocaleString('en-US')} TH/s${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
-      } else if (calculationType === 'duration' && parsedDurationMonths !== null) {
-        description = `Compared all plans over ${parsedDurationMonths} month(s)`;
-      } else {
-        description = 'Viewed mining calculator overview';
-      }
-
-      await SystemLog.create({
-        action: isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest',
-        entity: 'system',
-        entityId: null,
-
-        performedBy: actor.performedBy,
-        performedByModel: actor.performedByModel,
-        performedByEmail: actor.performedByEmail,
-        performedByName: actor.performedByName,
-
-        status: 'success',
-
-        ip: deviceInfo.ip,
-        userAgent: userAgentHeader,
-        location: deviceInfo.location || 'Unknown',
-        deviceType: getDeviceType(req),
-        os: getOSFromUserAgent(userAgentHeader),
-        browser: getBrowserFromUserAgent(userAgentHeader),
-        countryCode: deviceInfo.locationDetails?.country_code || 'Unknown',
-        city: deviceInfo.locationDetails?.city || 'Unknown',
-        region: deviceInfo.locationDetails?.region || 'Unknown',
-        latitude: deviceInfo.locationDetails?.latitude || null,
-        longitude: deviceInfo.locationDetails?.longitude || null,
-
-        metadata: {
-          description,
-          amount: parsedInvestmentAmount,
-          asset: 'USD',
-          calculationType: calculationTypeResolved,
-
-          inputs: {
-            investmentAmount: parsedInvestmentAmount,
-            durationMonths: parsedDurationMonths,
-            durationHours: parsedDurationHours,
-            hashrateTH: parsedHashrateTH
-          },
-
-          market: {
-            btcPriceAtCalculation: btcPrice,
-            btcPriceTimestamp: new Date().toISOString(),
-            plansAvailable: plans.length
-          },
-
-          calculationSummary,
-          recommendedPlanName,
-          recommendedPlanId,
-          recommendedInvestmentUSD,
-          recommendedProfitUSD,
-          recommendedROIPercent,
-          recommendedHashpower,
-
-          isLoggedIn,
-          userFirstName: isLoggedIn && user ? (user.firstName || null) : null,
-          userLastName: isLoggedIn && user ? (user.lastName || null) : null,
-          userEmail: isLoggedIn && user ? (user.email || null) : null,
-          userId: isLoggedIn && userId ? userId.toString() : null,
-
-          userMainBalanceUSD: result.userContext?.mainBalanceUSD ?? null,
-          userMaturedBalanceUSD: result.userContext?.maturedBalanceUSD ?? null,
-          userTotalAvailableUSD: result.userContext?.totalAvailableUSD ?? null,
-
-          resultProvided: true,
-          processingTimeMs: Date.now() - startTime
-        }
-      });
-    } catch (logError) {
-      console.error('Failed to log calculator activity:', logError.message);
-      if (logError.errors) {
-        console.error('Validation errors:', JSON.stringify(logError.errors, null, 2));
-      }
-    }
-
-    // =============================================
-    // RETURN RESPONSE
-    // =============================================
-    const processingTime = Date.now() - startTime;
-
-    res.status(200).json({
-      status: 'success',
-      success: true,
-      processingTimeMs: processingTime,
-      data: result
-    });
-
-  } catch (err) {
-    console.error('Mining calculator error:', err);
-
-    try {
-      const deviceInfo = await getUserDeviceInfo(req);
-      await SystemLog.create({
-        action: 'calculator_error',
-        entity: 'system',
-        entityId: null,
-        performedBy: null,
-        performedByModel: 'System',
-        performedByEmail: 'system@bithash.com',
-        performedByName: 'System',
-        status: 'failed',
-        errorMessage: err.message || 'Unknown calculator error',
-        errorStack: err.stack,
-        ip: deviceInfo.ip,
-        userAgent: userAgentHeader,
-        location: deviceInfo.location || 'Unknown',
-        deviceType: getDeviceType(req),
-        os: getOSFromUserAgent(userAgentHeader),
-        browser: getBrowserFromUserAgent(userAgentHeader),
-        metadata: {
-          description: 'Mining calculator threw an unhandled error',
-          body: req.body || {},
-          url: req.originalUrl,
-          method: req.method
-        }
-      });
-    } catch (logError) {
-      console.error('Failed to log calculator error to SystemLog:', logError.message);
-    }
-
-    res.status(500).json({
-      status: 'error',
-      success: false,
-      message: err.message || 'An error occurred while processing your calculation. Please try again.',
-      processingTimeMs: Date.now() - startTime
-    });
-  }
-});
-
-console.log('✅ Mining Calculator endpoint loaded:');
-console.log('   - POST /api/mining/calculator');
-console.log('   - Public access (no authentication required)');
-console.log('   - Supports: investment, hashrate, duration, and single_cycle calculations');
-console.log('   - Real-time BTC price (not displayed)');
-console.log('   - Payout model: profit-only for non-final months, principal + profit for the final month');
-console.log('   - Single-cycle is measured in HOURS (matching plan.duration from DB)');
-console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
-console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
-console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
 
 
 
@@ -23216,7 +21782,1306 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+// =============================================
+// MINING CALCULATOR ENDPOINT
+// POST /api/mining/calculator
+//
+// ============================================================
+// PAYOUT MODEL — "PROFIT-ONLY UNTIL FINAL MONTH"
+// ============================================================
+//   • Non-final months → user receives PROFIT ONLY.
+//   • Final month      → user receives PRINCIPAL + PROFIT.
+//   • Single cycle     → same as FINAL month: principal + profit.
+//
+// Fee is charged on the incoming balance of EVERY cycle.
+// It is baked into the net principal that mines and is NOT
+// deducted a second time at the month boundary.
+//
+// ============================================================
+// MONTHLY NET PAYOUT SEMANTICS (FIX)
+// ============================================================
+//   `finalPayoutUSD` / `finalPayoutBTC` are the NET figure for
+//   the last month (profit only, principal excluded). This is
+//   what the "Monthly Net Payout" UI tile expects.
+//
+//   The gross last-month figure (principal + profit) is still
+//   available via:
+//     • totalReturnUSD / totalReturnBTC
+//     • totalPayoutUSD / totalPayoutBTC
+//     • payoutPerMonth[last].payoutUSD / .payoutBTC
+//     • monthlyBreakdown[last].payoutUSD / .payoutBTC
+//
+// ============================================================
+// SINGLE-CYCLE SUPPORT (SIMPLIFIED)
+// ============================================================
+//   • Single-cycle is HOURS-based. The hours come from the plan
+//     record in the database (plan.duration). The user does NOT
+//     supply hours.
+//   • Invoke with `calculationType: 'single_cycle'` and either
+//     `investmentAmount` or `hashrateTH`.
+//   • Backend resolves the matching plan(s) from the DB:
+//       – investmentAmount → plans whose min/max range contains it
+//       – hashrateTH       → reverse-engineer required investment
+//   • Optional `durationHours` is accepted ONLY as a filter to
+//     narrow which plans are considered. It is never required
+//     and never comes from a user-typed field.
+// ============================================================
+app.post('/api/mining/calculator', async (req, res) => {
+  const startTime = Date.now();
+  const userAgentHeader = req.headers['user-agent'] || 'Unknown';
 
+  try {
+    // =============================================
+    // EXTRACT INPUTS
+    // =============================================
+    const {
+      investmentAmount,
+      durationMonths,
+      durationHours,   // optional filter only — never required
+      hashrateTH,
+      calculationType
+    } = req.body || {};
+
+    // =============================================
+    // VALIDATE INPUTS
+    // =============================================
+    const errors = [];
+
+    if (calculationType && !['investment', 'hashrate', 'duration', 'single_cycle'].includes(calculationType)) {
+      errors.push('Invalid calculation type. Must be: investment, hashrate, duration, or single_cycle');
+    }
+
+    if (investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== '') {
+      const amount = parseFloat(investmentAmount);
+      if (isNaN(amount) || amount < 50) errors.push('Minimum investment amount is $50');
+      if (amount > 1000000) errors.push('Maximum investment amount is $1,000,000');
+    }
+
+    if (durationMonths !== undefined && durationMonths !== null && durationMonths !== '') {
+      const months = parseInt(durationMonths);
+      if (isNaN(months) || ![1, 3, 6, 9, 12].includes(months)) {
+        errors.push('Duration in months must be 1, 3, 6, 9, or 12');
+      }
+    }
+
+    if (durationHours !== undefined && durationHours !== null && durationHours !== '') {
+      const hours = parseFloat(durationHours);
+      if (isNaN(hours) || hours <= 0) errors.push('Duration in hours must be a positive number');
+    }
+
+    const hasMonths = durationMonths !== undefined && durationMonths !== null && durationMonths !== '';
+    const hasHours = durationHours !== undefined && durationHours !== null && durationHours !== '';
+    if (hasMonths && hasHours) {
+      errors.push('Provide either durationMonths or durationHours, not both');
+    }
+
+    // single_cycle: only require an amount or a hashrate — hours come from DB
+    if (calculationType === 'single_cycle' &&
+        !(investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== '') &&
+        !(hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '')) {
+      errors.push('single_cycle calculation requires investmentAmount or hashrateTH');
+    }
+
+    if (hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '') {
+      const th = parseFloat(hashrateTH);
+      if (isNaN(th) || th <= 0) errors.push('Hashrate must be a positive number');
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Validation failed',
+        errors,
+        success: false
+      });
+    }
+
+    // =============================================
+    // FETCH REAL-TIME BTC PRICE
+    // =============================================
+    let btcPrice;
+    try {
+      btcPrice = await getRealTimeBitcoinPrice();
+    } catch (priceError) {
+      console.error('Failed to fetch BTC price for calculator:', priceError.message);
+      return res.status(503).json({
+        status: 'error',
+        message: 'Unable to fetch current market data. Please try again later.',
+        success: false,
+        retryAfter: 10
+      });
+    }
+
+    if (!btcPrice || btcPrice <= 0) {
+      return res.status(503).json({
+        status: 'error',
+        message: 'Unable to fetch current market data. Please try again later.',
+        success: false,
+        retryAfter: 10
+      });
+    }
+
+    // =============================================
+    // FETCH ACTIVE PLANS
+    // =============================================
+    const plans = await Plan.find({ isActive: true }).sort({ minAmount: 1 }).lean();
+    if (!plans || plans.length === 0) {
+      return res.status(503).json({
+        status: 'error',
+        message: 'No mining contracts available at this time.',
+        success: false
+      });
+    }
+
+    // =============================================
+    // RESOLVE ACTOR (logged-in vs guest)
+    // =============================================
+    const resolveCalculatorActor = async (req) => {
+      const actor = {
+        isLoggedIn: false, userId: null, user: null,
+        performedBy: null, performedByModel: 'System',
+        performedByName: 'Guest User',
+        performedByEmail: 'guest@bithash.com'
+      };
+
+      const authHeader = req.headers.authorization;
+      const headerToken = authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.split(' ')[1] : null;
+      const cookieToken = req.cookies && req.cookies.jwt ? req.cookies.jwt : null;
+      const token = headerToken || cookieToken;
+      if (!token) return actor;
+
+      try {
+        const decoded = verifyJWT(token);
+        if (!decoded || !decoded.id) return actor;
+
+        const dbUser = await User.findById(decoded.id)
+          .select('firstName lastName email balances status isVerified')
+          .lean();
+        if (!dbUser) return actor;
+
+        const fullName = [dbUser.firstName, dbUser.lastName].filter(Boolean).join(' ').trim();
+        actor.isLoggedIn = true;
+        actor.userId = dbUser._id;
+        actor.user = dbUser;
+        actor.performedBy = dbUser._id;
+        actor.performedByModel = 'User';
+        actor.performedByName = fullName || dbUser.email || 'User';
+        actor.performedByEmail = dbUser.email || 'unknown@bithash.com';
+        return actor;
+      } catch (authErr) {
+        return actor;
+      }
+    };
+
+    const actor = await resolveCalculatorActor(req);
+    const isLoggedIn = actor.isLoggedIn;
+    const userId = actor.userId;
+    const user = actor.user;
+
+    // =============================================
+    // HELPERS
+    // =============================================
+    const calculateCyclesPerMonth = (planDurationHours) => {
+      if (!planDurationHours || planDurationHours <= 0) return 1;
+      const monthHours = 30 * 24;
+      return Math.max(1, Math.floor(monthHours / planDurationHours));
+    };
+
+    const calculateHashpower = (netPrincipalUSD, planPercentage, durationHours, currentBtcPrice) => {
+      if (!netPrincipalUSD || netPrincipalUSD <= 0) return 0;
+      if (!planPercentage || planPercentage <= 0) return 0;
+      if (!durationHours || durationHours <= 0) return 0;
+      if (!currentBtcPrice || currentBtcPrice <= 0) return 0;
+
+      const cycleReturnUSD = netPrincipalUSD * (planPercentage / 100);
+      const cycleReturnBTC = cycleReturnUSD / currentBtcPrice;
+      const btcMinedPerTH = BTC_PER_TH_PER_HOUR * durationHours;
+      if (btcMinedPerTH <= 0) return 0;
+
+      return Math.max(0, parseFloat((cycleReturnBTC / btcMinedPerTH).toFixed(4)));
+    };
+
+    const resolveCycleFeePercent = (plan) => {
+      if (plan && typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0) {
+        return plan.cycleFeePercent;
+      }
+      return CYCLE_FEE_PERCENT;
+    };
+
+    // ============================================================
+    // SINGLE-CYCLE PROJECTION
+    // ------------------------------------------------------------
+    // FIX: finalPayoutUSD / finalPayoutBTC now carry NET profit.
+    //      The gross single-cycle payout (principal + profit) is
+    //      available via totalReturnUSD / totalPayoutUSD.
+    // ============================================================
+    const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
+      const planPercentageDecimal = plan.percentage / 100;
+      const durationHours = plan.duration;
+      const feePercent = resolveCycleFeePercent(plan);
+      const feeDecimal = feePercent / 100;
+
+      const grossPrincipalUSD = principalUSD;
+      const grossPrincipalBTC = principalUSD / currentBtcPrice;
+
+      const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
+      const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
+
+      const netPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
+      const netPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
+
+      const hashpower = calculateHashpower(
+        netPrincipalUSD, plan.percentage, durationHours, currentBtcPrice
+      );
+
+      const totalReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
+      const totalReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
+
+      // NET profit = return − net principal
+      const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
+      const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
+
+      const roiPercent = grossPrincipalUSD > 0
+        ? (totalProfitUSD / grossPrincipalUSD) * 100
+        : 0;
+
+      return {
+        payoutModel: 'single_cycle',
+        principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
+        principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
+        firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
+        firstCycleFeeBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
+        netPrincipalUSD: parseFloat(netPrincipalUSD.toFixed(2)),
+        netPrincipalBTC: parseFloat(netPrincipalBTC.toFixed(8)),
+        hashpower,
+
+        totalReturnUSD: parseFloat(totalReturnUSD.toFixed(2)),
+        totalReturnBTC: parseFloat(totalReturnBTC.toFixed(8)),
+        totalPayoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
+        totalPayoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
+        totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
+        totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+
+        // FIX: NET monthly payout tile = profit only
+        finalPayoutUSD: parseFloat(totalProfitUSD.toFixed(2)),
+        finalPayoutBTC: parseFloat(totalProfitBTC.toFixed(8)),
+
+        totalFeesUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
+        totalFeesBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
+
+        cyclesPerMonth: calculateCyclesPerMonth(durationHours),
+        totalCycles: 1,
+        durationMonths: 0,
+        durationHours,
+        cycleDurationHours: durationHours,
+        cycleFeePercent: feePercent,
+
+        roiPercent: parseFloat(roiPercent.toFixed(2)),
+        roiPerMonth: 0,
+
+        monthlyBreakdown: [],
+        payoutPerMonth: [{
+          month: 1,
+          isFinalMonth: true,
+          payoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
+          payoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
+          profitUSD: parseFloat(totalProfitUSD.toFixed(2)),
+          profitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+          note: 'Single-cycle contract pays principal + profit at cycle end'
+        }]
+      };
+    };
+
+    // ============================================================
+    // MULTI-MONTH PROJECTION
+    // ------------------------------------------------------------
+    // FIX: finalPayoutUSD / finalPayoutBTC = NET last-month profit.
+    // ============================================================
+    const calculateMultiMonthProjection = (principalUSD, plan, months, currentBtcPrice) => {
+      const planPercentageDecimal = plan.percentage / 100;
+      const durationHours = plan.duration;
+      const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
+      const totalMonths = months;
+      const feePercent = resolveCycleFeePercent(plan);
+      const feeDecimal = feePercent / 100;
+
+      const grossPrincipalUSD = principalUSD;
+      const grossPrincipalBTC = principalUSD / currentBtcPrice;
+
+      const firstCycleFeeUSD = grossPrincipalUSD * feeDecimal;
+      const firstCycleFeeBTC = grossPrincipalBTC * feeDecimal;
+      const firstNetPrincipalUSD = grossPrincipalUSD - firstCycleFeeUSD;
+      const firstNetPrincipalBTC = grossPrincipalBTC - firstCycleFeeBTC;
+
+      const initialHashpower = calculateHashpower(
+        firstNetPrincipalUSD, plan.percentage, durationHours, currentBtcPrice
+      );
+
+      let totalFeesUSD = 0;
+      let totalFeesBTC = 0;
+      let totalPayoutUSD = 0;
+      let totalPayoutBTC = 0;
+
+      const monthlyBreakdown = [];
+      const payoutPerMonth = [];
+
+      let monthStartingPrincipalUSD = grossPrincipalUSD;
+      let monthStartingPrincipalBTC = grossPrincipalBTC;
+
+      for (let month = 1; month <= totalMonths; month++) {
+        const isFinalMonth = month === totalMonths;
+
+        let monthIncomingUSD = monthStartingPrincipalUSD;
+        let monthIncomingBTC = monthStartingPrincipalBTC;
+
+        let monthReturnUSD = 0;
+        let monthReturnBTC = 0;
+        let monthFeesUSD = 0;
+        let monthFeesBTC = 0;
+
+        for (let cycle = 1; cycle <= cyclesPerMonth; cycle++) {
+          const cycleFeeUSD = monthIncomingUSD * feeDecimal;
+          const cycleFeeBTC = monthIncomingBTC * feeDecimal;
+
+          monthFeesUSD += cycleFeeUSD;
+          monthFeesBTC += cycleFeeBTC;
+
+          const netPrincipalUSD = monthIncomingUSD - cycleFeeUSD;
+          const netPrincipalBTC = monthIncomingBTC - cycleFeeBTC;
+
+          const cycleReturnUSD = netPrincipalUSD * (1 + planPercentageDecimal);
+          const cycleReturnBTC = netPrincipalBTC * (1 + planPercentageDecimal);
+
+          monthIncomingUSD = cycleReturnUSD;
+          monthIncomingBTC = cycleReturnBTC;
+
+          monthReturnUSD = cycleReturnUSD;
+          monthReturnBTC = cycleReturnBTC;
+        }
+
+        totalFeesUSD += monthFeesUSD;
+        totalFeesBTC += monthFeesBTC;
+
+        const monthProfitUSD = monthReturnUSD - monthStartingPrincipalUSD;
+        const monthProfitBTC = monthReturnBTC - monthStartingPrincipalBTC;
+
+        // Payout composition:
+        //   Final month     → principal + profit
+        //   Non-final month → profit only
+        const monthPayoutUSD = isFinalMonth ? monthReturnUSD : monthProfitUSD;
+        const monthPayoutBTC = isFinalMonth ? monthReturnBTC : monthProfitBTC;
+
+        totalPayoutUSD += monthPayoutUSD;
+        totalPayoutBTC += monthPayoutBTC;
+
+        monthlyBreakdown.push({
+          month,
+          isFinalMonth,
+          startingPrincipalUSD: parseFloat(monthStartingPrincipalUSD.toFixed(2)),
+          startingPrincipalBTC: parseFloat(monthStartingPrincipalBTC.toFixed(8)),
+          endingValueUSD: parseFloat(monthReturnUSD.toFixed(2)),
+          endingValueBTC: parseFloat(monthReturnBTC.toFixed(8)),
+          payoutUSD: parseFloat(monthPayoutUSD.toFixed(2)),
+          payoutBTC: parseFloat(monthPayoutBTC.toFixed(8)),
+          profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
+          profitBTC: parseFloat(monthProfitBTC.toFixed(8)),
+          cyclesInMonth: cyclesPerMonth,
+          feesPaidUSD: parseFloat(monthFeesUSD.toFixed(2)),
+          feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
+        });
+
+        payoutPerMonth.push({
+          month,
+          isFinalMonth,
+          payoutUSD: parseFloat(monthPayoutUSD.toFixed(2)),
+          payoutBTC: parseFloat(monthPayoutBTC.toFixed(8)),
+          profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
+          profitBTC: parseFloat(monthProfitBTC.toFixed(8)),
+          note: isFinalMonth
+            ? 'Final month: principal + profit'
+            : 'Non-final month: profit only'
+        });
+
+        monthStartingPrincipalUSD = firstNetPrincipalUSD;
+        monthStartingPrincipalBTC = firstNetPrincipalBTC;
+      }
+
+      // FIX: NET monthly payout tile = last month's profit only
+      const lastMonth = monthlyBreakdown[monthlyBreakdown.length - 1];
+      const finalPayoutUSD = lastMonth.profitUSD;
+      const finalPayoutBTC = lastMonth.profitBTC;
+
+      const totalProfitUSD = totalPayoutUSD - grossPrincipalUSD;
+      const totalProfitBTC = totalPayoutBTC - grossPrincipalBTC;
+
+      const roiPercent = grossPrincipalUSD > 0
+        ? (totalProfitUSD / grossPrincipalUSD) * 100
+        : 0;
+      const roiPerMonth = totalMonths > 0 ? roiPercent / totalMonths : 0;
+
+      return {
+        payoutModel: 'profit_only_until_final_month',
+        principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
+        principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
+        firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
+        firstCycleFeeBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
+        netPrincipalUSD: parseFloat(firstNetPrincipalUSD.toFixed(2)),
+        netPrincipalBTC: parseFloat(firstNetPrincipalBTC.toFixed(8)),
+        hashpower: initialHashpower,
+
+        totalReturnUSD: parseFloat(totalPayoutUSD.toFixed(2)),
+        totalReturnBTC: parseFloat(totalPayoutBTC.toFixed(8)),
+        totalPayoutUSD: parseFloat(totalPayoutUSD.toFixed(2)),
+        totalPayoutBTC: parseFloat(totalPayoutBTC.toFixed(8)),
+        totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
+        totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+
+        // FIX: NET monthly payout tile = profit only
+        finalPayoutUSD: parseFloat(finalPayoutUSD.toFixed(2)),
+        finalPayoutBTC: parseFloat(finalPayoutBTC.toFixed(8)),
+
+        totalFeesUSD: parseFloat(totalFeesUSD.toFixed(2)),
+        totalFeesBTC: parseFloat(totalFeesBTC.toFixed(8)),
+
+        cyclesPerMonth,
+        totalCycles: cyclesPerMonth * totalMonths,
+        durationMonths: totalMonths,
+        durationHours,
+        cycleDurationHours: durationHours,
+        cycleFeePercent: feePercent,
+
+        roiPercent: parseFloat(roiPercent.toFixed(2)),
+        roiPerMonth: parseFloat(roiPerMonth.toFixed(2)),
+
+        monthlyBreakdown,
+        payoutPerMonth
+      };
+    };
+
+    // ============================================================
+    // UNIFIED ROUTER
+    // ============================================================
+    const calculateContractProjection = (principalUSD, plan, months, currentBtcPrice) => {
+      if (!months || months === 0) {
+        return calculateSingleCycleProjection(principalUSD, plan, currentBtcPrice);
+      }
+      return calculateMultiMonthProjection(principalUSD, plan, months, currentBtcPrice);
+    };
+
+    // =============================================
+    // PLAN METRICS (used by duration + overview)
+    // =============================================
+    const calculateCostPerTH = (plan, currentBtcPrice) => {
+      const minInvestment = plan.minAmount;
+      const feePercent = resolveCycleFeePercent(plan);
+      const feeUSD = minInvestment * (feePercent / 100);
+      const netPrincipalUSD = minInvestment - feeUSD;
+
+      const hashpower = calculateHashpower(
+        netPrincipalUSD, plan.percentage, plan.duration, currentBtcPrice
+      );
+      if (hashpower <= 0) return null;
+
+      const costPerTHUSD = minInvestment / hashpower;
+      return {
+        minInvestment,
+        hashpowerAtMin: hashpower,
+        costPerTHUSD: parseFloat(costPerTHUSD.toFixed(2)),
+        costPerTHBTC: parseFloat((costPerTHUSD / currentBtcPrice).toFixed(8))
+      };
+    };
+
+    const planMetrics = plans.map(plan => {
+      const costData = calculateCostPerTH(plan, btcPrice);
+      const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
+
+      return {
+        planId: plan._id.toString(),
+        name: plan.name,
+        description: plan.description,
+        percentage: plan.percentage,
+        durationHours: plan.duration,
+        durationDays: parseFloat((plan.duration / 24).toFixed(2)),
+        cyclesPerMonth,
+        minAmount: plan.minAmount,
+        maxAmount: plan.maxAmount,
+        minAmountBTC: parseFloat((plan.minAmount / btcPrice).toFixed(8)),
+        maxAmountBTC: parseFloat((plan.maxAmount / btcPrice).toFixed(8)),
+        costPerTH: costData
+      };
+    });
+
+    // =============================================
+    // RESULT ENVELOPE
+    // =============================================
+    let result = {
+      calculationType: calculationType || 'investment',
+      timestamp: new Date().toISOString(),
+      success: true
+    };
+
+    // ============================================================
+    // CASE 0: SINGLE-CYCLE CALCULATION (SIMPLIFIED)
+    // ------------------------------------------------------------
+    // No `durationHours` input required. Plan hours come from DB.
+    // If `durationHours` IS supplied, it only narrows the plan list
+    // (useful when two plans share the same minAmount range but
+    // differ in cycle duration).
+    // ============================================================
+    if (calculationType === 'single_cycle') {
+      // Optional narrowing filter (should match a DB plan.duration exactly)
+      const filterHours = (durationHours !== undefined && durationHours !== null && durationHours !== '')
+        ? parseFloat(durationHours)
+        : null;
+
+      let matchingPlans = plans;
+      if (filterHours !== null) {
+        matchingPlans = plans.filter(p => Number(p.duration) === filterHours);
+        if (matchingPlans.length === 0) {
+          const availableDurations = [...new Set(plans.map(p => p.duration))].sort((a, b) => a - b);
+          return res.status(400).json({
+            status: 'fail',
+            success: false,
+            message: `No active plan supports a ${filterHours}-hour cycle. Available single-cycle durations: ${availableDurations.join(', ')} hours.`,
+            availableDurations
+          });
+        }
+      }
+
+      // --- HASHRATE MODE ---
+      if (hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== '') {
+        const requestedTH = parseFloat(hashrateTH);
+
+        const hashrateOptions = matchingPlans.map(plan => {
+          const feePercent = resolveCycleFeePercent(plan);
+          const feeDecimal = feePercent / 100;
+
+          const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.duration;
+          const btcReturnNeeded = requestedTH * btcMinedPerTH;
+          const usdReturnNeeded = btcReturnNeeded * btcPrice;
+          const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
+          const grossInvestment = netPrincipalNeeded / (1 - feeDecimal);
+
+          const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
+          const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
+
+          const effectiveFee = effectiveInvestment * feeDecimal;
+          const effectiveNet = effectiveInvestment - effectiveFee;
+          const effectiveHashpower = calculateHashpower(
+            effectiveNet, plan.percentage, plan.duration, btcPrice
+          );
+
+          const projection = calculateSingleCycleProjection(effectiveInvestment, plan, btcPrice);
+
+          return {
+            planId: plan._id.toString(),
+            planName: plan.name,
+            requestedTH,
+            requiredInvestmentUSD: parseFloat(grossInvestment.toFixed(2)),
+            requiredInvestmentBTC: parseFloat((grossInvestment / btcPrice).toFixed(8)),
+            effectiveInvestmentUSD: parseFloat(effectiveInvestment.toFixed(2)),
+            effectiveInvestmentBTC: parseFloat((effectiveInvestment / btcPrice).toFixed(8)),
+            effectiveHashpower,
+            costPerTHUSD: effectiveHashpower > 0
+              ? parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2)) : 0,
+            costPerTHBTC: effectiveHashpower > 0
+              ? parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8)) : 0,
+            isWithinRange,
+            rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum'
+              : grossInvestment > plan.maxAmount ? 'above_maximum'
+              : 'within_range',
+            minAmount: plan.minAmount,
+            maxAmount: plan.maxAmount,
+            planDurationHours: plan.duration,
+            planPercentage: plan.percentage,
+            projection
+          };
+        });
+
+        hashrateOptions.sort((a, b) => a.costPerTHUSD - b.costPerTHUSD);
+        const bestOption = hashrateOptions.find(o => o.isWithinRange) || hashrateOptions[0];
+
+        result.singleCycleCalculation = {
+          requestedTH,
+          options: hashrateOptions,
+          recommendedPlan: bestOption ? {
+            planId: bestOption.planId,
+            planName: bestOption.planName,
+            investmentUSD: bestOption.effectiveInvestmentUSD,
+            investmentBTC: bestOption.effectiveInvestmentBTC,
+            hashpower: bestOption.effectiveHashpower,
+            costPerTHUSD: bestOption.costPerTHUSD,
+            costPerTHBTC: bestOption.costPerTHBTC,
+            totalPayoutUSD: bestOption.projection.totalPayoutUSD,
+            totalPayoutBTC: bestOption.projection.totalPayoutBTC,
+            totalProfitUSD: bestOption.projection.totalProfitUSD,
+            totalProfitBTC: bestOption.projection.totalProfitBTC,
+            // NET monthly payout tile
+            finalPayoutUSD: bestOption.projection.finalPayoutUSD,
+            finalPayoutBTC: bestOption.projection.finalPayoutBTC,
+            roiPercent: bestOption.projection.roiPercent,
+            planDurationHours: bestOption.planDurationHours,
+            reason: `Best cost efficiency at $${bestOption.costPerTHUSD}/TH/s`
+          } : null
+        };
+      }
+      // --- INVESTMENT MODE ---
+      else {
+        const amount = parseFloat(investmentAmount);
+
+        // Plan list already narrowed by filterHours above (if provided).
+        // Now narrow to plans whose min/max range accepts this amount.
+        const eligiblePlans = matchingPlans.filter(plan =>
+          amount >= plan.minAmount && amount <= plan.maxAmount
+        );
+
+        const projections = matchingPlans.map(plan => {
+          const projection = calculateSingleCycleProjection(amount, plan, btcPrice);
+          return {
+            planId: plan._id.toString(),
+            planName: plan.name,
+            planDescription: plan.description,
+            planPercentage: plan.percentage,
+            planDurationHours: plan.duration,
+            planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
+            cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
+            isEligible: amount >= plan.minAmount && amount <= plan.maxAmount,
+            minAmount: plan.minAmount,
+            maxAmount: plan.maxAmount,
+            ...projection
+          };
+        });
+
+        projections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
+
+        const eligibleSorted = projections.filter(p => p.isEligible);
+        const bestPlan = eligibleSorted[0] || projections[0];
+
+        result.singleCycleCalculation = {
+          investmentAmount: amount,
+          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
+          eligiblePlansCount: eligiblePlans.length,
+          projections,
+          recommendedPlan: {
+            planId: bestPlan.planId,
+            planName: bestPlan.planName,
+            planPercentage: bestPlan.planPercentage,
+            planDurationHours: bestPlan.planDurationHours,
+            cyclesPerMonth: bestPlan.cyclesPerMonth,
+            cycleFeePercent: bestPlan.cycleFeePercent,
+            investmentUSD: amount,
+            investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
+            hashpower: bestPlan.hashpower,
+            totalPayoutUSD: bestPlan.totalPayoutUSD,
+            totalPayoutBTC: bestPlan.totalPayoutBTC,
+            totalProfitUSD: bestPlan.totalProfitUSD,
+            totalProfitBTC: bestPlan.totalProfitBTC,
+            totalReturnUSD: bestPlan.totalReturnUSD,
+            totalReturnBTC: bestPlan.totalReturnBTC,
+            // NET monthly payout tile
+            finalPayoutUSD: bestPlan.finalPayoutUSD,
+            finalPayoutBTC: bestPlan.finalPayoutBTC,
+            roiPercent: bestPlan.roiPercent,
+            totalFeesUSD: bestPlan.totalFeesUSD,
+            totalFeesBTC: bestPlan.totalFeesBTC,
+            reason: `Best single-cycle profit: $${bestPlan.totalProfitUSD.toLocaleString()} (${bestPlan.roiPercent}% ROI over ${bestPlan.planDurationHours}h)`
+          }
+        };
+      }
+    }
+
+    // =============================================
+    // CASE 1: HASHRATE (multi-month)
+    // =============================================
+    else if (calculationType === 'hashrate' && hashrateTH !== undefined) {
+      const requestedTH = parseFloat(hashrateTH);
+
+      let targetPlans = planMetrics;
+      if (durationMonths) {
+        targetPlans = planMetrics.filter(p => {
+          const maxCycles = (durationMonths * 30 * 24) / p.durationHours;
+          return maxCycles >= 1;
+        });
+      }
+
+      const hashrateOptions = targetPlans.map(plan => {
+        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
+        const feePercent = resolveCycleFeePercent(sourcePlan);
+        const feeDecimal = feePercent / 100;
+
+        const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.durationHours;
+        const btcReturnNeeded = requestedTH * btcMinedPerTH;
+        const usdReturnNeeded = btcReturnNeeded * btcPrice;
+        const netPrincipalNeeded = usdReturnNeeded / (plan.percentage / 100);
+        const grossInvestment = netPrincipalNeeded / (1 - feeDecimal);
+
+        const isWithinRange = grossInvestment >= plan.minAmount && grossInvestment <= plan.maxAmount;
+        const effectiveInvestment = Math.max(grossInvestment, plan.minAmount);
+        const effectiveFee = effectiveInvestment * feeDecimal;
+        const effectiveNet = effectiveInvestment - effectiveFee;
+        const effectiveHashpower = calculateHashpower(
+          effectiveNet, plan.percentage, plan.durationHours, btcPrice
+        );
+
+        return {
+          planId: plan.planId,
+          planName: plan.name,
+          requestedTH,
+          requiredInvestmentUSD: parseFloat(grossInvestment.toFixed(2)),
+          requiredInvestmentBTC: parseFloat((grossInvestment / btcPrice).toFixed(8)),
+          effectiveInvestmentUSD: parseFloat(effectiveInvestment.toFixed(2)),
+          effectiveInvestmentBTC: parseFloat((effectiveInvestment / btcPrice).toFixed(8)),
+          effectiveHashpower,
+          hashpowerPerDollar: effectiveHashpower > 0
+            ? parseFloat((effectiveHashpower / effectiveInvestment).toFixed(6)) : 0,
+          costPerTHUSD: effectiveHashpower > 0
+            ? parseFloat((effectiveInvestment / effectiveHashpower).toFixed(2)) : 0,
+          costPerTHBTC: effectiveHashpower > 0
+            ? parseFloat((effectiveInvestment / effectiveHashpower / btcPrice).toFixed(8)) : 0,
+          isWithinRange,
+          rangeStatus: grossInvestment < plan.minAmount ? 'below_minimum'
+            : grossInvestment > plan.maxAmount ? 'above_maximum' : 'within_range',
+          minAmount: plan.minAmount,
+          maxAmount: plan.maxAmount,
+          planDurationHours: plan.durationHours,
+          planPercentage: plan.percentage
+        };
+      });
+
+      hashrateOptions.sort((a, b) => a.costPerTHUSD - b.costPerTHUSD);
+      const bestOption = hashrateOptions.find(o => o.isWithinRange) || hashrateOptions[0];
+
+      result.hashrateCalculation = {
+        requestedTH,
+        options: hashrateOptions,
+        recommendedPlan: bestOption ? {
+          planId: bestOption.planId,
+          planName: bestOption.planName,
+          investmentUSD: bestOption.effectiveInvestmentUSD,
+          investmentBTC: bestOption.effectiveInvestmentBTC,
+          hashpower: bestOption.effectiveHashpower,
+          costPerTHUSD: bestOption.costPerTHUSD,
+          costPerTHBTC: bestOption.costPerTHBTC,
+          reason: `Best cost efficiency at $${bestOption.costPerTHUSD}/TH/s`
+        } : null
+      };
+
+      if (bestOption && durationMonths) {
+        const plan = plans.find(p => p._id.toString() === bestOption.planId);
+        if (plan) {
+          result.hashrateCalculation.projection = calculateContractProjection(
+            bestOption.effectiveInvestmentUSD, plan, durationMonths, btcPrice
+          );
+        }
+      }
+    }
+
+    // =============================================
+    // CASE 2: INVESTMENT (multi-month)
+    // =============================================
+    else if (calculationType === 'investment' && investmentAmount !== undefined) {
+      const amount = parseFloat(investmentAmount);
+
+      const eligiblePlans = plans.filter(plan =>
+        amount >= plan.minAmount && amount <= plan.maxAmount
+      );
+
+      if (eligiblePlans.length === 0) {
+        const plansByRange = [...plans].sort((a, b) => {
+          const aDist = Math.min(Math.abs(amount - a.minAmount), Math.abs(amount - a.maxAmount));
+          const bDist = Math.min(Math.abs(amount - b.minAmount), Math.abs(amount - b.maxAmount));
+          return aDist - bDist;
+        });
+
+        const closestPlan = plansByRange[0];
+        const isBelowMin = amount < closestPlan.minAmount;
+
+        result.investmentCalculation = {
+          investmentAmount: amount,
+          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
+          eligiblePlans: [],
+          recommendation: {
+            type: isBelowMin ? 'increase_investment' : 'reduce_investment',
+            message: isBelowMin
+              ? `Minimum investment for ${closestPlan.name} is $${closestPlan.minAmount.toLocaleString()}. You need $${(closestPlan.minAmount - amount).toLocaleString()} more.`
+              : `Maximum investment for ${closestPlan.name} is $${closestPlan.maxAmount.toLocaleString()}. Consider reducing by $${(amount - closestPlan.maxAmount).toLocaleString()}.`,
+            closestPlan: {
+              planId: closestPlan._id.toString(),
+              planName: closestPlan.name,
+              minAmount: closestPlan.minAmount,
+              maxAmount: closestPlan.maxAmount,
+              requiredAdjustment: isBelowMin ? closestPlan.minAmount - amount : -(amount - closestPlan.maxAmount)
+            }
+          }
+        };
+      } else {
+        const monthsToUse = durationMonths ? parseInt(durationMonths) : 1;
+
+        const planProjections = eligiblePlans.map(plan => {
+          const projection = calculateContractProjection(amount, plan, monthsToUse, btcPrice);
+          return {
+            planId: plan._id.toString(),
+            planName: plan.name,
+            planDescription: plan.description,
+            planPercentage: plan.percentage,
+            planDurationHours: plan.duration,
+            planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
+            cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
+            ...projection
+          };
+        });
+
+        planProjections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
+        const bestPlan = planProjections[0];
+
+        result.investmentCalculation = {
+          investmentAmount: amount,
+          investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
+          eligiblePlansCount: eligiblePlans.length,
+          projections: planProjections,
+          recommendedPlan: {
+            planId: bestPlan.planId,
+            planName: bestPlan.planName,
+            planPercentage: bestPlan.planPercentage,
+            planDurationHours: bestPlan.planDurationHours,
+            cyclesPerMonth: bestPlan.cyclesPerMonth,
+            cycleFeePercent: bestPlan.cycleFeePercent,
+            investmentUSD: amount,
+            investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
+            hashpower: bestPlan.hashpower,
+            totalPayoutUSD: bestPlan.totalPayoutUSD,
+            totalPayoutBTC: bestPlan.totalPayoutBTC,
+            totalProfitUSD: bestPlan.totalProfitUSD,
+            totalProfitBTC: bestPlan.totalProfitBTC,
+            totalReturnUSD: bestPlan.totalReturnUSD,
+            totalReturnBTC: bestPlan.totalReturnBTC,
+            // NET monthly payout tile
+            finalPayoutUSD: bestPlan.finalPayoutUSD,
+            finalPayoutBTC: bestPlan.finalPayoutBTC,
+            roiPercent: bestPlan.roiPercent,
+            roiPerMonth: bestPlan.roiPerMonth,
+            totalFeesUSD: bestPlan.totalFeesUSD,
+            totalFeesBTC: bestPlan.totalFeesBTC,
+            monthlyBreakdown: bestPlan.monthlyBreakdown,
+            payoutPerMonth: bestPlan.payoutPerMonth,
+            reason: `Highest profit: $${bestPlan.totalProfitUSD.toLocaleString()} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`
+          }
+        };
+
+        if (!durationMonths) {
+          const singleCycleProjections = eligiblePlans.map(plan => {
+            const projection = calculateSingleCycleProjection(amount, plan, btcPrice);
+            return {
+              planId: plan._id.toString(),
+              planName: plan.name,
+              planDescription: plan.description,
+              planPercentage: plan.percentage,
+              planDurationHours: plan.duration,
+              planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
+              cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
+              ...projection
+            };
+          }).sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
+
+          result.investmentCalculation.singleCycleProjections = singleCycleProjections;
+        }
+      }
+    }
+
+    // =============================================
+    // CASE 3: DURATION (multi-month)
+    // =============================================
+    else if (calculationType === 'duration' && durationMonths !== undefined) {
+      const months = parseInt(durationMonths);
+
+      const durationOptions = planMetrics.map(plan => {
+        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
+        const projection = calculateContractProjection(plan.minAmount, sourcePlan, months, btcPrice);
+
+        return {
+          planId: plan.planId,
+          planName: plan.name,
+          planPercentage: plan.percentage,
+          planDurationHours: plan.durationHours,
+          planDurationDays: plan.durationDays,
+          cyclesPerMonth: plan.cyclesPerMonth,
+          minInvestmentUSD: plan.minAmount,
+          minInvestmentBTC: plan.minAmountBTC,
+          ...projection
+        };
+      });
+
+      durationOptions.sort((a, b) => b.roiPerMonth - a.roiPerMonth);
+      const bestPlan = durationOptions[0];
+
+      result.durationCalculation = {
+        durationMonths: months,
+        options: durationOptions,
+        recommendedPlan: {
+          planId: bestPlan.planId,
+          planName: bestPlan.planName,
+          planPercentage: bestPlan.planPercentage,
+          planDurationHours: bestPlan.planDurationHours,
+          cyclesPerMonth: bestPlan.cyclesPerMonth,
+          cycleFeePercent: bestPlan.cycleFeePercent,
+          minInvestmentUSD: bestPlan.minInvestmentUSD,
+          minInvestmentBTC: bestPlan.minInvestmentBTC,
+          hashpower: bestPlan.hashpower,
+          totalPayoutUSD: bestPlan.totalPayoutUSD,
+          totalPayoutBTC: bestPlan.totalPayoutBTC,
+          totalProfitUSD: bestPlan.totalProfitUSD,
+          totalProfitBTC: bestPlan.totalProfitBTC,
+          totalReturnUSD: bestPlan.totalReturnUSD,
+          totalReturnBTC: bestPlan.totalReturnBTC,
+          // NET monthly payout tile
+          finalPayoutUSD: bestPlan.finalPayoutUSD,
+          finalPayoutBTC: bestPlan.finalPayoutBTC,
+          roiPercent: bestPlan.roiPercent,
+          roiPerMonth: bestPlan.roiPerMonth,
+          totalFeesUSD: bestPlan.totalFeesUSD,
+          totalFeesBTC: bestPlan.totalFeesBTC,
+          monthlyBreakdown: bestPlan.monthlyBreakdown,
+          payoutPerMonth: bestPlan.payoutPerMonth,
+          reason: `Best ROI per month: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`
+        }
+      };
+    }
+
+    // =============================================
+    // DEFAULT: OVERVIEW
+    // =============================================
+    else {
+      const planComparisons = planMetrics.map(plan => {
+        const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
+        const projection = calculateContractProjection(plan.minAmount, sourcePlan, 1, btcPrice);
+
+        return {
+          planId: plan.planId,
+          planName: plan.name,
+          planDescription: plan.description,
+          planPercentage: plan.percentage,
+          planDurationHours: plan.durationHours,
+          planDurationDays: plan.durationDays,
+          cyclesPerMonth: plan.cyclesPerMonth,
+          minAmount: plan.minAmount,
+          maxAmount: plan.maxAmount,
+          minAmountBTC: plan.minAmountBTC,
+          maxAmountBTC: plan.maxAmountBTC,
+          costPerTH: plan.costPerTH,
+          minInvestmentHashpower: projection.hashpower,
+          minInvestmentMonthlyProfit: projection.totalProfitUSD,
+          minInvestmentMonthlyROI: projection.roiPercent
+        };
+      });
+
+      planComparisons.sort((a, b) => {
+        if (!a.costPerTH || !b.costPerTH) return 0;
+        return a.costPerTH.costPerTHUSD - b.costPerTH.costPerTHUSD;
+      });
+
+      const mostCostEffective = planComparisons[0];
+
+      result.overview = {
+        totalPlans: planComparisons.length,
+        plans: planComparisons,
+        mostCostEffectivePlan: {
+          planId: mostCostEffective.planId,
+          planName: mostCostEffective.planName,
+          costPerTHUSD: mostCostEffective.costPerTH.costPerTHUSD,
+          costPerTHBTC: mostCostEffective.costPerTH.costPerTHBTC,
+          minInvestment: mostCostEffective.minAmount,
+          hashpowerAtMin: mostCostEffective.costPerTH.hashpowerAtMin,
+          reason: `Lowest cost per TH/s at $${mostCostEffective.costPerTH.costPerTHUSD}/TH/s`
+        }
+      };
+    }
+
+    // =============================================
+    // USER CONTEXT
+    // =============================================
+    if (isLoggedIn && user) {
+      let userMainBalanceUSD = 0;
+      let userMaturedBalanceUSD = 0;
+
+      try {
+        if (user.balances) {
+          if (user.balances.main) {
+            for (const [asset, balance] of user.balances.main.entries()) {
+              if (balance > 0 && asset !== 'usd') {
+                const price = await getCryptoPrice(asset.toUpperCase());
+                if (price && price > 0) userMainBalanceUSD += balance * price;
+              }
+            }
+          }
+          if (user.balances.matured) {
+            for (const [asset, balance] of user.balances.matured.entries()) {
+              if (balance > 0 && asset !== 'usd') {
+                const price = await getCryptoPrice(asset.toUpperCase());
+                if (price && price > 0) userMaturedBalanceUSD += balance * price;
+              }
+            }
+          }
+        }
+      } catch (balErr) {
+        console.warn('Could not compute user balance for calculator:', balErr.message);
+      }
+
+      result.userContext = {
+        isLoggedIn: true,
+        firstName: user.firstName || null,
+        lastName: user.lastName || null,
+        totalAvailableUSD: parseFloat((userMainBalanceUSD + userMaturedBalanceUSD).toFixed(2)),
+        mainBalanceUSD: parseFloat(userMainBalanceUSD.toFixed(2)),
+        maturedBalanceUSD: parseFloat(userMaturedBalanceUSD.toFixed(2))
+      };
+    } else {
+      result.userContext = { isLoggedIn: false };
+    }
+
+    // =============================================
+    // LOG ACTIVITY TO SYSTEMLOG
+    // =============================================
+    try {
+      const deviceInfo = await getUserDeviceInfo(req);
+      const calculationTypeResolved = calculationType || 'overview';
+
+      let calculationSummary = null;
+      let recommendedPlanName = null;
+      let recommendedPlanId = null;
+      let recommendedProfitUSD = null;
+      let recommendedROIPercent = null;
+      let recommendedHashpower = null;
+      let recommendedInvestmentUSD = null;
+
+      if (calculationType === 'single_cycle' && result.singleCycleCalculation) {
+        calculationSummary = {
+          investmentAmount: result.singleCycleCalculation.investmentAmount || null,
+          requestedTH: result.singleCycleCalculation.requestedTH || null,
+          optionsCount: result.singleCycleCalculation.options?.length
+            || result.singleCycleCalculation.projections?.length || 0,
+          recommendedPlan: result.singleCycleCalculation.recommendedPlan?.planName || null
+        };
+        recommendedPlanName = result.singleCycleCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.singleCycleCalculation.recommendedPlan?.planId || null;
+        recommendedProfitUSD = result.singleCycleCalculation.recommendedPlan?.totalProfitUSD || null;
+        recommendedROIPercent = result.singleCycleCalculation.recommendedPlan?.roiPercent || null;
+        recommendedHashpower = result.singleCycleCalculation.recommendedPlan?.hashpower || null;
+        recommendedInvestmentUSD = result.singleCycleCalculation.recommendedPlan?.investmentUSD || null;
+      } else if (calculationType === 'hashrate' && result.hashrateCalculation) {
+        calculationSummary = {
+          requestedTH: result.hashrateCalculation.requestedTH,
+          optionsCount: result.hashrateCalculation.options?.length || 0,
+          recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
+          recommendedInvestmentUSD: result.hashrateCalculation.recommendedPlan?.investmentUSD || null,
+          recommendedHashpower: result.hashrateCalculation.recommendedPlan?.hashpower || null,
+          hasProjection: !!result.hashrateCalculation.projection
+        };
+        recommendedPlanName = result.hashrateCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.hashrateCalculation.recommendedPlan?.planId || null;
+        recommendedInvestmentUSD = result.hashrateCalculation.recommendedPlan?.investmentUSD || null;
+        recommendedHashpower = result.hashrateCalculation.recommendedPlan?.hashpower || null;
+      } else if (calculationType === 'investment' && result.investmentCalculation) {
+        calculationSummary = {
+          investmentAmount: result.investmentCalculation.investmentAmount,
+          eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
+          projectionsCount: result.investmentCalculation.projections?.length || 0,
+          recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
+          recommendedProfitUSD: result.investmentCalculation.recommendedPlan?.totalProfitUSD || null,
+          recommendedROIPercent: result.investmentCalculation.recommendedPlan?.roiPercent || null,
+          recommendedHashpower: result.investmentCalculation.recommendedPlan?.hashpower || null
+        };
+        recommendedPlanName = result.investmentCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.investmentCalculation.recommendedPlan?.planId || null;
+        recommendedProfitUSD = result.investmentCalculation.recommendedPlan?.totalProfitUSD || null;
+        recommendedROIPercent = result.investmentCalculation.recommendedPlan?.roiPercent || null;
+        recommendedHashpower = result.investmentCalculation.recommendedPlan?.hashpower || null;
+        recommendedInvestmentUSD = result.investmentCalculation.recommendedPlan?.investmentUSD || null;
+      } else if (calculationType === 'duration' && result.durationCalculation) {
+        calculationSummary = {
+          durationMonths: result.durationCalculation.durationMonths,
+          optionsCount: result.durationCalculation.options?.length || 0,
+          recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
+          recommendedProfitUSD: result.durationCalculation.recommendedPlan?.totalProfitUSD || null,
+          recommendedROIPerMonth: result.durationCalculation.recommendedPlan?.roiPerMonth || null
+        };
+        recommendedPlanName = result.durationCalculation.recommendedPlan?.planName || null;
+        recommendedPlanId = result.durationCalculation.recommendedPlan?.planId || null;
+        recommendedProfitUSD = result.durationCalculation.recommendedPlan?.totalProfitUSD || null;
+        recommendedROIPercent = result.durationCalculation.recommendedPlan?.roiPercent || null;
+        recommendedHashpower = result.durationCalculation.recommendedPlan?.hashpower || null;
+        recommendedInvestmentUSD = result.durationCalculation.recommendedPlan?.minInvestmentUSD || null;
+      } else if (result.overview) {
+        calculationSummary = {
+          totalPlans: result.overview.totalPlans,
+          mostCostEffectivePlan: result.overview.mostCostEffectivePlan?.planName || null,
+          costPerTHUSD: result.overview.mostCostEffectivePlan?.costPerTHUSD || null,
+          minInvestment: result.overview.mostCostEffectivePlan?.minInvestment || null
+        };
+        recommendedPlanName = result.overview.mostCostEffectivePlan?.planName || null;
+        recommendedPlanId = result.overview.mostCostEffectivePlan?.planId || null;
+        recommendedInvestmentUSD = result.overview.mostCostEffectivePlan?.minInvestment || null;
+      }
+
+      const parsedInvestmentAmount = investmentAmount !== undefined && investmentAmount !== null && investmentAmount !== ''
+        ? parseFloat(investmentAmount) : null;
+      const parsedDurationMonths = durationMonths !== undefined && durationMonths !== null && durationMonths !== ''
+        ? parseInt(durationMonths) : null;
+      const parsedDurationHours = durationHours !== undefined && durationHours !== null && durationHours !== ''
+        ? parseFloat(durationHours) : null;
+      const parsedHashrateTH = hashrateTH !== undefined && hashrateTH !== null && hashrateTH !== ''
+        ? parseFloat(hashrateTH) : null;
+
+      let description = 'Mining calculator used';
+      if (calculationType === 'single_cycle') {
+        description = `Calculated single-cycle projection${parsedInvestmentAmount ? ` with $${parsedInvestmentAmount.toLocaleString('en-US')}` : ''}${parsedHashrateTH ? ` at ${parsedHashrateTH.toLocaleString('en-US')} TH/s` : ''}`;
+      } else if (calculationType === 'investment' && parsedInvestmentAmount !== null) {
+        description = `Calculated investment projection for $${parsedInvestmentAmount.toLocaleString('en-US')}${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
+      } else if (calculationType === 'hashrate' && parsedHashrateTH !== null) {
+        description = `Calculated cost for ${parsedHashrateTH.toLocaleString('en-US')} TH/s${parsedDurationMonths ? ` over ${parsedDurationMonths} month(s)` : ''}`;
+      } else if (calculationType === 'duration' && parsedDurationMonths !== null) {
+        description = `Compared all plans over ${parsedDurationMonths} month(s)`;
+      } else {
+        description = 'Viewed mining calculator overview';
+      }
+
+      await SystemLog.create({
+        action: isLoggedIn && userId ? 'calculator_used' : 'calculator_used_guest',
+        entity: 'system',
+        entityId: null,
+
+        performedBy: actor.performedBy,
+        performedByModel: actor.performedByModel,
+        performedByEmail: actor.performedByEmail,
+        performedByName: actor.performedByName,
+
+        status: 'success',
+
+        ip: deviceInfo.ip,
+        userAgent: userAgentHeader,
+        location: deviceInfo.location || 'Unknown',
+        deviceType: getDeviceType(req),
+        os: getOSFromUserAgent(userAgentHeader),
+        browser: getBrowserFromUserAgent(userAgentHeader),
+        countryCode: deviceInfo.locationDetails?.country_code || 'Unknown',
+        city: deviceInfo.locationDetails?.city || 'Unknown',
+        region: deviceInfo.locationDetails?.region || 'Unknown',
+        latitude: deviceInfo.locationDetails?.latitude || null,
+        longitude: deviceInfo.locationDetails?.longitude || null,
+
+        metadata: {
+          description,
+          amount: parsedInvestmentAmount,
+          asset: 'USD',
+          calculationType: calculationTypeResolved,
+
+          inputs: {
+            investmentAmount: parsedInvestmentAmount,
+            durationMonths: parsedDurationMonths,
+            durationHours: parsedDurationHours,
+            hashrateTH: parsedHashrateTH
+          },
+
+          market: {
+            btcPriceAtCalculation: btcPrice,
+            btcPriceTimestamp: new Date().toISOString(),
+            plansAvailable: plans.length
+          },
+
+          calculationSummary,
+          recommendedPlanName,
+          recommendedPlanId,
+          recommendedInvestmentUSD,
+          recommendedProfitUSD,
+          recommendedROIPercent,
+          recommendedHashpower,
+
+          isLoggedIn,
+          userFirstName: isLoggedIn && user ? (user.firstName || null) : null,
+          userLastName: isLoggedIn && user ? (user.lastName || null) : null,
+          userEmail: isLoggedIn && user ? (user.email || null) : null,
+          userId: isLoggedIn && userId ? userId.toString() : null,
+
+          userMainBalanceUSD: result.userContext?.mainBalanceUSD ?? null,
+          userMaturedBalanceUSD: result.userContext?.maturedBalanceUSD ?? null,
+          userTotalAvailableUSD: result.userContext?.totalAvailableUSD ?? null,
+
+          resultProvided: true,
+          processingTimeMs: Date.now() - startTime
+        }
+      });
+    } catch (logError) {
+      console.error('Failed to log calculator activity:', logError.message);
+      if (logError.errors) {
+        console.error('Validation errors:', JSON.stringify(logError.errors, null, 2));
+      }
+    }
+
+    // =============================================
+    // RETURN RESPONSE
+    // =============================================
+    const processingTime = Date.now() - startTime;
+
+    res.status(200).json({
+      status: 'success',
+      success: true,
+      processingTimeMs: processingTime,
+      data: result
+    });
+
+  } catch (err) {
+    console.error('Mining calculator error:', err);
+
+    try {
+      const deviceInfo = await getUserDeviceInfo(req);
+      await SystemLog.create({
+        action: 'calculator_error',
+        entity: 'system',
+        entityId: null,
+        performedBy: null,
+        performedByModel: 'System',
+        performedByEmail: 'system@bithash.com',
+        performedByName: 'System',
+        status: 'failed',
+        errorMessage: err.message || 'Unknown calculator error',
+        errorStack: err.stack,
+        ip: deviceInfo.ip,
+        userAgent: userAgentHeader,
+        location: deviceInfo.location || 'Unknown',
+        deviceType: getDeviceType(req),
+        os: getOSFromUserAgent(userAgentHeader),
+        browser: getBrowserFromUserAgent(userAgentHeader),
+        metadata: {
+          description: 'Mining calculator threw an unhandled error',
+          body: req.body || {},
+          url: req.originalUrl,
+          method: req.method
+        }
+      });
+    } catch (logError) {
+      console.error('Failed to log calculator error to SystemLog:', logError.message);
+    }
+
+    res.status(500).json({
+      status: 'error',
+      success: false,
+      message: err.message || 'An error occurred while processing your calculation. Please try again.',
+      processingTimeMs: Date.now() - startTime
+    });
+  }
+});
+
+console.log('✅ Mining Calculator endpoint loaded:');
+console.log('   - POST /api/mining/calculator');
+console.log('   - Public access (no authentication required)');
+console.log('   - Supports: investment, hashrate, duration, and single_cycle calculations');
+console.log('   - Real-time BTC price (not displayed)');
+console.log('   - Payout model: profit-only for non-final months, principal + profit for the final month');
+console.log('   - finalPayoutUSD / finalPayoutBTC carry the NET monthly payout (profit only)');
+console.log('   - Single-cycle hours are pulled from the plan record in the DB; users do NOT type hours');
+console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
+console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
+console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
 
 
 
