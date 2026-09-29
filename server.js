@@ -21767,8 +21767,10 @@ app.get('/api/plans', async (req, res) => {
 
 
 
+
+
 // =============================================
-// MINING CALCULATOR — COMPLETE REWRITE
+// MINING CALCULATOR — COMPLETE REWRITE (v2)
 // ------------------------------------------------------------
 // CONTRACT MODEL (mirrors /api/investments exactly)
 //
@@ -21785,9 +21787,11 @@ app.get('/api/plans', async (req, res) => {
 //
 // RESPONSE CONTRACT:
 //   • btcLogoUrl is ALWAYS present (top-level and inside data)
-//   • monthlyBreakdown[] carries the payout schedule
-//   • recommendedDuration describes the plan duration + total cycles
+//   • Every projection emits BOTH nested buildMoney objects AND flat
+//     *USD/*BTC fields so the frontend can read either shape
 //   • NO hours input is accepted; durationMonths drives everything
+//   • BTC price comes from getCryptoPrice('BTC') — the cached, resilient
+//     server helper with 10-API fallback chain
 // =============================================
 app.post('/api/mining/calculator', async (req, res) => {
     const startTime = Date.now();
@@ -21806,7 +21810,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         const calcType = calculationType || 'investment';
 
         // durationMonths is the ONLY duration input.
-        // 0 = single cycle, 1/3/6/9/12 = multi-month contract.
+        // 0 or absent = single cycle, 1/3/6/9/12 = multi-month contract.
         const parsedDurationMonths =
             (durationMonths === undefined || durationMonths === null || durationMonths === '')
                 ? 0
@@ -21853,11 +21857,15 @@ app.post('/api/mining/calculator', async (req, res) => {
         }
 
         // =============================================
-        // 3. FETCH LIVE BTC PRICE
+        // 3. FETCH LIVE BTC PRICE (via existing cached helper)
+        // ------------------------------------------------------------
+        // Using getCryptoPrice('BTC') — the same cached function that
+        // powers /api/plans and /api/users/balances. It already has a
+        // 10-API fallback chain and a 30-second in-memory cache.
         // =============================================
         let btcPrice;
         try {
-            btcPrice = await getRealTimeBitcoinPrice();
+            btcPrice = await getCryptoPrice('BTC');
         } catch (priceError) {
             console.error('BTC price fetch failed for calculator:', priceError.message);
             return res.status(503).json({
@@ -21915,6 +21923,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
         /**
          * Structured money object used everywhere in the response.
+         * The frontend can read either the nested shape (principal.btc)
+         * OR the flat shape (principalBTC) — both are always present.
          */
         const buildMoney = (btcValue, usdValue) => {
             const btc = Number.isFinite(Number(btcValue)) ? Number(btcValue) : 0;
@@ -21985,12 +21995,11 @@ app.post('/api/mining/calculator', async (req, res) => {
             return {
                 payoutModel: 'single_cycle',
 
+                // ---- Nested shape ----
                 principal: buildMoney(grossPrincipalBTC, grossPrincipalUSD),
                 netPrincipal: buildMoney(netPrincipalBTC, netPrincipalUSD),
-
                 firstCycleFee: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
                 totalFees: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
-
                 hashpower,
 
                 totalReturn: buildMoney(totalReturnBTC, totalReturnUSD),
@@ -22002,7 +22011,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                 finalPayout: buildMoney(totalProfitBTC, totalProfitUSD),
                 netMonthlyPayout: buildMoney(totalProfitBTC, totalProfitUSD),
 
-                // ---- Legacy flat fields ----
+                // ---- FLAT fields the frontend reads ----
                 principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
                 principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
                 firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
@@ -22074,7 +22083,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         //   • Final month end     → PRINCIPAL + PROFIT to user
         //
         // `totalReturn` = SUM of ACTUAL cash payouts.
-        // `monthlyBreakdown[]` = the exact schedule cloudmining.html uses.
+        // `monthlyBreakdown[]` = the exact schedule the frontend uses.
         // =============================================
         const calculateMultiMonthProjection = (principalUSD, plan, months, currentBtcPrice) => {
             const planReturnDecimal = plan.percentage / 100;
@@ -22100,7 +22109,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             );
 
             let totalFeesUSD = 0;
+            let totalFeesBTC = 0;
             let totalPayoutUSD = 0;
+            let totalPayoutBTC = 0;
 
             const monthlyBreakdown = [];
 
@@ -22147,7 +22158,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                 const monthPayoutBTC = isFinalMonth ? monthEndingValueBTC : monthProfitBTC;
 
                 totalFeesUSD += monthFeesUSD;
+                totalFeesBTC += monthFeesBTC;
                 totalPayoutUSD += monthPayoutUSD;
+                totalPayoutBTC += monthPayoutBTC;
 
                 monthlyBreakdown.push({
                     month,
@@ -22183,12 +22196,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             const monthlyNetPayoutBTC = lastMonth.profitBTC;
 
             const totalProfitUSD = totalPayoutUSD - grossPrincipalUSD;
-            const totalProfitBTC = totalPayoutBTC = (() => {
-                // Sum the payouts in BTC for an accurate total
-                let sum = 0;
-                monthlyBreakdown.forEach(m => { sum += m.payoutBTC; });
-                return sum;
-            })();
+            const totalProfitBTC = totalPayoutBTC - grossPrincipalBTC;
 
             const roiPercent = grossPrincipalUSD > 0
                 ? (totalProfitUSD / grossPrincipalUSD) * 100
@@ -22198,24 +22206,22 @@ app.post('/api/mining/calculator', async (req, res) => {
             return {
                 payoutModel: 'profit_only_until_final_month',
 
+                // ---- Nested shape ----
                 principal: buildMoney(grossPrincipalBTC, grossPrincipalUSD),
                 netPrincipal: buildMoney(firstNetPrincipalBTC, firstNetPrincipalUSD),
-
                 firstCycleFee: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
-                totalFees: buildMoney(0, totalFeesUSD).btc
-                    ? buildMoney(totalFeesUSD / currentBtcPrice, totalFeesUSD)
-                    : buildMoney(totalFeesUSD / currentBtcPrice, totalFeesUSD),
-
+                totalFees: buildMoney(totalFeesBTC, totalFeesUSD),
                 hashpower: initialHashpower,
 
-                totalReturn: buildMoney(totalProfitBTC + grossPrincipalBTC, totalPayoutUSD),
-                totalPayout: buildMoney(totalProfitBTC + grossPrincipalBTC, totalPayoutUSD),
+                totalReturn: buildMoney(totalPayoutBTC, totalPayoutUSD),
+                totalPayout: buildMoney(totalPayoutBTC, totalPayoutUSD),
                 totalProfit: buildMoney(totalProfitBTC, totalProfitUSD),
 
                 monthlyNetPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
                 finalPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
                 netMonthlyPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
 
+                // ---- FLAT fields the frontend reads ----
                 principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
                 principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
                 firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
@@ -22224,9 +22230,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                 netPrincipalBTC: parseFloat(firstNetPrincipalBTC.toFixed(8)),
 
                 totalReturnUSD: parseFloat(totalPayoutUSD.toFixed(2)),
-                totalReturnBTC: parseFloat((totalProfitBTC + grossPrincipalBTC).toFixed(8)),
+                totalReturnBTC: parseFloat(totalPayoutBTC.toFixed(8)),
                 totalPayoutUSD: parseFloat(totalPayoutUSD.toFixed(2)),
-                totalPayoutBTC: parseFloat((totalProfitBTC + grossPrincipalBTC).toFixed(8)),
+                totalPayoutBTC: parseFloat(totalPayoutBTC.toFixed(8)),
                 totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
                 totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
 
@@ -22236,7 +22242,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                 finalPayoutBTC: parseFloat(monthlyNetPayoutBTC.toFixed(8)),
 
                 totalFeesUSD: parseFloat(totalFeesUSD.toFixed(2)),
-                totalFeesBTC: parseFloat((totalFeesUSD / currentBtcPrice).toFixed(8)),
+                totalFeesBTC: parseFloat(totalFeesBTC.toFixed(8)),
 
                 cyclesPerMonth,
                 totalCycles: cyclesPerMonth * totalMonths,
@@ -22266,7 +22272,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         // =============================================
         // 11. RECOMMENDED DURATION INFO
         // ------------------------------------------------------------
-        // Replaces the old "ROI (1 Month)" tile.
+        // Replaces the old "ROI (1 Month)" tile on the frontend.
         // Returns the actual DB duration + cycle count for the selected
         // durationMonths, mirroring the payout model.
         // =============================================
@@ -22275,9 +22281,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
             const isSingle = !months || months === 0;
 
-            const totalCycles = isSingle
-                ? 1
-                : months * cyclesPerMonth;
+            const totalCycles = isSingle ? 1 : months * cyclesPerMonth;
 
             const label = isSingle
                 ? `Single Cycle (${durationHours}h)`
@@ -22294,8 +22298,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                 payoutModel: isSingle
                     ? 'single_cycle'
                     : 'profit_only_until_final_month',
-                // Explicitly document the payout composition so the
-                // frontend can render it without guessing.
                 payoutComposition: isSingle
                     ? 'principal_and_profit_at_cycle_end'
                     : `profit_only_for_months_1_to_${months - 1}_then_principal_and_profit_at_month_${months}`
@@ -22962,10 +22964,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         });
     }
 });
-
-
-
-
 
 
 
