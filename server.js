@@ -21768,15 +21768,15 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
 // =============================================
-// MINING CALCULATOR — COMPLETE REWRITE (v2)
+// MINING CALCULATOR — COMPLETE REWRITE (v3)
 // ------------------------------------------------------------
 // CONTRACT MODEL (mirrors /api/investments exactly)
 //
 //   Single Cycle (durationMonths = 0):
 //     • One cycle at plan.duration hours
 //     • Payout = netPrincipal + profit at cycle end
+//     • monthlyBreakdown is empty (there is only one cycle)
 //
 //   Multi-Month (durationMonths = 1/3/6/9/12):
 //     • Month 1 starts at GROSS principal
@@ -21784,11 +21784,16 @@ app.get('/api/plans', async (req, res) => {
 //     • Every cycle charges cycleFeePercent on incoming balance
 //     • Non-final month end → PROFIT ONLY to user
 //     • Final month end     → PRINCIPAL + PROFIT to user
+//     • monthlyBreakdown = per-month schedule (frontend consumes this)
 //
 // RESPONSE CONTRACT:
 //   • btcLogoUrl is ALWAYS present (top-level and inside data)
 //   • Every projection emits BOTH nested buildMoney objects AND flat
 //     *USD/*BTC fields so the frontend can read either shape
+//   • Every recommendedPlan includes:
+//       - principal: { btc, usd, btcFormatted, usdFormatted, display }
+//       - monthlyBreakdown: [] with per-month payout schedule
+//       - payoutPerMonth: [] (alias of monthlyBreakdown)
 //   • NO hours input is accepted; durationMonths drives everything
 //   • BTC price comes from getCryptoPrice('BTC') — the cached, resilient
 //     server helper with 10-API fallback chain
@@ -21956,7 +21961,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         // ------------------------------------------------------------
         // One cycle of plan.duration hours.
         // Payout = netPrincipal + profit at cycle end.
-        // monthlyNetPayout carries NET PROFIT (principal excluded).
+        // monthlyBreakdown is empty (there is only one cycle).
         // =============================================
         const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
             const planReturnDecimal = plan.percentage / 100;
@@ -22044,7 +22049,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                 roiPercent: parseFloat(roiPercent.toFixed(2)),
                 roiPerMonth: 0,
 
-                // Single-cycle: only one payout row
+                // Single-cycle: no monthly schedule, but expose the single payout row.
                 monthlyBreakdown: [],
                 payoutPerMonth: [{
                     month: 1,
@@ -22430,6 +22435,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                     requestedTH,
                     options: hashrateOptions,
                     recommendedPlan: bestOption ? {
+                        // ---- Capital is the requested/effective investment ----
+                        principal: bestOption.effectiveInvestment,
+
                         planId: bestOption.planId,
                         planName: bestOption.planName,
                         investment: bestOption.effectiveInvestment,
@@ -22437,10 +22445,15 @@ app.post('/api/mining/calculator', async (req, res) => {
                         costPerTH: bestOption.costPerTH,
                         totalPayout: bestOption.projection.totalPayout,
                         totalProfit: bestOption.projection.totalProfit,
+                        totalReturn: bestOption.projection.totalReturn,
                         monthlyNetPayout: bestOption.projection.monthlyNetPayout,
                         roiPercent: bestOption.projection.roiPercent,
                         planDurationHours: bestOption.planDurationHours,
+                        cyclesPerMonth: bestOption.projection.cyclesPerMonth,
+                        cycleFeePercent: bestOption.projection.cycleFeePercent,
                         recommendedDuration: bestOption.recommendedDuration,
+                        monthlyBreakdown: [],
+                        payoutPerMonth: bestOption.projection.payoutPerMonth,
                         reason: `Best cost efficiency at ${bestOption.costPerTH.display}/TH/s`
                     } : null
                 };
@@ -22455,6 +22468,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                         planId: plan._id.toString(),
                         planName: plan.name,
                         planDescription: plan.description,
+                        planBadge: plan.badge,
+                        planTier: plan.tier,
                         planPercentage: plan.percentage,
                         planDurationHours: plan.duration,
                         planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
@@ -22463,6 +22478,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                         minAmount: plan.minAmount,
                         maxAmount: plan.maxAmount,
                         recommendedDuration: buildRecommendedDuration(plan, 0),
+                        // Full projection (includes principal, monthlyBreakdown, etc.)
                         ...projection
                     };
                 });
@@ -22478,8 +22494,14 @@ app.post('/api/mining/calculator', async (req, res) => {
                     eligiblePlansCount: eligibleSorted.length,
                     projections,
                     recommendedPlan: {
+                        // ---- Capital is the requested investment ----
+                        principal: buildMoney(amount / btcPrice, amount),
+
                         planId: bestPlan.planId,
                         planName: bestPlan.planName,
+                        planDescription: bestPlan.planDescription,
+                        planBadge: bestPlan.planBadge,
+                        planTier: bestPlan.planTier,
                         planPercentage: bestPlan.planPercentage,
                         planDurationHours: bestPlan.planDurationHours,
                         cyclesPerMonth: bestPlan.cyclesPerMonth,
@@ -22493,6 +22515,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                         roiPercent: bestPlan.roiPercent,
                         totalFees: bestPlan.totalFees,
                         recommendedDuration: bestPlan.recommendedDuration,
+                        monthlyBreakdown: [],
                         payoutPerMonth: bestPlan.payoutPerMonth,
                         reason: `Best single-cycle profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI over ${bestPlan.planDurationHours}h)`
                     }
@@ -22567,13 +22590,26 @@ app.post('/api/mining/calculator', async (req, res) => {
                 requestedTH,
                 options: hashrateOptions,
                 recommendedPlan: bestOption ? {
+                    // ---- Capital is the effective investment ----
+                    principal: bestOption.effectiveInvestment,
+
                     planId: bestOption.planId,
                     planName: bestOption.planName,
                     investment: bestOption.effectiveInvestment,
                     hashpower: bestOption.effectiveHashpower,
                     costPerTH: bestOption.costPerTH,
                     recommendedDuration: bestOption.recommendedDuration,
+                    // Include the full projection so the frontend has everything
                     projection: bestOption.projection,
+                    monthlyBreakdown: bestOption.projection.monthlyBreakdown,
+                    payoutPerMonth: bestOption.projection.payoutPerMonth,
+                    totalReturn: bestOption.projection.totalReturn,
+                    totalProfit: bestOption.projection.totalProfit,
+                    monthlyNetPayout: bestOption.projection.monthlyNetPayout,
+                    roiPercent: bestOption.projection.roiPercent,
+                    totalFees: bestOption.projection.totalFees,
+                    cyclesPerMonth: bestOption.projection.cyclesPerMonth,
+                    cycleFeePercent: bestOption.projection.cycleFeePercent,
                     reason: `Best cost efficiency at ${bestOption.costPerTH.display}/TH/s`
                 } : null
             };
@@ -22581,6 +22617,13 @@ app.post('/api/mining/calculator', async (req, res) => {
 
         // =============================================
         // 16. CASE: INVESTMENT (multi-month)
+        // ------------------------------------------------------------
+        // This is the MAIN case the cloudmining.html page uses.
+        // The recommendedPlan MUST include:
+        //   • principal (the requested capital, in BTC and USD)
+        //   • monthlyBreakdown (the per-month payout schedule)
+        //   • payoutPerMonth (alias of monthlyBreakdown)
+        //   • all summary fields (totalReturn, totalProfit, roiPercent, etc.)
         // =============================================
         else if (calcType === 'investment' && hasAmount) {
             const amount = parseFloat(investmentAmount);
@@ -22621,16 +22664,22 @@ app.post('/api/mining/calculator', async (req, res) => {
                 };
             } else {
                 const planProjections = eligiblePlans.map(plan => {
+                    // calculateContractProjection returns a full projection with monthlyBreakdown
                     const projection = calculateContractProjection(amount, plan, monthsToUse, btcPrice);
+
+                    // Attach plan static details to the projection for the frontend
                     return {
                         planId: plan._id.toString(),
                         planName: plan.name,
                         planDescription: plan.description,
+                        planBadge: plan.badge,
+                        planTier: plan.tier,
                         planPercentage: plan.percentage,
                         planDurationHours: plan.duration,
                         planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
                         cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
                         recommendedDuration: buildRecommendedDuration(plan, monthsToUse),
+                        // Merge in the full dynamic projection (includes principal + monthlyBreakdown)
                         ...projection
                     };
                 });
@@ -22638,6 +22687,14 @@ app.post('/api/mining/calculator', async (req, res) => {
                 planProjections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
                 const bestPlan = planProjections[0];
 
+                // ------------------------------------------------------------
+                // recommendedPlan is the FULL projection of the best plan,
+                // so the frontend has everything it needs:
+                //   • principal (the requested capital in BTC + USD)
+                //   • monthlyBreakdown (per-month payout schedule)
+                //   • payoutPerMonth (alias of monthlyBreakdown)
+                //   • summary fields
+                // ------------------------------------------------------------
                 result.investmentCalculation = {
                     investment: buildMoney(amount / btcPrice, amount),
                     investmentUSD: amount,
@@ -22645,24 +22702,60 @@ app.post('/api/mining/calculator', async (req, res) => {
                     eligiblePlansCount: eligiblePlans.length,
                     projections: planProjections,
                     recommendedPlan: {
+                        // ---- Identity from the plan ----
                         planId: bestPlan.planId,
                         planName: bestPlan.planName,
+                        planDescription: bestPlan.planDescription,
+                        planBadge: bestPlan.planBadge,
+                        planTier: bestPlan.planTier,
                         planPercentage: bestPlan.planPercentage,
                         planDurationHours: bestPlan.planDurationHours,
                         cyclesPerMonth: bestPlan.cyclesPerMonth,
                         cycleFeePercent: bestPlan.cycleFeePercent,
-                        investment: buildMoney(amount / btcPrice, amount),
+                        recommendedDuration: bestPlan.recommendedDuration,
+
+                        // ---- Capital (the requested investment, in BTC + USD) ----
+                        principal: buildMoney(amount / btcPrice, amount),
+
+                        // ---- Nested money objects from the projection ----
+                        netPrincipal: bestPlan.netPrincipal,
+                        firstCycleFee: bestPlan.firstCycleFee,
+                        totalFees: bestPlan.totalFees,
                         hashpower: bestPlan.hashpower,
+                        totalReturn: bestPlan.totalReturn,
                         totalPayout: bestPlan.totalPayout,
                         totalProfit: bestPlan.totalProfit,
-                        totalReturn: bestPlan.totalReturn,
                         monthlyNetPayout: bestPlan.monthlyNetPayout,
+                        finalPayout: bestPlan.finalPayout,
+                        netMonthlyPayout: bestPlan.netMonthlyPayout,
+
+                        // ---- FLAT fields the frontend reads ----
+                        principalUSD: bestPlan.principalUSD,
+                        principalBTC: bestPlan.principalBTC,
+                        netPrincipalUSD: bestPlan.netPrincipalUSD,
+                        netPrincipalBTC: bestPlan.netPrincipalBTC,
+                        totalReturnUSD: bestPlan.totalReturnUSD,
+                        totalReturnBTC: bestPlan.totalReturnBTC,
+                        totalPayoutUSD: bestPlan.totalPayoutUSD,
+                        totalPayoutBTC: bestPlan.totalPayoutBTC,
+                        totalProfitUSD: bestPlan.totalProfitUSD,
+                        totalProfitBTC: bestPlan.totalProfitBTC,
+                        monthlyNetPayoutUSD: bestPlan.monthlyNetPayoutUSD,
+                        monthlyNetPayoutBTC: bestPlan.monthlyNetPayoutBTC,
+                        finalPayoutUSD: bestPlan.finalPayoutUSD,
+                        finalPayoutBTC: bestPlan.finalPayoutBTC,
+                        totalFeesUSD: bestPlan.totalFeesUSD,
+                        totalFeesBTC: bestPlan.totalFeesBTC,
                         roiPercent: bestPlan.roiPercent,
                         roiPerMonth: bestPlan.roiPerMonth,
-                        totalFees: bestPlan.totalFees,
+                        totalMonths: bestPlan.totalMonths,
+                        totalCycles: bestPlan.totalCycles,
+
+                        // ---- The per-month payout schedule ----
                         monthlyBreakdown: bestPlan.monthlyBreakdown,
                         payoutPerMonth: bestPlan.payoutPerMonth,
-                        recommendedDuration: bestPlan.recommendedDuration,
+
+                        // ---- Human-readable reason ----
                         reason: `Highest profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`
                     }
                 };
@@ -22682,12 +22775,16 @@ app.post('/api/mining/calculator', async (req, res) => {
                 return {
                     planId: plan.planId,
                     planName: plan.name,
+                    planDescription: plan.description,
+                    planBadge: sourcePlan.badge,
+                    planTier: sourcePlan.tier,
                     planPercentage: plan.percentage,
                     planDurationHours: plan.durationHours,
                     planDurationDays: plan.durationDays,
                     cyclesPerMonth: plan.cyclesPerMonth,
                     minInvestment: buildMoney(plan.minAmount / btcPrice, plan.minAmount),
                     recommendedDuration: buildRecommendedDuration(sourcePlan, months),
+                    // Full projection (includes principal + monthlyBreakdown)
                     ...projection
                 };
             });
@@ -22699,6 +22796,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                 durationMonths: months,
                 options: durationOptions,
                 recommendedPlan: {
+                    // ---- Capital is the min investment for the best plan ----
+                    principal: bestPlan.principal,
+
                     planId: bestPlan.planId,
                     planName: bestPlan.planName,
                     planPercentage: bestPlan.planPercentage,
@@ -22714,9 +22814,14 @@ app.post('/api/mining/calculator', async (req, res) => {
                     roiPercent: bestPlan.roiPercent,
                     roiPerMonth: bestPlan.roiPerMonth,
                     totalFees: bestPlan.totalFees,
+                    totalMonths: bestPlan.totalMonths,
+                    totalCycles: bestPlan.totalCycles,
+                    recommendedDuration: bestPlan.recommendedDuration,
+
+                    // ---- The per-month payout schedule ----
                     monthlyBreakdown: bestPlan.monthlyBreakdown,
                     payoutPerMonth: bestPlan.payoutPerMonth,
-                    recommendedDuration: bestPlan.recommendedDuration,
+
                     reason: `Best ROI per month: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`
                 }
             };
@@ -22734,6 +22839,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                     planId: plan.planId,
                     planName: plan.name,
                     planDescription: plan.description,
+                    planBadge: sourcePlan.badge,
+                    planTier: sourcePlan.tier,
                     planPercentage: plan.percentage,
                     planDurationHours: plan.durationHours,
                     planDurationDays: plan.durationDays,
@@ -22747,7 +22854,11 @@ app.post('/api/mining/calculator', async (req, res) => {
                     minInvestmentHashpower: projection.hashpower,
                     minInvestmentMonthlyProfit: projection.totalProfit,
                     minInvestmentMonthlyProfitUSD: projection.totalProfitUSD,
-                    minInvestmentMonthlyROI: projection.roiPercent
+                    minInvestmentMonthlyROI: projection.roiPercent,
+                    // Include the full 1-month projection so the frontend
+                    // can render the schedule if the user selects this plan
+                    monthlyBreakdown: projection.monthlyBreakdown,
+                    payoutPerMonth: projection.payoutPerMonth
                 };
             });
 
@@ -22771,6 +22882,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                     minInvestmentMoney: mostCostEffective.minAmountMoney,
                     hashpowerAtMin: mostCostEffective.costPerTH.hashpowerAtMin,
                     recommendedDuration: mostCostEffective.recommendedDuration,
+                    monthlyBreakdown: mostCostEffective.monthlyBreakdown,
+                    payoutPerMonth: mostCostEffective.payoutPerMonth,
                     reason: `Lowest cost per TH/s at ${mostCostEffective.costPerTH.display}/TH/s`
                 }
             };
@@ -22964,9 +23077,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         });
     }
 });
-
-
-
 
 
 
