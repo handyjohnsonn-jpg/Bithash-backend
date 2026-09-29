@@ -21772,73 +21772,6 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
-
-
-
-
-
-// =============================================
-// MINING CALCULATOR ENDPOINT
-// POST /api/mining/calculator
-//
-// ============================================================
-// PAYOUT MODEL — "PROFIT-ONLY UNTIL FINAL MONTH"
-// ============================================================
-//   • Non-final months → user receives PROFIT ONLY.
-//   • Final month      → user receives PRINCIPAL + PROFIT.
-//   • Single cycle     → same as FINAL month: principal + profit.
-//
-// Fee is charged on the incoming balance of EVERY cycle.
-// It is baked into the net principal that mines and is NOT
-// deducted a second time at the month boundary.
-//
-// ============================================================
-// MONTHLY NET PAYOUT SEMANTICS (FIXED)
-// ============================================================
-//   `monthlyNetPayoutUSD` / `monthlyNetPayoutBTC` are the
-//   NET figure for the LAST month (profit only, principal
-//   excluded). This is what the "Monthly Net Payout" UI tile
-//   expects.
-//
-//   Additional aliases provided for backward compatibility:
-//     • finalPayoutUSD / finalPayoutBTC (same value)
-//     • netMonthlyPayoutUSD / netMonthlyPayoutBTC
-//
-//   The gross last-month figure (principal + profit) is still
-//   available via:
-//     • totalReturnUSD / totalReturnBTC
-//     • totalPayoutUSD / totalPayoutBTC
-//     • monthlyBreakdown[last].payoutUSD / .payoutBTC
-//     • payoutPerMonth[last].payoutUSD / .payoutBTC
-//
-// ============================================================
-// SINGLE-CYCLE SUPPORT (SIMPLIFIED — NO HOURS INPUT)
-// ============================================================
-//   • Single-cycle is HOURS-based. The hours come from the plan
-//     record in the database (plan.duration). The user does NOT
-//     supply hours.
-//   • Invoke with `calculationType: 'single_cycle'` and either
-//     `investmentAmount` or `hashrateTH`.
-//   • Backend resolves the matching plan(s) from the DB.
-//
-// ============================================================
-// DISPLAY FIELDS (BTC + FIAT)
-// ============================================================
-//   Every monetary value is returned as a structured object:
-//     {
-//       btc: 0.000137,
-//       btcFormatted: "0.000137",
-//       usd: 11.40,
-//       usdFormatted: "$11.40",
-//       display: "0.000137 BTC ≈ $11.40"
-//     }
-//   The frontend renders `display` with BTC in the normal font
-//   and USD in a smaller, muted font.
-//
-//   `btcLogoUrl` is included at the top level and uses the same
-//   source as the email system (getCryptoLogo('BTC')).
-// ============================================================
 app.post('/api/mining/calculator', async (req, res) => {
   const startTime = Date.now();
   const userAgentHeader = req.headers['user-agent'] || 'Unknown';
@@ -21995,16 +21928,9 @@ app.post('/api/mining/calculator', async (req, res) => {
     // =============================================
     // DISPLAY FORMATTING HELPERS
     // =============================================
-    //
-    // Every monetary value is returned as a structured object so
-    // the frontend can render BTC in the normal font and USD in a
-    // smaller muted font, exactly like:
-    //   0.000137 BTC ≈ $11.40
-    //
     const formatBTC = (value) => {
       const n = Number(value);
       if (!Number.isFinite(n)) return '0.00000000';
-      // 8 decimals for BTC amounts
       return n.toFixed(8);
     };
 
@@ -22037,32 +21963,16 @@ app.post('/api/mining/calculator', async (req, res) => {
       };
     };
 
-    // BTC logo — same source as the email system
+    // BTC logo — sourced from the CANONICAL getCryptoLogo helper
+    // defined at the top of the file (cryptologos.cc), the same
+    // source the email system uses.
     const btcLogoUrl = getCryptoLogo('BTC');
 
     // =============================================
-    // HELPERS
+    // LOCAL HELPERS
+    // (Do not shadow the global calculateHashpower /
+    //  calculateCyclesPerMonth / calculateTotalCycles.)
     // =============================================
-    const calculateCyclesPerMonth = (planDurationHours) => {
-      if (!planDurationHours || planDurationHours <= 0) return 1;
-      const monthHours = 30 * 24;
-      return Math.max(1, Math.floor(monthHours / planDurationHours));
-    };
-
-    const calculateHashpower = (netPrincipalUSD, planPercentage, durationHours, currentBtcPrice) => {
-      if (!netPrincipalUSD || netPrincipalUSD <= 0) return 0;
-      if (!planPercentage || planPercentage <= 0) return 0;
-      if (!durationHours || durationHours <= 0) return 0;
-      if (!currentBtcPrice || currentBtcPrice <= 0) return 0;
-
-      const cycleReturnUSD = netPrincipalUSD * (planPercentage / 100);
-      const cycleReturnBTC = cycleReturnUSD / currentBtcPrice;
-      const btcMinedPerTH = BTC_PER_TH_PER_HOUR * durationHours;
-      if (btcMinedPerTH <= 0) return 0;
-
-      return Math.max(0, parseFloat((cycleReturnBTC / btcMinedPerTH).toFixed(4)));
-    };
-
     const resolveCycleFeePercent = (plan) => {
       if (plan && typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0) {
         return plan.cycleFeePercent;
@@ -22075,9 +21985,9 @@ app.post('/api/mining/calculator', async (req, res) => {
     // ------------------------------------------------------------
     // Payout = principal + profit at cycle end.
     //
-    // FIX: monthlyNetPayoutUSD / monthlyNetPayoutBTC carry the
-    //      NET profit (principal excluded). This is what the
-    //      "Monthly Net Payout" UI tile must display.
+    // monthlyNetPayoutUSD / monthlyNetPayoutBTC carry the NET
+    // profit (principal excluded). This is what the "Monthly Net
+    // Payout" UI tile must display.
     // ============================================================
     const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
       const planPercentageDecimal = plan.percentage / 100;
@@ -22124,14 +22034,11 @@ app.post('/api/mining/calculator', async (req, res) => {
         hashpower,
 
         // --- Payouts ---
-        // Gross payout = principal + profit (what lands in matured wallet)
         totalReturn: buildMoney(totalReturnBTC, totalReturnUSD),
         totalPayout: buildMoney(totalReturnBTC, totalReturnUSD),
-
-        // NET profit = the actual earnings (principal excluded)
         totalProfit: buildMoney(totalProfitBTC, totalProfitUSD),
 
-        // FIX: "Monthly Net Payout" tile = NET profit only
+        // "Monthly Net Payout" tile = NET profit only
         monthlyNetPayout: buildMoney(totalProfitBTC, totalProfitUSD),
         finalPayout: buildMoney(totalProfitBTC, totalProfitUSD),
         netMonthlyPayout: buildMoney(totalProfitBTC, totalProfitUSD),
@@ -22151,7 +22058,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
         totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
 
-        // FIX: NET monthly payout tile = profit only
         monthlyNetPayoutUSD: parseFloat(totalProfitUSD.toFixed(2)),
         monthlyNetPayoutBTC: parseFloat(totalProfitBTC.toFixed(8)),
         finalPayoutUSD: parseFloat(totalProfitUSD.toFixed(2)),
@@ -22188,10 +22094,6 @@ app.post('/api/mining/calculator', async (req, res) => {
     // ------------------------------------------------------------
     // Non-final months: profit only.
     // Final month:      principal + profit.
-    //
-    // FIX: monthlyNetPayoutUSD / monthlyNetPayoutBTC carry the
-    //      NET last-month profit (principal excluded). This is
-    //      what the "Monthly Net Payout" UI tile must display.
     // ============================================================
     const calculateMultiMonthProjection = (principalUSD, plan, months, currentBtcPrice) => {
       const planPercentageDecimal = plan.percentage / 100;
@@ -22280,7 +22182,6 @@ app.post('/api/mining/calculator', async (req, res) => {
           cyclesInMonth: cyclesPerMonth,
           feesPaid: buildMoney(monthFeesBTC, monthFeesUSD),
 
-          // Legacy flat fields
           startingPrincipalUSD: parseFloat(monthStartingPrincipalUSD.toFixed(2)),
           startingPrincipalBTC: parseFloat(monthStartingPrincipalBTC.toFixed(8)),
           endingValueUSD: parseFloat(monthReturnUSD.toFixed(2)),
@@ -22302,7 +22203,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             ? 'Final month: principal + profit'
             : 'Non-final month: profit only',
 
-          // Legacy flat fields
           payoutUSD: parseFloat(monthPayoutUSD.toFixed(2)),
           payoutBTC: parseFloat(monthPayoutBTC.toFixed(8)),
           profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
@@ -22313,7 +22213,7 @@ app.post('/api/mining/calculator', async (req, res) => {
         monthStartingPrincipalBTC = firstNetPrincipalBTC;
       }
 
-      // FIX: "Monthly Net Payout" tile = NET last-month profit only
+      // "Monthly Net Payout" tile = NET last-month profit only
       const lastMonth = monthlyBreakdown[monthlyBreakdown.length - 1];
       const monthlyNetPayoutUSD = lastMonth.profitUSD;
       const monthlyNetPayoutBTC = lastMonth.profitBTC;
@@ -22329,28 +22229,22 @@ app.post('/api/mining/calculator', async (req, res) => {
       return {
         payoutModel: 'profit_only_until_final_month',
 
-        // --- Principal ---
         principal: buildMoney(grossPrincipalBTC, grossPrincipalUSD),
         netPrincipal: buildMoney(firstNetPrincipalBTC, firstNetPrincipalUSD),
 
-        // --- Fees ---
         firstCycleFee: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
         totalFees: buildMoney(totalFeesBTC, totalFeesUSD),
 
-        // --- Hashpower ---
         hashpower: initialHashpower,
 
-        // --- Payouts ---
         totalReturn: buildMoney(totalPayoutBTC, totalPayoutUSD),
         totalPayout: buildMoney(totalPayoutBTC, totalPayoutUSD),
         totalProfit: buildMoney(totalProfitBTC, totalProfitUSD),
 
-        // FIX: "Monthly Net Payout" tile = NET last-month profit
         monthlyNetPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
         finalPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
         netMonthlyPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
 
-        // --- Legacy flat fields ---
         principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
         principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
         firstCycleFeeUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
@@ -22365,7 +22259,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
         totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
 
-        // FIX: NET monthly payout tile = profit only
         monthlyNetPayoutUSD: parseFloat(monthlyNetPayoutUSD.toFixed(2)),
         monthlyNetPayoutBTC: parseFloat(monthlyNetPayoutBTC.toFixed(8)),
         finalPayoutUSD: parseFloat(monthlyNetPayoutUSD.toFixed(2)),
@@ -22461,12 +22354,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
     // ============================================================
     // CASE 0: SINGLE-CYCLE CALCULATION (SIMPLIFIED — NO HOURS INPUT)
-    // ------------------------------------------------------------
-    // No `durationHours` input required. Plan hours come from DB.
-    // If `durationHours` IS supplied, it only narrows the plan list.
     // ============================================================
     if (calculationType === 'single_cycle') {
-      // Optional narrowing filter (should match a DB plan.duration exactly)
       const filterHours = (durationHours !== undefined && durationHours !== null && durationHours !== '')
         ? parseFloat(durationHours)
         : null;
@@ -22556,7 +22445,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             planDurationHours: bestOption.planDurationHours,
             reason: `Best cost efficiency at ${bestOption.costPerTH.display}/TH/s`,
 
-            // Legacy flat fields
             investmentUSD: bestOption.effectiveInvestment.usd,
             investmentBTC: bestOption.effectiveInvestment.btc,
             totalPayoutUSD: bestOption.projection.totalPayoutUSD,
@@ -22574,8 +22462,6 @@ app.post('/api/mining/calculator', async (req, res) => {
       else {
         const amount = parseFloat(investmentAmount);
 
-        // Plan list already narrowed by filterHours above (if provided).
-        // Now narrow to plans whose min/max range accepts this amount.
         const eligiblePlans = matchingPlans.filter(plan =>
           amount >= plan.minAmount && amount <= plan.maxAmount
         );
@@ -22625,7 +22511,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             totalFees: bestPlan.totalFees,
             reason: `Best single-cycle profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI over ${bestPlan.planDurationHours}h)`,
 
-            // Legacy flat fields
             investmentUSD: amount,
             investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
             totalPayoutUSD: bestPlan.totalPayoutUSD,
@@ -22719,7 +22604,6 @@ app.post('/api/mining/calculator', async (req, res) => {
           costPerTH: bestOption.costPerTH,
           reason: `Best cost efficiency at ${bestOption.costPerTH.display}/TH/s`,
 
-          // Legacy flat fields
           investmentUSD: bestOption.effectiveInvestment.usd,
           investmentBTC: bestOption.effectiveInvestment.btc,
           costPerTHUSD: bestOption.costPerTHUSD,
@@ -22822,7 +22706,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             payoutPerMonth: bestPlan.payoutPerMonth,
             reason: `Highest profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`,
 
-            // Legacy flat fields
             investmentUSD: amount,
             investmentBTC: parseFloat((amount / btcPrice).toFixed(8)),
             totalPayoutUSD: bestPlan.totalPayoutUSD,
@@ -22908,7 +22791,6 @@ app.post('/api/mining/calculator', async (req, res) => {
           payoutPerMonth: bestPlan.payoutPerMonth,
           reason: `Best ROI per month: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`,
 
-          // Legacy flat fields
           minInvestmentUSD: bestPlan.minInvestmentUSD,
           minInvestmentBTC: bestPlan.minInvestmentBTC,
           totalPayoutUSD: bestPlan.totalPayoutUSD,
@@ -23019,7 +22901,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         mainBalance: buildMoney(userMainBalanceUSD / btcPrice, userMainBalanceUSD),
         maturedBalance: buildMoney(userMaturedBalanceUSD / btcPrice, userMaturedBalanceUSD),
 
-        // Legacy flat fields
         totalAvailableUSD: parseFloat(totalAvailableUSD.toFixed(2)),
         mainBalanceUSD: parseFloat(userMainBalanceUSD.toFixed(2)),
         maturedBalanceUSD: parseFloat(userMaturedBalanceUSD.toFixed(2))
@@ -23259,20 +23140,6 @@ app.post('/api/mining/calculator', async (req, res) => {
     });
   }
 });
-
-console.log('✅ Mining Calculator endpoint loaded:');
-console.log('   - POST /api/mining/calculator');
-console.log('   - Public access (no authentication required)');
-console.log('   - Supports: investment, hashrate, duration, and single_cycle calculations');
-console.log('   - Real-time BTC price (not displayed)');
-console.log('   - Payout model: profit-only for non-final months, principal + profit for the final month');
-console.log('   - monthlyNetPayout / finalPayout / netMonthlyPayout = NET monthly payout (profit only)');
-console.log('   - Single-cycle hours are pulled from the plan record in the DB; users do NOT type hours');
-console.log('   - All monetary values returned as { btc, btcFormatted, usd, usdFormatted, display }');
-console.log('   - btcLogoUrl included at top level (same source as email system)');
-console.log('   - Logged-in users logged as action="calculator_used"  (entity="system")');
-console.log('   - Guests          logged as action="calculator_used_guest" (entity="system")');
-console.log('   - All calculator activity goes to SystemLog only (single source of truth)');
 
 
 
