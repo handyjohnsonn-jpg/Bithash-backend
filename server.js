@@ -19580,7 +19580,7 @@ app.post('/api/investments', protect, [
 
     console.log(`📊 BTC Balance Check for ${user.email}:`);
     console.log(`   Main Wallet BTC: ${mainBitcoinBalance}`);
-    console.log(`   Matured Wallet BTC: ${maturedBTCBalance > 0 ? maturedBitcoinBalance : maturedBitcoinBalance}`);
+    console.log(`   Matured Wallet BTC: ${maturedBitcoinBalance}`);
     console.log(`   Investment: $${amount} USD = ${amountInBTC.toFixed(8)} BTC`);
     console.log(`   BTC Price from API: $${btcPrice}`);
     console.log(`   Auto-compound: ${requestedMonths > 0 ? requestedMonths + ' month(s)' : 'single cycle (normal hourly rental)'}`);
