@@ -390,13 +390,74 @@ if (process.env.NODE_ENV === 'production') {
 
 
 
+
+
+
+
+
+
+
+
+
 const CYCLE_FEE_PERCENT = 3; // % deducted at the start of every cycle
 
 const BTC_PER_TH_PER_HOUR = 0.000025 / 24;
 
 const MINUTES_PER_MONTH = 30 * 24 * 60; // 43200
 
+// ============================================================
+// ELECTRICITY CONSTANTS (fallback defaults; live values are
+// read from SystemSettings { type: 'electricity' } and may be
+// overridden per Plan. See resolveElectricityRates() below.)
+// ============================================================
+const ELEC_FALLBACK = {
+    rateBaseUSDPerKWh:   0.055,   // energy charge
+    rateDemandUSDPerKWh: 0.030,   // amortized demand charge
+    wallPowerDerating:   1.06,    // nameplate -> wall power (+6%)
+};
 
+/**
+ * Resolve the electricity rates that apply to a given plan.
+ * Precedence:
+ *   1) plan.electricityRate* / plan.wallPowerDerating  (per-plan override)
+ *   2) SystemSettings { type: 'electricity' }          (platform-wide)
+ *   3) ELEC_FALLBACK                                   (last-resort)
+ *
+ * Returns an object with the resolved values, always including
+ * rateAllInUSDPerKWh = base + demand, so callers never need to
+ * add the two together themselves.
+ */
+async function resolveElectricityRates(plan) {
+    const planBase   = Number(plan?.electricityRateBaseUSDPerKWh);
+    const planDemand = Number(plan?.electricityRateDemandUSDPerKWh);
+    const planDerate = Number(plan?.wallPowerDerating);
+
+    let global = null;
+    try {
+        global = await SystemSettings.findOne({ type: 'electricity' }).lean();
+    } catch (err) {
+        global = null;
+    }
+
+    const rateBaseUSDPerKWh =
+        Number.isFinite(planBase) ? planBase :
+        (global?.electricity?.rateBaseUSDPerKWh ?? ELEC_FALLBACK.rateBaseUSDPerKWh);
+
+    const rateDemandUSDPerKWh =
+        Number.isFinite(planDemand) ? planDemand :
+        (global?.electricity?.rateDemandUSDPerKWh ?? ELEC_FALLBACK.rateDemandUSDPerKWh);
+
+    const wallPowerDerating =
+        Number.isFinite(planDerate) ? planDerate :
+        (global?.electricity?.wallPowerDerating ?? ELEC_FALLBACK.wallPowerDerating);
+
+    return {
+        rateBaseUSDPerKWh,
+        rateDemandUSDPerKWh,
+        rateAllInUSDPerKWh: rateBaseUSDPerKWh + rateDemandUSDPerKWh,
+        wallPowerDerating,
+    };
+}
 
 /**
  * How many cycles fit inside one 30-day month for a given plan duration (hours).
@@ -441,6 +502,61 @@ function calculateHashpower(netPrincipalUSD, planPercentage, durationHours, btcP
     const hashpower = cycleReturnBTC / btcMinedPerTH;
     return Math.max(0, parseFloat(hashpower.toFixed(4)));
 }
+
+/**
+ * Physical power draw of an ASIC fleet at wall.
+ *   wallWatts = hashpowerTH × joulesPerTH × wallPowerDerating
+ */
+function wallWatts(hashpowerTH, joulesPerTH, wallPowerDerating) {
+    if (!hashpowerTH || hashpowerTH <= 0) return 0;
+    if (!joulesPerTH || joulesPerTH <= 0) return 0;
+    const derate = wallPowerDerating && wallPowerDerating > 0 ? wallPowerDerating : 1;
+    return hashpowerTH * joulesPerTH * derate;
+}
+
+/**
+ * Electricity cost (USD) for one cycle.
+ *
+ *   kWh      = wallWatts × durationHours / 1000
+ *   costUSD  = kWh × rateAllInUSDPerKWh
+ *
+ * `rates` should be the resolved object from resolveElectricityRates().
+ * If omitted, the fallback constants are used.
+ */
+function powerCostForCycleUSD(hashpowerTH, joulesPerTH, durationHours, rates) {
+    const r = rates || {
+        rateAllInUSDPerKWh:
+            ELEC_FALLBACK.rateBaseUSDPerKWh + ELEC_FALLBACK.rateDemandUSDPerKWh,
+        wallPowerDerating: ELEC_FALLBACK.wallPowerDerating,
+    };
+
+    if (!hashpowerTH || hashpowerTH <= 0) return 0;
+    if (!joulesPerTH || joulesPerTH <= 0) return 0;
+    if (!durationHours || durationHours <= 0) return 0;
+
+    const watts = wallWatts(hashpowerTH, joulesPerTH, r.wallPowerDerating);
+    const kwh = (watts * durationHours) / 1000;
+    return kwh * r.rateAllInUSDPerKWh;
+}
+
+/**
+ * Electricity cost (USD) for 24 hours — convenience wrapper
+ * used by admin/debug views. Not rendered on plan cards.
+ */
+function powerCostPerDayUSD(hashpowerTH, joulesPerTH, rates) {
+    return powerCostForCycleUSD(hashpowerTH, joulesPerTH, 24, rates);
+}
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -3252,11 +3368,13 @@ const TradingRevenue = mongoose.models.TradingRevenue || mongoose.model('Trading
 const PairLimits = mongoose.models.PairLimits || mongoose.model('PairLimits', PairLimitsSchema);
 const AssetExtraInfo = mongoose.models.AssetExtraInfo || mongoose.model('AssetExtraInfo', AssetExtraInfoSchema);
 
+
+
 const SystemSettingsSchema = new mongoose.Schema({
   type: { 
     type: String, 
     required: true,
-    enum: ['general', 'email', 'payment', 'security'],
+    enum: ['general', 'email', 'payment', 'security', 'electricity'],
     unique: true
   },
   platformName: String,
@@ -3269,11 +3387,40 @@ const SystemSettingsSchema = new mongoose.Schema({
   dateFormat: String,
   maxLoginAttempts: Number,
   sessionTimeout: Number,
+
+  // ============================================================
+  // ELECTRICITY SETTINGS (populated only when type === 'electricity')
+  // ============================================================
+  // These are the platform-wide defaults. Individual plans may override
+  // any of these values on their own schema, and activated investments
+  // freeze whatever was in effect at activation time onto investment.costBasis.
+  electricity: {
+    // Base energy charge from the utility / PPA, in USD per kWh
+    rateBaseUSDPerKWh:   { type: Number, default: 0.055, min: 0 },
+
+    // Amortized demand charge (peak capacity billing) in USD per kWh
+    rateDemandUSDPerKWh: { type: Number, default: 0.030, min: 0 },
+
+    // Nameplate → wall-power derating factor (1.06 = +6%)
+    wallPowerDerating:   { type: Number, default: 1.06, min: 1, max: 2 },
+
+    currency:            { type: String, default: 'USD' },
+
+    effectiveFrom:       { type: Date, default: Date.now },
+
+    notes:               { type: String, default: '' },
+
+    updatedBy:           { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+    updatedAt:           { type: Date, default: Date.now }
+  },
+
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
   updatedAt: Date
 }, { timestamps: true });
 
 const SystemSettings = mongoose.model('SystemSettings', SystemSettingsSchema);
+
+
 
 const AdminSchema = new mongoose.Schema({
   email: { 
@@ -3347,6 +3494,20 @@ const PlanSchema = new mongoose.Schema({
 
   hashrateUnit:            { type: String, default: 'TH/s' },
   hashrateDisplayOverride: { type: String, default: null },
+
+  // ---------- Mining hardware identity ----------
+  hardwareModel:  { type: String, default: '', trim: true },   // e.g. "S21 (200T)", "S23 Hyd (580T)"
+  hardwareVendor: { type: String, default: 'Bitmain', trim: true },
+
+  // ---------- Energy efficiency ----------
+  // Delivered J/TH (spec-sheet delivered value, not nameplate). The +6% wall-power
+  // derating is applied inside powerCostForCycleUSD(), not baked into this number.
+  joulesPerTH: { type: Number, default: 15.0, min: 5, max: 120 },
+
+  // ---------- Electricity cost inputs (per-plan override; null → inherit SystemSettings) ----------
+  electricityRateBaseUSDPerKWh:   { type: Number, default: null, min: 0 },
+  electricityRateDemandUSDPerKWh: { type: Number, default: null, min: 0 },
+  wallPowerDerating:               { type: Number, default: null, min: 1, max: 2 },
 
   videoUrl:       { type: String, default: '' },
   referralBonus:  { type: Number, default: 5, min: [0, 'Bonus cannot be negative'] }
@@ -3552,7 +3713,6 @@ const UserPreference = mongoose.model('UserPreference', UserPreferenceSchema);
 const DepositAsset = mongoose.model('DepositAsset', DepositAssetSchema);
 const Buy = mongoose.model('Buy', BuySchema);
 const Sell = mongoose.model('Sell', SellSchema);
-
 
 
 
@@ -3832,12 +3992,40 @@ const InvestmentSchema = new mongoose.Schema({
     netPrincipalBTC: { type: Number, required: true },
     returnUSD: { type: Number, default: 0 },
     returnBTC: { type: Number, default: 0 },
+    powerCostUSD: { type: Number, default: 0 },
+    powerCostBTC: { type: Number, default: 0 },
+    netAfterPowerUSD: { type: Number, default: 0 },
+    netAfterPowerBTC: { type: Number, default: 0 },
+    kwhConsumed: { type: Number, default: 0 },
     btcPriceAtStart: { type: Number },
     btcPriceAtEnd: { type: Number },
     startDate: { type: Date, required: true },
     endDate: { type: Date, required: true },
     status: { type: String, enum: ['active', 'completed'], default: 'active' }
-  }]
+  }],
+
+  costBasis: {
+    hardwareModel: { type: String, default: '' },
+    hardwareVendor: { type: String, default: '' },
+    joulesPerTH: { type: Number, default: 15.0 },
+    wallPowerDerating: { type: Number, default: 1.06 },
+    electricityRateBaseUSDPerKWh: { type: Number, default: 0.055 },
+    electricityRateDemandUSDPerKWh: { type: Number, default: 0.030 },
+    electricityRateAllInUSDPerKWh: { type: Number, default: 0.085 },
+    btcPriceAtActivation: { type: Number, default: 0 },
+    snapshotAt: { type: Date, default: Date.now }
+  },
+
+  totalPowerCostUSD: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  totalPowerCostBTC: {
+    type: Number,
+    default: 0,
+    min: 0
+  }
 }, { 
   timestamps: true,
   toJSON: { 
@@ -3869,6 +4057,9 @@ InvestmentSchema.index({ status: 1, endDate: 1, isAutoCompoundActive: 1 });
 
 InvestmentSchema.index({ user: 1, plan: 1, status: 1 });
 
+InvestmentSchema.index({ 'costBasis.snapshotAt': -1 });
+InvestmentSchema.index({ 'costBasis.joulesPerTH': 1 });
+
 InvestmentSchema.virtual('daysRemaining').get(function() {
   return this.status === 'active' 
     ? Math.max(0, Math.ceil((this.endDate - Date.now()) / (1000 * 60 * 60 * 24)))
@@ -3892,6 +4083,26 @@ InvestmentSchema.virtual('cyclesRemaining').get(function() {
 InvestmentSchema.virtual('currentMultiplier').get(function() {
   if (!this.monthStartingPrincipalUSD || this.monthStartingPrincipalUSD <= 0) return 1;
   return ((this.monthToDateReturnUSD || 0) + this.monthStartingPrincipalUSD) / this.monthStartingPrincipalUSD;
+});
+
+InvestmentSchema.virtual('powerCostPerCycleUSD').get(function() {
+  const cb = this.costBasis || {};
+  const jPerTH = cb.joulesPerTH || 15.0;
+  const derating = cb.wallPowerDerating || 1.06;
+  const rate = cb.electricityRateAllInUSDPerKWh || 0.085;
+  const hashrate = this.currentHashrate || 0;
+  const durationHours = this.plan?.duration || 0;
+  const wallWatts = hashrate * jPerTH * derating;
+  const kwh = (wallWatts * durationHours) / 1000;
+  return kwh * rate;
+});
+
+InvestmentSchema.virtual('hardwareModel').get(function() {
+  return this.costBasis?.hardwareModel || '';
+});
+
+InvestmentSchema.virtual('joulesPerTH').get(function() {
+  return this.costBasis?.joulesPerTH || 15.0;
 });
 
 InvestmentSchema.pre('save', function(next) {
@@ -3932,6 +4143,29 @@ InvestmentSchema.statics.hasActiveInPlan = function(userId, planId) {
   return this.findOne({ user: userId, plan: planId, status: 'active' });
 };
 
+InvestmentSchema.statics.calculateTotalPowerCost = async function(investmentId) {
+  const result = await PlatformRevenue.aggregate([
+    {
+      $match: {
+        investmentId: mongoose.Types.ObjectId(investmentId),
+        source: 'power_cost'
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalUSD: { $sum: '$amount' },
+        totalBTC: { $sum: '$amountBTC' }
+      }
+    }
+  ]);
+  if (!result.length) return { totalUSD: 0, totalBTC: 0 };
+  return {
+    totalUSD: Math.abs(result[0].totalUSD || 0),
+    totalBTC: Math.abs(result[0].totalBTC || 0)
+  };
+};
+
 InvestmentSchema.methods.addDailyEarning = function(amount, btcValue) {
   this.dailyEarnings.push({
     date: new Date(),
@@ -3960,6 +4194,42 @@ InvestmentSchema.methods.complete = function() {
   return this.save();
 };
 
+InvestmentSchema.methods.recordCyclePowerCost = function(powerCostUSD, powerCostBTC, kwhConsumed) {
+  this.totalPowerCostUSD = (this.totalPowerCostUSD || 0) + powerCostUSD;
+  this.totalPowerCostBTC = (this.totalPowerCostBTC || 0) + powerCostBTC;
+
+  const activeCycle = this.cycleHistory.find(
+    c => c.cycleNumber === this.currentCycle &&
+         c.monthNumber === this.currentMonth &&
+         c.status === 'active'
+  );
+
+  if (activeCycle) {
+    activeCycle.powerCostUSD = powerCostUSD;
+    activeCycle.powerCostBTC = powerCostBTC;
+    activeCycle.netAfterPowerUSD = (activeCycle.returnUSD || 0) - powerCostUSD;
+    activeCycle.netAfterPowerBTC = (activeCycle.returnBTC || 0) - powerCostBTC;
+    activeCycle.kwhConsumed = kwhConsumed;
+  }
+
+  return this;
+};
+
+InvestmentSchema.methods.snapshotCostBasis = function(plan, resolvedRates, btcPrice) {
+  this.costBasis = {
+    hardwareModel: plan.hardwareModel || '',
+    hardwareVendor: plan.hardwareVendor || '',
+    joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+    wallPowerDerating: resolvedRates.wallPowerDerating,
+    electricityRateBaseUSDPerKWh: resolvedRates.rateBaseUSDPerKWh,
+    electricityRateDemandUSDPerKWh: resolvedRates.rateDemandUSDPerKWh,
+    electricityRateAllInUSDPerKWh: resolvedRates.rateAllInUSDPerKWh,
+    btcPriceAtActivation: btcPrice,
+    snapshotAt: new Date()
+  };
+  return this;
+};
+
 InvestmentSchema.query.byStatus = function(status) {
   return this.where({ status });
 };
@@ -3974,6 +4244,16 @@ InvestmentSchema.query.completed = function() {
 
 InvestmentSchema.query.autoCompounding = function() {
   return this.where({ status: 'active', isAutoCompoundActive: true });
+};
+
+InvestmentSchema.query.byHardware = function(hardwareModel) {
+  return this.where({ 'costBasis.hardwareModel': hardwareModel });
+};
+
+InvestmentSchema.query.byEfficiencyRange = function(minJPerTH, maxJPerTH) {
+  return this.where({
+    'costBasis.joulesPerTH': { $gte: minJPerTH, $lte: maxJPerTH }
+  });
 };
 
 const Investment = mongoose.model('Investment', InvestmentSchema);
@@ -4833,16 +5113,26 @@ OTPSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const OTP = mongoose.model('OTP', OTPSchema);
 
+
+
+
+
+
+
+
 const PlatformRevenueSchema = new mongoose.Schema({
   source: {
     type: String,
-    enum: ['investment_fee', 'refund', 'withdrawal_fee', 'buy_fee', 'sell_fee', 'other'],
+    enum: ['investment_fee', 'refund', 'withdrawal_fee', 'buy_fee', 'sell_fee', 'power_cost', 'other'],
     required: true
   },
   amount: {
     type: Number,
-    required: true,
-    min: 0
+    required: true
+  },
+  amountBTC: {
+    type: Number,
+    default: 0
   },
   currency: {
     type: String,
@@ -4879,17 +5169,12 @@ const PlatformRevenueSchema = new mongoose.Schema({
 });
 
 PlatformRevenueSchema.index({ source: 1 });
+PlatformRevenueSchema.index({ source: 1, recordedAt: -1 });
 PlatformRevenueSchema.index({ recordedAt: -1 });
 PlatformRevenueSchema.index({ userId: 1 });
+PlatformRevenueSchema.index({ investmentId: 1, source: 1 });
 
 const PlatformRevenue = mongoose.model('PlatformRevenue', PlatformRevenueSchema);
-
-
-
-
-
-
-
 
 
 
@@ -6817,6 +7102,15 @@ const verifyTOTP = (token, secret) => {
   });
 };
 
+
+
+
+
+
+
+
+
+
 const initializeAdmin = async () => {
   try {
     const adminExists = await Admin.findOne({ email: 'admin@bithash.com' });
@@ -6836,6 +7130,10 @@ const initializeAdmin = async () => {
     console.error('Error initializing admin:', err);
   }
 };
+
+
+
+
 
 const initializePlans = async () => {
   try {
@@ -6861,6 +7159,14 @@ const initializePlans = async () => {
         isPopular: false,
         isBestValue: false,
         sortOrder: 10,
+
+        hardwareModel: 'S21 (200T)',
+        hardwareVendor: 'Bitmain',
+        joulesPerTH: 17.5,
+        electricityRateBaseUSDPerKWh: null,
+        electricityRateDemandUSDPerKWh: null,
+        wallPowerDerating: null,
+
         features: [
           'SHA-256 ASIC mining',
           'Automated cycle payouts',
@@ -6889,6 +7195,14 @@ const initializePlans = async () => {
         isPopular: false,
         isBestValue: false,
         sortOrder: 20,
+
+        hardwareModel: 'S21 Pro (234T)',
+        hardwareVendor: 'Bitmain',
+        joulesPerTH: 15.0,
+        electricityRateBaseUSDPerKWh: null,
+        electricityRateDemandUSDPerKWh: null,
+        wallPowerDerating: null,
+
         features: [
           'SHA-256 ASIC mining',
           'Automated cycle payouts',
@@ -6918,6 +7232,14 @@ const initializePlans = async () => {
         isPopular: true,
         isBestValue: true,
         sortOrder: 30,
+
+        hardwareModel: 'S21 XP (270T)',
+        hardwareVendor: 'Bitmain',
+        joulesPerTH: 13.5,
+        electricityRateBaseUSDPerKWh: null,
+        electricityRateDemandUSDPerKWh: null,
+        wallPowerDerating: null,
+
         features: [
           'SHA-256 ASIC mining',
           'Automated cycle payouts',
@@ -6949,6 +7271,14 @@ const initializePlans = async () => {
         isPopular: false,
         isBestValue: false,
         sortOrder: 40,
+
+        hardwareModel: 'S23 Air (318T)',
+        hardwareVendor: 'Bitmain',
+        joulesPerTH: 11.0,
+        electricityRateBaseUSDPerKWh: null,
+        electricityRateDemandUSDPerKWh: null,
+        wallPowerDerating: null,
+
         features: [
           'SHA-256 ASIC mining',
           'Automated cycle payouts',
@@ -6980,6 +7310,14 @@ const initializePlans = async () => {
         isPopular: false,
         isBestValue: false,
         sortOrder: 50,
+
+        hardwareModel: 'S23 Hyd (580T)',
+        hardwareVendor: 'Bitmain',
+        joulesPerTH: 9.5,
+        electricityRateBaseUSDPerKWh: null,
+        electricityRateDemandUSDPerKWh: null,
+        wallPowerDerating: null,
+
         features: [
           'SHA-256 ASIC mining',
           'Automated cycle payouts',
@@ -7028,6 +7366,13 @@ const initializePlans = async () => {
       fillIfMissing('bgColor', planData.bgColor);
       fillIfMissing('borderColor', planData.borderColor);
 
+      fillIfMissing('hardwareModel', planData.hardwareModel);
+      fillIfMissing('hardwareVendor', planData.hardwareVendor);
+      fillIfMissing('joulesPerTH', planData.joulesPerTH);
+      fillIfMissing('electricityRateBaseUSDPerKWh', planData.electricityRateBaseUSDPerKWh);
+      fillIfMissing('electricityRateDemandUSDPerKWh', planData.electricityRateDemandUSDPerKWh);
+      fillIfMissing('wallPowerDerating', planData.wallPowerDerating);
+
       if (!Array.isArray(existingPlan.features) || existingPlan.features.length === 0) {
         patch.features = planData.features;
       }
@@ -7060,8 +7405,56 @@ const initializePlans = async () => {
   }
 };
 
+
+
+
+
+const initializeElectricitySettings = async () => {
+  try {
+    const existing = await SystemSettings.findOne({ type: 'electricity' });
+    if (existing) {
+      console.log('↩️  Electricity settings already seeded');
+      return;
+    }
+
+    await SystemSettings.create({
+      type: 'electricity',
+      electricity: {
+        rateBaseUSDPerKWh: 0.055,
+        rateDemandUSDPerKWh: 0.030,
+        wallPowerDerating: 1.06,
+        currency: 'USD',
+        effectiveFrom: new Date(),
+        notes: '2026 US industrial blended default; override per plan if hosting contract differs.'
+      }
+    });
+
+    console.log('✅ Electricity settings seeded (base=0.055, demand=0.030, derating=1.06)');
+  } catch (err) {
+    console.error('Error initializing electricity settings:', err);
+  }
+};
+
+
+
+
+
 initializeAdmin();
 initializePlans();
+initializeElectricitySettings();
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -18508,7 +18901,6 @@ app.delete('/api/admin/two-factor', adminProtect, [
 
 
 
-
 app.post('/api/investments', protect, [
   body('planId').notEmpty().withMessage('Plan ID is required').isMongoId().withMessage('Invalid Plan ID'),
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be a positive number'),
@@ -18673,6 +19065,28 @@ app.post('/api/investments', protect, [
       btcPrice
     );
 
+    const resolvedRates = await resolveElectricityRates(plan);
+
+    const costBasisSnapshot = {
+      hardwareModel: plan.hardwareModel || '',
+      hardwareVendor: plan.hardwareVendor || '',
+      joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+      wallPowerDerating: resolvedRates.wallPowerDerating,
+      electricityRateBaseUSDPerKWh: resolvedRates.rateBaseUSDPerKWh,
+      electricityRateDemandUSDPerKWh: resolvedRates.rateDemandUSDPerKWh,
+      electricityRateAllInUSDPerKWh: resolvedRates.rateAllInUSDPerKWh,
+      btcPriceAtActivation: btcPrice,
+      snapshotAt: new Date()
+    };
+
+    const firstCyclePowerCostUSD = await powerCostForCycleUSD(
+      initialHashpower,
+      costBasisSnapshot.joulesPerTH,
+      plan.duration,
+      resolvedRates
+    );
+    const firstCyclePowerCostBTC = btcPrice > 0 ? firstCyclePowerCostUSD / btcPrice : 0;
+
     const user = await User.findById(userId);
 
     if (!user.balances) {
@@ -18699,6 +19113,10 @@ app.post('/api/investments', protect, [
     console.log(`   Cycles per Month: ${cyclesPerMonth}`);
     console.log(`   Cycle Fee: ${cycleFeePercent}% (source: ${typeof plan.cycleFeePercent === 'number' ? 'plan' : 'global'})`);
     console.log(`   Assigned Hashpower: ${initialHashpower} TH/s`);
+    console.log(`   Hardware: ${costBasisSnapshot.hardwareModel} @ ${costBasisSnapshot.joulesPerTH} J/TH`);
+    console.log(`   Electricity Rate (all-in): $${costBasisSnapshot.electricityRateAllInUSDPerKWh}/kWh`);
+    console.log(`   Wall Power Derating: ${costBasisSnapshot.wallPowerDerating}`);
+    console.log(`   First Cycle Power Cost: ${firstCyclePowerCostBTC.toFixed(8)} BTC ($${firstCyclePowerCostUSD.toFixed(2)})`);
     console.log(`   Model: ${requestedMonths === 0
       ? 'SINGLE CYCLE — fee paid once, net capital + net mining returns paid at cycle end'
       : `MULTI-MONTH — non-final months pay net mining returns only, month ${requestedMonths} pays capital deployed + net mining returns`}`);
@@ -18783,6 +19201,10 @@ app.post('/api/investments', protect, [
       balanceType: balanceType,
       btcPriceAtInvestment: btcPrice,
 
+      costBasis: costBasisSnapshot,
+      totalPowerCostUSD: firstCyclePowerCostUSD,
+      totalPowerCostBTC: firstCyclePowerCostBTC,
+
       autoCompoundMonths: requestedMonths > 0 ? requestedMonths : 1,
       totalCycles: totalCycles,
       cyclesPerMonth: cyclesPerMonth,
@@ -18833,6 +19255,8 @@ app.post('/api/investments', protect, [
       details: {
         investmentId: investment._id,
         planName: plan.name,
+        hardwareModel: costBasisSnapshot.hardwareModel,
+        joulesPerTH: costBasisSnapshot.joulesPerTH,
         cycle: 1,
         month: 1,
         totalCycles: totalCycles,
@@ -18850,8 +19274,12 @@ app.post('/api/investments', protect, [
         expectedReturnBTC: firstCycleReturnBTC,
         expectedReturnUSD: firstCycleReturnUSD,
         assignedHashrate: initialHashpower,
+        firstCyclePowerCostUSD: firstCyclePowerCostUSD,
+        firstCyclePowerCostBTC: firstCyclePowerCostBTC,
+        electricityRateAllInUSDPerKWh: costBasisSnapshot.electricityRateAllInUSDPerKWh,
+        wallPowerDerating: costBasisSnapshot.wallPowerDerating,
         transactionType: 'debit',
-        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${requestedMonths > 0 ? ` for ${requestedMonths} month(s) (${cyclesPerMonth} cycles/month)` : ' (single cycle, normal hourly rental)'}. ${cycleFeePercent}% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net capital: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s.`
+        description: `Invested ${investmentBTCAmount.toFixed(8)} BTC (≈ $${amount.toLocaleString()} USD at $${btcPrice.toLocaleString()} per BTC) in ${plan.name} plan${requestedMonths > 0 ? ` for ${requestedMonths} month(s) (${cyclesPerMonth} cycles/month)` : ' (single cycle, normal hourly rental)'}. ${cycleFeePercent}% fee: ${firstCycleFeeBTC.toFixed(8)} BTC. Net capital: ${netPrincipalBTC.toFixed(8)} BTC. Assigned hashpower: ${initialHashpower} TH/s on ${costBasisSnapshot.hardwareModel} (${costBasisSnapshot.joulesPerTH} J/TH).`
       },
       fee: firstCycleFeeUSD,
       netAmount: netPrincipalUSD
@@ -18868,6 +19296,8 @@ app.post('/api/investments', protect, [
       description: `${cycleFeePercent}% initiation fee for cycle 1 (month 1) of ${plan.name} investment`,
       metadata: {
         planName: plan.name,
+        hardwareModel: costBasisSnapshot.hardwareModel,
+        joulesPerTH: costBasisSnapshot.joulesPerTH,
         cycle: 1,
         month: 1,
         totalCycles: totalCycles,
@@ -18881,6 +19311,35 @@ app.post('/api/investments', protect, [
         feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
         btcPrice: btcPrice,
         assignedHashrate: initialHashpower
+      }
+    });
+
+    await PlatformRevenue.create({
+      source: 'power_cost',
+      amount: -firstCyclePowerCostUSD,
+      amountBTC: -firstCyclePowerCostBTC,
+      currency: 'BTC',
+      transactionId: transaction._id,
+      investmentId: investment._id,
+      userId: userId,
+      description: `Cycle 1 (month 1) electricity cost for ${costBasisSnapshot.hardwareModel} @ ${costBasisSnapshot.joulesPerTH} J/TH × ${initialHashpower.toFixed(4)} TH/s × ${plan.duration}h @ $${costBasisSnapshot.electricityRateAllInUSDPerKWh}/kWh`,
+      metadata: {
+        planName: plan.name,
+        hardwareModel: costBasisSnapshot.hardwareModel,
+        hardwareVendor: costBasisSnapshot.hardwareVendor,
+        joulesPerTH: costBasisSnapshot.joulesPerTH,
+        wallPowerDerating: costBasisSnapshot.wallPowerDerating,
+        rateBase: costBasisSnapshot.electricityRateBaseUSDPerKWh,
+        rateDemand: costBasisSnapshot.electricityRateDemandUSDPerKWh,
+        rateAllIn: costBasisSnapshot.electricityRateAllInUSDPerKWh,
+        hashrateTH: initialHashpower,
+        durationHours: plan.duration,
+        kwhConsumed: (initialHashpower * costBasisSnapshot.joulesPerTH * costBasisSnapshot.wallPowerDerating * plan.duration) / 1000,
+        cycle: 1,
+        month: 1,
+        totalCycles: totalCycles,
+        cyclesPerMonth: cyclesPerMonth,
+        btcPriceAtCycle: btcPrice
       }
     });
 
@@ -18908,6 +19367,13 @@ app.post('/api/investments', protect, [
       metadata: {
         planName: plan.name,
         planId: plan._id.toString(),
+        hardwareModel: costBasisSnapshot.hardwareModel,
+        hardwareVendor: costBasisSnapshot.hardwareVendor,
+        joulesPerTH: costBasisSnapshot.joulesPerTH,
+        wallPowerDerating: costBasisSnapshot.wallPowerDerating,
+        electricityRateBaseUSDPerKWh: costBasisSnapshot.electricityRateBaseUSDPerKWh,
+        electricityRateDemandUSDPerKWh: costBasisSnapshot.electricityRateDemandUSDPerKWh,
+        electricityRateAllInUSDPerKWh: costBasisSnapshot.electricityRateAllInUSDPerKWh,
         investmentAmountUSD: amount,
         investmentAmountBTC: investmentBTCAmount,
         incomingBalanceUSD: incomingBalanceUSD,
@@ -18917,6 +19383,8 @@ app.post('/api/investments', protect, [
         investmentFeeUSD: firstCycleFeeUSD,
         investmentFeeBTC: firstCycleFeeBTC,
         cycleFeePercent: cycleFeePercent,
+        firstCyclePowerCostUSD: firstCyclePowerCostUSD,
+        firstCyclePowerCostBTC: firstCyclePowerCostBTC,
         expectedReturnUSD: firstCycleReturnUSD,
         expectedReturnBTC: firstCycleReturnBTC,
         btcPriceAtInvestment: btcPrice,
@@ -18992,6 +19460,8 @@ app.post('/api/investments', protect, [
         totalProfitUSD: projection.totalProfitUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
         totalProfitBTC: projection.totalProfitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
         roiPercent: projection.roiPercent.toFixed(2),
+        powerCostTotalUSD: firstCyclePowerCostUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        powerCostTotalBTC: firstCyclePowerCostBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
       };
 
       let monthlyBreakdownHtml = '';
@@ -19078,6 +19548,14 @@ app.post('/api/investments', protect, [
                         <td style="padding: 8px 0; text-align: right; font-weight: bold;">${formatted.netPrincipalBTC} BTC (≈ $${formatted.netPrincipalUSD})</td>
                     </tr>
                     <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Mining Hardware:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${costBasisSnapshot.hardwareModel || '—'}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Energy Efficiency:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${costBasisSnapshot.joulesPerTH} J/TH</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Assigned Hashpower:</strong></td>
                         <td style="padding: 8px 0; text-align: right; font-weight: bold;">${projection.hashpower.toLocaleString()} TH/s</td>
                     </tr>
@@ -19096,6 +19574,32 @@ app.post('/api/investments', protect, [
                     <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Contract ID:</strong></td>
                         <td style="padding: 8px 0; text-align: right; font-size: 11px;">${transaction.reference}</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="email-card" style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                <h3 style="font-size: 16px; font-weight: 600; color: #0B0E11; margin: 0 0 12px 0; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0;">Electricity Cost Basis (Locked)</h3>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <tr>
+                        <td style="padding: 6px 0;"><strong>Base Rate:</strong></td>
+                        <td style="padding: 6px 0; text-align: right;">$${costBasisSnapshot.electricityRateBaseUSDPerKWh.toFixed(3)}/kWh</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 6px 0;"><strong>Demand Charge:</strong></td>
+                        <td style="padding: 6px 0; text-align: right;">$${costBasisSnapshot.electricityRateDemandUSDPerKWh.toFixed(3)}/kWh</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 6px 0;"><strong>All-In Rate:</strong></td>
+                        <td style="padding: 6px 0; text-align: right; font-weight: bold;">$${costBasisSnapshot.electricityRateAllInUSDPerKWh.toFixed(3)}/kWh</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 6px 0;"><strong>Wall Power Derating:</strong></td>
+                        <td style="padding: 6px 0; text-align: right;">×${costBasisSnapshot.wallPowerDerating}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 6px 0;"><strong>First Cycle Power Cost:</strong></td>
+                        <td style="padding: 6px 0; text-align: right; color: #EF4444;">- ${formatted.powerCostTotalBTC} BTC (≈ $${formatted.powerCostTotalUSD})</td>
                     </tr>
                 </table>
             </div>
@@ -19172,6 +19676,18 @@ app.post('/api/investments', protect, [
         investment: {
           id: investment._id,
           plan: plan.name,
+          hardwareModel: costBasisSnapshot.hardwareModel,
+          hardwareVendor: costBasisSnapshot.hardwareVendor,
+          joulesPerTH: costBasisSnapshot.joulesPerTH,
+          wallPowerDerating: costBasisSnapshot.wallPowerDerating,
+          electricityRateBaseUSDPerKWh: costBasisSnapshot.electricityRateBaseUSDPerKWh,
+          electricityRateDemandUSDPerKWh: costBasisSnapshot.electricityRateDemandUSDPerKWh,
+          electricityRateAllInUSDPerKWh: costBasisSnapshot.electricityRateAllInUSDPerKWh,
+          costBasisSnapshotAt: costBasisSnapshot.snapshotAt,
+          firstCyclePowerCostUSD: firstCyclePowerCostUSD,
+          firstCyclePowerCostBTC: firstCyclePowerCostBTC,
+          totalPowerCostUSD: investment.totalPowerCostUSD,
+          totalPowerCostBTC: investment.totalPowerCostBTC,
           netPrincipalUSD: investment.amount,
           netPrincipalBTC: investment.amountBTC,
           incomingBalanceUSD: incomingBalanceUSD,
@@ -19428,7 +19944,7 @@ function calculateContractProjection(principalUSD, plan, months, currentBtcPrice
     const durationHours = plan.duration;
     const cyclesPerMonth = calculateCyclesPerMonth(durationHours);
     const isSingleCycle = months === 0;
-    const totalMonths = months === 0 ? 1 : months; // Treat 0 as a single cycle
+    const totalMonths = months === 0 ? 1 : months;
     const feePercent = (typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0)
         ? plan.cycleFeePercent
         : CYCLE_FEE_PERCENT;
@@ -19480,7 +19996,7 @@ function calculateContractProjection(principalUSD, plan, months, currentBtcPrice
     }
 
     let totalFeesUSD = 0;
-    let totalPayoutUSD = 0;          // <-- actual cash paid out to the user
+    let totalPayoutUSD = 0;
     const monthlyBreakdown = [];
 
     let monthStartingPrincipalUSD = grossPrincipalUSD;
@@ -19505,8 +20021,8 @@ function calculateContractProjection(principalUSD, plan, months, currentBtcPrice
         const monthProfitUSD = monthEndingValueUSD - monthStartingPrincipalUSD;
 
         const monthPayoutUSD = isFinalMonth
-            ? monthEndingValueUSD           // capital deployed + net mining returns
-            : monthProfitUSD;               // net mining returns only
+            ? monthEndingValueUSD
+            : monthProfitUSD;
 
         totalFeesUSD += monthFeesUSD;
         totalPayoutUSD += monthPayoutUSD;
@@ -19534,8 +20050,8 @@ function calculateContractProjection(principalUSD, plan, months, currentBtcPrice
         netPrincipalUSD,
         netPrincipalBTC,
         totalFeesUSD,
-        totalFeesBTC: totalFeesUSD / currentBtcPrice, // approximation for display
-        totalReturnUSD: totalPayoutUSD,               // <-- ACTUAL cash paid to user
+        totalFeesBTC: totalFeesUSD / currentBtcPrice,
+        totalReturnUSD: totalPayoutUSD,
         totalReturnBTC: totalPayoutUSD / currentBtcPrice,
         totalProfitUSD,
         totalProfitBTC: totalProfitUSD / currentBtcPrice,
@@ -19605,6 +20121,18 @@ const completeMaturedInvestmentsCron = async () => {
           throw new Error('Could not fetch BTC price');
         }
 
+        const cb = investment.costBasis || {};
+        const frozenRates = {
+          rateBaseUSDPerKWh: cb.electricityRateBaseUSDPerKWh ?? ELEC_FALLBACK.rateBaseUSDPerKWh,
+          rateDemandUSDPerKWh: cb.electricityRateDemandUSDPerKWh ?? ELEC_FALLBACK.rateDemandUSDPerKWh,
+          rateAllInUSDPerKWh: cb.electricityRateAllInUSDPerKWh ??
+                              ((cb.electricityRateBaseUSDPerKWh ?? ELEC_FALLBACK.rateBaseUSDPerKWh) +
+                               (cb.electricityRateDemandUSDPerKWh ?? ELEC_FALLBACK.rateDemandUSDPerKWh)),
+          wallPowerDerating: cb.wallPowerDerating ?? ELEC_FALLBACK.wallPowerDerating,
+        };
+        const frozenJPerTH = cb.joulesPerTH ?? plan.joulesPerTH ?? 15.0;
+        const frozenHardwareModel = cb.hardwareModel || plan.hardwareModel || '';
+
         const cycleIdx = investment.cycleHistory.findIndex(
           c => c.cycleNumber === investment.currentCycle &&
                c.monthNumber === investment.currentMonth &&
@@ -19628,8 +20156,28 @@ const completeMaturedInvestmentsCron = async () => {
         const cycleReturnUSD = netPrincipalUSD * (1 + planReturnDecimal);
         const cycleReturnBTC = netPrincipalBTC * (1 + planReturnDecimal);
 
-        const cycleNetReturnUSD = cycleReturnUSD - netPrincipalUSD;
-        const cycleNetReturnBTC = cycleReturnBTC - netPrincipalBTC;
+        const cycleGrossReturnUSD = cycleReturnUSD - netPrincipalUSD;
+        const cycleGrossReturnBTC = cycleReturnBTC - netPrincipalBTC;
+
+        const cycleHashpowerTH = calculateHashpower(
+          netPrincipalUSD,
+          plan.percentage,
+          plan.duration,
+          currentBTCPrice
+        );
+
+        const cyclePowerCostUSD = await powerCostForCycleUSD(
+          cycleHashpowerTH,
+          frozenJPerTH,
+          plan.duration,
+          frozenRates
+        );
+        const cyclePowerCostBTC = currentBTCPrice > 0
+          ? cyclePowerCostUSD / currentBTCPrice
+          : 0;
+
+        const cycleNetReturnUSD = cycleGrossReturnUSD - cyclePowerCostUSD;
+        const cycleNetReturnBTC = cycleGrossReturnBTC - cyclePowerCostBTC;
 
         currentCycle.feeUSD = cycleFeeUSD;
         currentCycle.feeBTC = cycleFeeBTC;
@@ -19640,16 +20188,22 @@ const completeMaturedInvestmentsCron = async () => {
         currentCycle.btcPriceAtEnd = currentBTCPrice;
         currentCycle.status = 'completed';
 
-        investment.monthToDateReturnUSD = (investment.monthToDateReturnUSD || 0) + cycleReturnUSD;
-        investment.monthToDateReturnBTC = (investment.monthToDateReturnBTC || 0) + cycleReturnBTC;
-        investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleReturnUSD;
-        investment.cumulativeReturnBTC = (investment.cumulativeReturnBTC || 0) + cycleReturnBTC;
+        investment.monthToDateReturnUSD = (investment.monthToDateReturnUSD || 0) + cycleNetReturnUSD;
+        investment.monthToDateReturnBTC = (investment.monthToDateReturnBTC || 0) + cycleNetReturnBTC;
+        investment.cumulativeReturnUSD = (investment.cumulativeReturnUSD || 0) + cycleNetReturnUSD;
+        investment.cumulativeReturnBTC = (investment.cumulativeReturnBTC || 0) + cycleNetReturnBTC;
+
+        investment.totalPowerCostUSD = (investment.totalPowerCostUSD || 0) + cyclePowerCostUSD;
+        investment.totalPowerCostBTC = (investment.totalPowerCostBTC || 0) + cyclePowerCostBTC;
 
         console.log(`📊 [CRON] Investment ${investment._id} month ${investment.currentMonth} cycle ${investment.currentCycle}/${investment.cyclesPerMonth}:`);
+        console.log(`   Hardware: ${frozenHardwareModel} @ ${frozenJPerTH} J/TH`);
         console.log(`   Incoming: ${incomingBalanceBTC.toFixed(8)} BTC ($${incomingBalanceUSD.toFixed(2)})`);
         console.log(`   Fee (${cycleFeePercent}%): ${cycleFeeBTC.toFixed(8)} BTC ($${cycleFeeUSD.toFixed(2)})`);
         console.log(`   Net Capital: ${netPrincipalBTC.toFixed(8)} BTC ($${netPrincipalUSD.toFixed(2)})`);
-        console.log(`   Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
+        console.log(`   Gross Cycle Return: ${cycleReturnBTC.toFixed(8)} BTC ($${cycleReturnUSD.toFixed(2)})`);
+        console.log(`   Power Cost (${plan.duration}h @ $${frozenRates.rateAllInUSDPerKWh}/kWh): ${cyclePowerCostBTC.toFixed(8)} BTC ($${cyclePowerCostUSD.toFixed(2)})`);
+        console.log(`   Net Cycle Return (after power): ${cycleNetReturnBTC.toFixed(8)} BTC ($${cycleNetReturnUSD.toFixed(2)})`);
         console.log(`   Month-to-date: ${investment.monthToDateReturnBTC.toFixed(8)} BTC ($${investment.monthToDateReturnUSD.toFixed(2)})`);
 
         const feeTxRef = `CYCLE-FEE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -19665,6 +20219,8 @@ const completeMaturedInvestmentsCron = async () => {
           details: {
             investmentId: investment._id,
             planName: plan.name,
+            hardwareModel: frozenHardwareModel,
+            joulesPerTH: frozenJPerTH,
             cycle: investment.currentCycle,
             month: investment.currentMonth,
             transactionType: 'fee',
@@ -19686,6 +20242,8 @@ const completeMaturedInvestmentsCron = async () => {
           description: `${cycleFeePercent}% cycle fee (month ${investment.currentMonth}, cycle ${investment.currentCycle}) for ${plan.name} investment`,
           metadata: {
             planName: plan.name,
+            hardwareModel: frozenHardwareModel,
+            joulesPerTH: frozenJPerTH,
             cycle: investment.currentCycle,
             month: investment.currentMonth,
             totalCycles: investment.totalCycles,
@@ -19693,6 +20251,35 @@ const completeMaturedInvestmentsCron = async () => {
             feePercentage: cycleFeePercent,
             feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
             btcPrice: currentBTCPrice
+          }
+        }], { session });
+
+        await PlatformRevenue.create([{
+          source: 'power_cost',
+          amount: -cyclePowerCostUSD,
+          amountBTC: -cyclePowerCostBTC,
+          currency: 'BTC',
+          transactionId: feeTx._id,
+          investmentId: investment._id,
+          userId: userId,
+          description: `Cycle ${investment.currentCycle} (month ${investment.currentMonth}) electricity: ${frozenHardwareModel} @ ${frozenJPerTH} J/TH × ${cycleHashpowerTH.toFixed(4)} TH/s × ${plan.duration}h @ $${frozenRates.rateAllInUSDPerKWh}/kWh`,
+          metadata: {
+            planName: plan.name,
+            hardwareModel: frozenHardwareModel,
+            hardwareVendor: cb.hardwareVendor || plan.hardwareVendor || '',
+            joulesPerTH: frozenJPerTH,
+            wallPowerDerating: frozenRates.wallPowerDerating,
+            rateBase: frozenRates.rateBaseUSDPerKWh,
+            rateDemand: frozenRates.rateDemandUSDPerKWh,
+            rateAllIn: frozenRates.rateAllInUSDPerKWh,
+            hashrateTH: cycleHashpowerTH,
+            durationHours: plan.duration,
+            kwhConsumed: (cycleHashpowerTH * frozenJPerTH * frozenRates.wallPowerDerating * plan.duration) / 1000,
+            cycle: investment.currentCycle,
+            month: investment.currentMonth,
+            totalCycles: investment.totalCycles,
+            cyclesPerMonth: investment.cyclesPerMonth,
+            btcPriceAtCycle: currentBTCPrice
           }
         }], { session });
 
@@ -19760,19 +20347,25 @@ const completeMaturedInvestmentsCron = async () => {
             details: {
               investmentId: investment._id,
               planName: plan.name,
+              hardwareModel: frozenHardwareModel,
+              joulesPerTH: frozenJPerTH,
               finalCycle: investment.currentCycle,
               finalMonth: investment.currentMonth,
               totalCycles: investment.totalCycles,
               autoCompoundMonths: investment.autoCompoundMonths || 1,
               cumulativeReturnUSD: investment.cumulativeReturnUSD,
               cumulativeReturnBTC: investment.cumulativeReturnBTC,
+              totalPowerCostUSD: investment.totalPowerCostUSD,
+              totalPowerCostBTC: investment.totalPowerCostBTC,
+              finalCyclePowerCostUSD: cyclePowerCostUSD,
+              finalCyclePowerCostBTC: cyclePowerCostBTC,
               returnedPrincipalUSD: returnedPrincipalUSD,
               returnedPrincipalBTC: returnedPrincipalBTC,
               finalProfitUSD: finalProfitUSD,
               finalProfitBTC: finalProfitBTC,
               transactionType: 'credit',
               payoutModel: 'net_mining_returns_only_until_final_month',
-              description: `FINAL payout for completed ${plan.name} contract after ${investment.autoCompoundMonths} month(s). Returned capital deployed ${returnedPrincipalBTC.toFixed(8)} BTC + final-cycle net mining returns ${finalProfitBTC.toFixed(8)} BTC = total ${finalPayoutBTC.toFixed(8)} BTC (≈ $${finalPayoutUSD.toLocaleString()}).`
+              description: `FINAL payout for completed ${plan.name} contract after ${investment.autoCompoundMonths} month(s). Returned capital deployed ${returnedPrincipalBTC.toFixed(8)} BTC + final-cycle net mining returns ${finalProfitBTC.toFixed(8)} BTC (already net of electricity cost ${cyclePowerCostBTC.toFixed(8)} BTC) = total ${finalPayoutBTC.toFixed(8)} BTC (≈ $${finalPayoutUSD.toLocaleString()}).`
             },
             fee: 0,
             netAmount: finalPayoutUSD,
@@ -19799,12 +20392,22 @@ const completeMaturedInvestmentsCron = async () => {
             region: 'System',
             metadata: {
               planName: plan.name,
+              hardwareModel: frozenHardwareModel,
+              joulesPerTH: frozenJPerTH,
+              wallPowerDerating: frozenRates.wallPowerDerating,
+              electricityRateBaseUSDPerKWh: frozenRates.rateBaseUSDPerKWh,
+              electricityRateDemandUSDPerKWh: frozenRates.rateDemandUSDPerKWh,
+              electricityRateAllInUSDPerKWh: frozenRates.rateAllInUSDPerKWh,
               originalAmountUSD: investment.originalAmount,
               originalAmountBTC: investment.originalAmountBTC,
               totalCycles: investment.totalCycles,
               totalMonths: investment.autoCompoundMonths,
               completedCycles: investment.currentCycle,
               finalMonth: investment.currentMonth,
+              finalCyclePowerCostUSD: cyclePowerCostUSD,
+              finalCyclePowerCostBTC: cyclePowerCostBTC,
+              totalPowerCostUSD: investment.totalPowerCostUSD,
+              totalPowerCostBTC: investment.totalPowerCostBTC,
               returnedPrincipalUSD: returnedPrincipalUSD,
               returnedPrincipalBTC: returnedPrincipalBTC,
               finalProfitUSD: finalProfitUSD,
@@ -19840,6 +20443,10 @@ const completeMaturedInvestmentsCron = async () => {
             const formattedProfitBTC = finalProfitBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
             const formattedPayoutUSD = finalPayoutUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             const formattedPayoutBTC = finalPayoutBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+            const formattedFinalCyclePowerCostUSD = cyclePowerCostUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedFinalCyclePowerCostBTC = cyclePowerCostBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+            const formattedTotalPowerCostUSD = (investment.totalPowerCostUSD || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const formattedTotalPowerCostBTC = (investment.totalPowerCostBTC || 0).toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
 
             const formattedCompletionDate = now.toLocaleString('en-US', {
               year: 'numeric',
@@ -19931,12 +20538,24 @@ const completeMaturedInvestmentsCron = async () => {
                         <td style="padding: 8px 0; text-align: right;">${plan.name}</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Mining Hardware:</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${frozenHardwareModel || '—'} @ ${frozenJPerTH} J/TH</td>
+                      </tr>
+                      <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong>Returned Capital Deployed:</strong></td>
                         <td style="padding: 8px 0; text-align: right;">${formattedPrincipalBTC} BTC (≈ $${formattedPrincipalUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong style="color: #10B981;">Final Cycle Net Mining Returns:</strong></td>
                         <td style="padding: 8px 0; text-align: right; color: #10B981;">+ ${formattedProfitBTC} BTC (≈ $${formattedProfitUSD} USD)</td>
+                      </tr>
+                      <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong style="color: #EF4444;">Final Cycle Power Cost:</strong></td>
+                        <td style="padding: 8px 0; text-align: right; color: #EF4444;">- ${formattedFinalCyclePowerCostBTC} BTC (≈ $${formattedFinalCyclePowerCostUSD} USD)</td>
+                      </tr>
+                      <tr style="border-top: 1px solid #E2E8F0;">
+                        <td style="padding: 8px 0;"><strong>Total Power Cost (Contract):</strong></td>
+                        <td style="padding: 8px 0; text-align: right;">${formattedTotalPowerCostBTC} BTC (≈ $${formattedTotalPowerCostUSD} USD)</td>
                       </tr>
                       <tr style="border-top: 1px solid #E2E8F0;">
                         <td style="padding: 8px 0;"><strong style="color: #10B981;">Total Final Payout:</strong></td>
@@ -20006,6 +20625,7 @@ const completeMaturedInvestmentsCron = async () => {
               month: investment.currentMonth,
               totalCycles: investment.totalCycles,
               payoutUSD: finalPayoutUSD,
+              cyclePowerCostUSD: cyclePowerCostUSD,
               timestamp: Date.now()
             });
           }
@@ -20017,11 +20637,11 @@ const completeMaturedInvestmentsCron = async () => {
           const startingPrincipalUSD = investment.monthStartingPrincipalUSD || investment.amount;
           const startingPrincipalBTC = investment.monthStartingPrincipalBTC || investment.amountBTC;
 
-          const monthProfitUSD = monthEndingValueUSD - startingPrincipalUSD;
-          const monthProfitBTC = monthEndingValueBTC - startingPrincipalBTC;
+          const monthProfitUSD = monthEndingValueUSD;
+          const monthProfitBTC = monthEndingValueBTC;
 
           console.log(`🔄 [CRON] Investment ${investment._id} NON-FINAL month ${investment.currentMonth} boundary:`);
-          console.log(`   Month ending value: $${monthEndingValueUSD.toFixed(2)} (${monthEndingValueBTC.toFixed(8)} BTC)`);
+          console.log(`   Month net mining returns (after power): $${monthEndingValueUSD.toFixed(2)} (${monthEndingValueBTC.toFixed(8)} BTC)`);
           console.log(`   Starting capital: $${startingPrincipalUSD.toFixed(2)} (${startingPrincipalBTC.toFixed(8)} BTC)`);
           console.log(`   Net mining returns to credit: $${monthProfitUSD.toFixed(2)} (${monthProfitBTC.toFixed(8)} BTC)`);
           console.log(`   Capital deployed ($ ${startingPrincipalUSD.toFixed(2)}) stays locked for next month.`);
@@ -20070,10 +20690,12 @@ const completeMaturedInvestmentsCron = async () => {
             details: {
               investmentId: investment._id,
               planName: plan.name,
+              hardwareModel: frozenHardwareModel,
+              joulesPerTH: frozenJPerTH,
               monthNumber: investment.currentMonth,
               transactionType: 'credit',
               payoutModel: 'net_mining_returns_only_until_final_month',
-              description: `Month ${investment.currentMonth} net mining returns sweep: net mining returns ${monthProfitBTC.toFixed(8)} BTC (≈ $${monthProfitUSD.toLocaleString()}) credited to Matured Wallet. Capital deployed stays locked in Active Wallet.`
+              description: `Month ${investment.currentMonth} net mining returns sweep: net mining returns ${monthProfitBTC.toFixed(8)} BTC (≈ $${monthProfitUSD.toLocaleString()}) credited to Matured Wallet (already net of electricity). Capital deployed stays locked in Active Wallet.`
             },
             fee: 0,
             netAmount: monthProfitUSD,
@@ -20136,8 +20758,8 @@ const completeMaturedInvestmentsCron = async () => {
           investment.currentCycle += 1;
           const newCycleNumber = investment.currentCycle;
 
-          const nextIncomingUSD = cycleReturnUSD;
-          const nextIncomingBTC = cycleReturnBTC;
+          const nextIncomingUSD = cycleReturnUSD - cyclePowerCostUSD;
+          const nextIncomingBTC = cycleReturnBTC - cyclePowerCostBTC;
 
           const newHashpower = calculateHashpower(
             nextIncomingUSD,
@@ -20236,14 +20858,19 @@ cron.schedule('*/10 * * * * *', async () => {
         const isFinalCycle = investment.currentCycle >= cyclesPerMonth;
         const willPayPrincipal = isFinalMonth && isFinalCycle;
 
+        const hardwareModel = investment.costBasis?.hardwareModel || investment.plan?.hardwareModel || '—';
+        const joulesPerTH = investment.costBasis?.joulesPerTH ?? investment.plan?.joulesPerTH ?? '—';
+
         console.log(`\n👤 USER FOUND: ${userEmail} (${userName})`);
         console.log(`   ├─ Investment ID: ${investment._id}`);
         console.log(`   ├─ Plan: ${planName}`);
+        console.log(`   ├─ Hardware: ${hardwareModel} @ ${joulesPerTH} J/TH`);
         console.log(`   ├─ Month: ${monthNum} of ${investment.autoCompoundMonths || 1}`);
         console.log(`   ├─ Cycle: ${cycleNum} of ${cyclesPerMonth} (this month) ${isAuto ? '(auto-compounding)' : '(single cycle)'}`);
         console.log(`   ├─ Current Hashpower: ${investment.currentHashrate || 0} TH/s`);
         console.log(`   ├─ Month-Starting Capital: ${investment.monthStartingPrincipalBTC?.toFixed(8) || '0'} BTC`);
         console.log(`   ├─ Month-to-Date Return: ${investment.monthToDateReturnBTC?.toFixed(8) || '0'} BTC`);
+        console.log(`   ├─ Total Power Cost (Contract): ${investment.totalPowerCostBTC?.toFixed(8) || '0'} BTC`);
         console.log(`   ├─ Payout on this boundary: ${willPayPrincipal ? 'CAPITAL DEPLOYED + NET MINING RETURNS (FINAL)' : 'NET MINING RETURNS ONLY'}`);
         console.log(`   └─ Cycle End Date: ${investment.endDate}`);
       }
@@ -20269,9 +20896,8 @@ cron.schedule('*/10 * * * * *', async () => {
 
 console.log('🚀 Investment maturity cron job scheduled to run EVERY 10 SECONDS');
 console.log('📊 The system will log which users have matured cycles at each check');
-console.log('💰 PAYOUT MODEL: net mining returns only for non-final months, capital deployed + net mining returns for the final month\n');
-
-
+console.log('💰 PAYOUT MODEL: net mining returns only for non-final months, capital deployed + net mining returns for the final month');
+console.log('⚡ ELECTRICITY: charged per cycle from frozen investment.costBasis (hardware × J/TH × duration × all-in rate × wall-power derating)\n');
 
 
 
@@ -20316,6 +20942,40 @@ app.get('/api/plans', async (req, res) => {
         } catch (priceErr) {
             console.error('Failed to fetch BTC price:', priceErr.message);
         }
+
+        // ---- Global electricity settings (used as fallback when a plan does not override) ----
+        let globalElectricity = null;
+        try {
+            const settingsDoc = await SystemSettings.findOne({ type: 'electricity' }).lean();
+            globalElectricity = settingsDoc?.electricity || null;
+        } catch (elecErr) {
+            console.warn('Failed to load electricity SystemSettings for plans endpoint:', elecErr.message);
+        }
+
+        const resolvePlanElectricity = (plan) => {
+            const baseOverride   = Number(plan.electricityRateBaseUSDPerKWh);
+            const demandOverride = Number(plan.electricityRateDemandUSDPerKWh);
+            const derateOverride = Number(plan.wallPowerDerating);
+
+            const rateBase = Number.isFinite(baseOverride)
+                ? baseOverride
+                : (globalElectricity?.rateBaseUSDPerKWh ?? ELEC_FALLBACK.rateBaseUSDPerKWh);
+
+            const rateDemand = Number.isFinite(demandOverride)
+                ? demandOverride
+                : (globalElectricity?.rateDemandUSDPerKWh ?? ELEC_FALLBACK.rateDemandUSDPerKWh);
+
+            const derating = Number.isFinite(derateOverride)
+                ? derateOverride
+                : (globalElectricity?.wallPowerDerating ?? ELEC_FALLBACK.wallPowerDerating);
+
+            return {
+                rateBaseUSDPerKWh: rateBase,
+                rateDemandUSDPerKWh: rateDemand,
+                rateAllInUSDPerKWh: rateBase + rateDemand,
+                wallPowerDerating: derating
+            };
+        };
 
         let userContext = {
             isLoggedIn: false,
@@ -20389,7 +21049,7 @@ app.get('/api/plans', async (req, res) => {
             }
         }
 
-        const enhancedPlans = plans.map((plan) => {
+        const enhancedPlans = await Promise.all(plans.map(async (plan) => {
             const planId         = plan._id.toString();
             const planName       = plan.name || 'Mining Contract';
             const planDescription = plan.description || `${planName} SHA-256 ASIC mining contract`;
@@ -20466,6 +21126,25 @@ app.get('/api/plans', async (req, res) => {
                 ? `${minAmountBTC.toFixed(5)} - ${maxAmountBTC.toFixed(5)} BTC`
                 : `${minAmountUSD.toFixed(0)} - ${maxAmountUSD.toFixed(0)} USD`;
 
+            // ---------- Hardware + efficiency identity (DB-backed) ----------
+            const hardwareModel  = plan.hardwareModel || '';
+            const hardwareVendor = plan.hardwareVendor || '';
+            const joulesPerTH    = Number(plan.joulesPerTH) > 0
+                ? Number(plan.joulesPerTH)
+                : 15.0;
+
+            // ---------- Resolved electricity cost basis ----------
+            const resolvedElectricity = resolvePlanElectricity(plan);
+
+            // ---------- Informational power-cost envelope (admin/debug only) ----------
+            const minPowerCostPerDayUSD =
+                (minHashpower * joulesPerTH * resolvedElectricity.wallPowerDerating * 24 / 1000)
+                * resolvedElectricity.rateAllInUSDPerKWh;
+
+            const maxPowerCostPerDayUSD =
+                (maxHashpower * joulesPerTH * resolvedElectricity.wallPowerDerating * 24 / 1000)
+                * resolvedElectricity.rateAllInUSDPerKWh;
+
             let buttonState   = 'login';
             let buttonText    = 'Login to Rent Hashpower';
             let buttonTooltip = 'Please login to rent hashpower';
@@ -20537,6 +21216,25 @@ app.get('/api/plans', async (req, res) => {
                     display: hashrateRangeDisplay
                 },
 
+                // ---------- Hardware + efficiency for the card ----------
+                hardwareModel,
+                hardwareVendor,
+                joulesPerTH,
+
+                // ---------- Resolved electricity basis for transparency / future settlement ----------
+                electricityRate: {
+                    baseUSDPerKWh:   resolvedElectricity.rateBaseUSDPerKWh,
+                    demandUSDPerKWh: resolvedElectricity.rateDemandUSDPerKWh,
+                    allInUSDPerKWh:  resolvedElectricity.rateAllInUSDPerKWh
+                },
+                wallPowerDerating: resolvedElectricity.wallPowerDerating,
+
+                // ---------- Admin/debug only — not rendered on cards ----------
+                powerCostPerDayUSD: {
+                    min: parseFloat(minPowerCostPerDayUSD.toFixed(2)),
+                    max: parseFloat(maxPowerCostPerDayUSD.toFixed(2))
+                },
+
                 autoCompound: {
                     allow: allowAutoCompound,
                     options: autoCompoundOptions,
@@ -20552,7 +21250,7 @@ app.get('/api/plans', async (req, res) => {
                 buttonTooltip,
                 canRent
             };
-        });
+        }));
 
         const response = {
             status: 'success',
@@ -20578,6 +21276,11 @@ app.get('/api/plans', async (req, res) => {
         });
     }
 });
+
+
+
+
+
 
 
 
@@ -20671,6 +21374,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             });
         }
 
+        // ---------- Resolve global electricity rates (once per request) ----------
+        const globalRates = await resolveElectricityRates(null);
+
         const btcLogoUrl = getCryptoLogo('BTC');
 
         const formatUSD = (value) => {
@@ -20715,11 +21421,83 @@ app.post('/api/mining/calculator', async (req, res) => {
             return CYCLE_FEE_PERCENT;
         };
 
+        /**
+         * Resolve per-plan electricity rates using:
+         *   plan override → global SystemSettings → ELEC_FALLBACK
+         * Returns the rate bundle the calculator uses to compute power cost.
+         */
+        const resolvePlanRates = (plan) => {
+            const baseOverride = Number(plan && plan.electricityRateBaseUSDPerKWh);
+            const demandOverride = Number(plan && plan.electricityRateDemandUSDPerKWh);
+            const derateOverride = Number(plan && plan.wallPowerDerating);
+
+            const rateBase = Number.isFinite(baseOverride) && baseOverride > 0
+                ? baseOverride
+                : globalRates.rateBaseUSDPerKWh;
+
+            const rateDemand = Number.isFinite(demandOverride) && demandOverride > 0
+                ? demandOverride
+                : globalRates.rateDemandUSDPerKWh;
+
+            const derating = Number.isFinite(derateOverride) && derateOverride >= 1
+                ? derateOverride
+                : globalRates.wallPowerDerating;
+
+            return {
+                rateBaseUSDPerKWh: rateBase,
+                rateDemandUSDPerKWh: rateDemand,
+                rateAllInUSDPerKWh: rateBase + rateDemand,
+                wallPowerDerating: derating
+            };
+        };
+
+        /**
+         * Compute electricity cost for a given hashpower over a duration.
+         * Uses wall power = hashpower × J/TH × derating.
+         */
+        const computePowerCostUSD = (hashpowerTH, joulesPerTH, durationHours, rates) => {
+            if (!hashpowerTH || hashpowerTH <= 0) return 0;
+            if (!joulesPerTH || joulesPerTH <= 0) return 0;
+            if (!durationHours || durationHours <= 0) return 0;
+
+            const wallWatts = hashpowerTH * joulesPerTH * rates.wallPowerDerating;
+            const kwh = (wallWatts * durationHours) / 1000;
+            return kwh * rates.rateAllInUSDPerKWh;
+        };
+
+        /**
+         * Build the electricity descriptor block that every projection exposes.
+         */
+        const buildElectricityBlock = (hashpowerTH, plan, durationHours, rates, cycles) => {
+            const jPerTH = Number(plan.joulesPerTH) || 15.0;
+            const perCycleUSD = computePowerCostUSD(hashpowerTH, jPerTH, durationHours, rates);
+            const totalUSD = perCycleUSD * (cycles || 1);
+            const perCycleBTC = btcPrice > 0 ? perCycleUSD / btcPrice : 0;
+            const totalBTC = btcPrice > 0 ? totalUSD / btcPrice : 0;
+
+            return {
+                hardwareModel: plan.hardwareModel || '',
+                joulesPerTH: jPerTH,
+                wallPowerDerating: rates.wallPowerDerating,
+                rateBaseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                rateDemandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                rateAllInUSDPerKWh: rates.rateAllInUSDPerKWh,
+                durationHours,
+                cycles: cycles || 1,
+                perCycleUSD: parseFloat(perCycleUSD.toFixed(2)),
+                perCycleBTC: parseFloat(perCycleBTC.toFixed(8)),
+                totalUSD: parseFloat(totalUSD.toFixed(2)),
+                totalBTC: parseFloat(totalBTC.toFixed(8)),
+                kwhPerCycle: parseFloat(((hashpowerTH * jPerTH * rates.wallPowerDerating * durationHours) / 1000).toFixed(4))
+            };
+        };
+
         const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
             const planReturnDecimal = plan.percentage / 100;
             const durationHours = Number(plan.duration) || 0;    // ← actual DB hours
             const feePercent = resolveCycleFeePercent(plan);
             const feeDecimal = feePercent / 100;
+            const rates = resolvePlanRates(plan);
 
             const grossPrincipalUSD = principalUSD;
             const grossPrincipalBTC = principalUSD / currentBtcPrice;
@@ -20743,8 +21521,14 @@ app.post('/api/mining/calculator', async (req, res) => {
             const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
             const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
 
+            // ---------- Electricity (single cycle = 1 charge) ----------
+            const electricity = buildElectricityBlock(hashpower, plan, durationHours, rates, 1);
+
+            const netAfterPowerUSD = totalProfitUSD - electricity.totalUSD;
+            const netAfterPowerBTC = totalProfitBTC - electricity.totalBTC;
+
             const roiPercent = grossPrincipalUSD > 0
-                ? (totalProfitUSD / grossPrincipalUSD) * 100
+                ? (netAfterPowerUSD / grossPrincipalUSD) * 100
                 : 0;
 
             return {
@@ -20756,13 +21540,19 @@ app.post('/api/mining/calculator', async (req, res) => {
                 totalFees: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
                 hashpower,
 
+                electricity,
+
                 totalReturn: buildMoney(totalReturnBTC, totalReturnUSD),
                 totalPayout: buildMoney(totalReturnBTC, totalReturnUSD),
                 totalProfit: buildMoney(totalProfitBTC, totalProfitUSD),
 
-                monthlyNetPayout: buildMoney(totalProfitBTC, totalProfitUSD),
-                finalPayout: buildMoney(totalProfitBTC, totalProfitUSD),
-                netMonthlyPayout: buildMoney(totalProfitBTC, totalProfitUSD),
+                netAfterPower: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
+                netAfterPowerUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                netAfterPowerBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
+
+                monthlyNetPayout: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
+                finalPayout: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
+                netMonthlyPayout: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
 
                 principalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
                 principalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
@@ -20778,10 +21568,10 @@ app.post('/api/mining/calculator', async (req, res) => {
                 totalProfitUSD: parseFloat(totalProfitUSD.toFixed(2)),
                 totalProfitBTC: parseFloat(totalProfitBTC.toFixed(8)),
 
-                monthlyNetPayoutUSD: parseFloat(totalProfitUSD.toFixed(2)),
-                monthlyNetPayoutBTC: parseFloat(totalProfitBTC.toFixed(8)),
-                finalPayoutUSD: parseFloat(totalProfitUSD.toFixed(2)),
-                finalPayoutBTC: parseFloat(totalProfitBTC.toFixed(8)),
+                monthlyNetPayoutUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                monthlyNetPayoutBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
+                finalPayoutUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                finalPayoutBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
 
                 totalFeesUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
                 totalFeesBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
@@ -20791,7 +21581,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                 planDurationHours: durationHours,             // alias used by some UI blocks
                 planDurationDays: parseFloat((durationHours / 24).toFixed(2)),
                 durationMonths: 0,                            // 0 = single cycle
-
 
                 cycleFeePercent: feePercent,                  // informational only
 
@@ -20804,23 +21593,26 @@ app.post('/api/mining/calculator', async (req, res) => {
                     isFinalMonth: true,
                     startingPrincipal: buildMoney(grossPrincipalBTC, grossPrincipalUSD),
                     endingValue: buildMoney(totalReturnBTC, totalReturnUSD),
-                    payout: buildMoney(totalReturnBTC, totalReturnUSD),
-                    profit: buildMoney(totalProfitBTC, totalProfitUSD),
+                    payout: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
+                    profit: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
                     cyclesInMonth: 1,
                     feesPaid: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
+                    electricityPaid: buildMoney(electricity.perCycleBTC, electricity.perCycleUSD),
 
                     startingPrincipalUSD: parseFloat(grossPrincipalUSD.toFixed(2)),
                     startingPrincipalBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
                     endingValueUSD: parseFloat(totalReturnUSD.toFixed(2)),
                     endingValueBTC: parseFloat(totalReturnBTC.toFixed(8)),
-                    payoutUSD: parseFloat(totalReturnUSD.toFixed(2)),
-                    payoutBTC: parseFloat(totalReturnBTC.toFixed(8)),
-                    profitUSD: parseFloat(totalProfitUSD.toFixed(2)),
-                    profitBTC: parseFloat(totalProfitBTC.toFixed(8)),
+                    payoutUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                    payoutBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
+                    profitUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                    profitBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
                     feesPaidUSD: parseFloat(firstCycleFeeUSD.toFixed(2)),
                     feesPaidBTC: parseFloat(firstCycleFeeBTC.toFixed(8)),
+                    electricityPaidUSD: electricity.perCycleUSD,
+                    electricityPaidBTC: electricity.perCycleBTC,
 
-                    note: `Single-cycle contract of ${durationHours} hours pays principal + profit at cycle end`
+                    note: `Single-cycle contract of ${durationHours} hours pays principal + profit at cycle end, net of electricity`
                 }]
             };
         };
@@ -20832,6 +21624,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             const totalMonths = months;
             const feePercent = resolveCycleFeePercent(plan);
             const feeDecimal = feePercent / 100;
+            const rates = resolvePlanRates(plan);
 
             const grossPrincipalUSD = principalUSD;
             const grossPrincipalBTC = principalUSD / currentBtcPrice;
@@ -20848,8 +21641,19 @@ app.post('/api/mining/calculator', async (req, res) => {
                 currentBtcPrice
             );
 
+            // Per-cycle electricity is computed once from the initial hashpower.
+            // This mirrors the settlement engine, which freezes the cost basis at activation.
+            const electricityPerCycleUSD = computePowerCostUSD(
+                initialHashpower,
+                plan.joulesPerTH || 15.0,
+                durationHours,
+                rates
+            );
+
             let totalFeesUSD = 0;
             let totalFeesBTC = 0;
+            let totalElectricityUSD = 0;
+            let totalElectricityBTC = 0;
             let totalPayoutUSD = 0;
             let totalPayoutBTC = 0;
 
@@ -20865,6 +21669,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                 let monthIncomingBTC = monthStartingPrincipalBTC;
                 let monthFeesUSD = 0;
                 let monthFeesBTC = 0;
+                let monthElectricityUSD = 0;
+                let monthElectricityBTC = 0;
                 let monthEndingValueUSD = monthStartingPrincipalUSD;
                 let monthEndingValueBTC = monthStartingPrincipalBTC;
 
@@ -20885,16 +21691,27 @@ app.post('/api/mining/calculator', async (req, res) => {
                     monthIncomingBTC = cycleReturnBTC;
                     monthEndingValueUSD = cycleReturnUSD;
                     monthEndingValueBTC = cycleReturnBTC;
+
+                    // Electricity is deducted from the profit at cycle end.
+                    // We accumulate per-cycle cost so the month totals stay auditable.
+                    const cyclePowerCostBTC = currentBtcPrice > 0
+                        ? electricityPerCycleUSD / currentBtcPrice
+                        : 0;
+
+                    monthElectricityUSD += electricityPerCycleUSD;
+                    monthElectricityBTC += cyclePowerCostBTC;
                 }
 
-                const monthProfitUSD = monthEndingValueUSD - monthStartingPrincipalUSD;
-                const monthProfitBTC = monthEndingValueBTC - monthStartingPrincipalBTC;
+                const monthProfitUSD = monthEndingValueUSD - monthStartingPrincipalUSD - monthElectricityUSD;
+                const monthProfitBTC = monthEndingValueBTC - monthStartingPrincipalBTC - monthElectricityBTC;
 
-                const monthPayoutUSD = isFinalMonth ? monthEndingValueUSD : monthProfitUSD;
-                const monthPayoutBTC = isFinalMonth ? monthEndingValueBTC : monthProfitBTC;
+                const monthPayoutUSD = isFinalMonth ? (monthEndingValueUSD - monthElectricityUSD) : monthProfitUSD;
+                const monthPayoutBTC = isFinalMonth ? (monthEndingValueBTC - monthElectricityBTC) : monthProfitBTC;
 
                 totalFeesUSD += monthFeesUSD;
                 totalFeesBTC += monthFeesBTC;
+                totalElectricityUSD += monthElectricityUSD;
+                totalElectricityBTC += monthElectricityBTC;
                 totalPayoutUSD += monthPayoutUSD;
                 totalPayoutBTC += monthPayoutBTC;
 
@@ -20908,6 +21725,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                     profit: buildMoney(monthProfitBTC, monthProfitUSD),
                     cyclesInMonth: cyclesPerMonth,
                     feesPaid: buildMoney(monthFeesBTC, monthFeesUSD),
+                    electricityPaid: buildMoney(monthElectricityBTC, monthElectricityUSD),
 
                     startingPrincipalUSD: parseFloat(monthStartingPrincipalUSD.toFixed(2)),
                     startingPrincipalBTC: parseFloat(monthStartingPrincipalBTC.toFixed(8)),
@@ -20918,7 +21736,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                     profitUSD: parseFloat(monthProfitUSD.toFixed(2)),
                     profitBTC: parseFloat(monthProfitBTC.toFixed(8)),
                     feesPaidUSD: parseFloat(monthFeesUSD.toFixed(2)),
-                    feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8))
+                    feesPaidBTC: parseFloat(monthFeesBTC.toFixed(8)),
+                    electricityPaidUSD: parseFloat(monthElectricityUSD.toFixed(2)),
+                    electricityPaidBTC: parseFloat(monthElectricityBTC.toFixed(8))
                 });
 
                 monthStartingPrincipalUSD = firstNetPrincipalUSD;
@@ -20937,6 +21757,19 @@ app.post('/api/mining/calculator', async (req, res) => {
                 : 0;
             const roiPerMonth = totalMonths > 0 ? roiPercent / totalMonths : 0;
 
+            const totalCycles = cyclesPerMonth * totalMonths;
+
+            const electricity = buildElectricityBlock(
+                initialHashpower,
+                plan,
+                durationHours,
+                rates,
+                totalCycles
+            );
+
+            const netAfterPowerUSD = totalProfitUSD - totalElectricityUSD;
+            const netAfterPowerBTC = totalProfitBTC - totalElectricityBTC;
+
             return {
                 payoutModel: 'profit_only_until_final_month',
 
@@ -20946,9 +21779,15 @@ app.post('/api/mining/calculator', async (req, res) => {
                 totalFees: buildMoney(totalFeesBTC, totalFeesUSD),
                 hashpower: initialHashpower,
 
+                electricity,
+
                 totalReturn: buildMoney(totalPayoutBTC, totalPayoutUSD),
                 totalPayout: buildMoney(totalPayoutBTC, totalPayoutUSD),
                 totalProfit: buildMoney(totalProfitBTC, totalProfitUSD),
+
+                netAfterPower: buildMoney(netAfterPowerBTC, netAfterPowerUSD),
+                netAfterPowerUSD: parseFloat(netAfterPowerUSD.toFixed(2)),
+                netAfterPowerBTC: parseFloat(netAfterPowerBTC.toFixed(8)),
 
                 monthlyNetPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
                 finalPayout: buildMoney(monthlyNetPayoutBTC, monthlyNetPayoutUSD),
@@ -20975,6 +21814,9 @@ app.post('/api/mining/calculator', async (req, res) => {
 
                 totalFeesUSD: parseFloat(totalFeesUSD.toFixed(2)),
                 totalFeesBTC: parseFloat(totalFeesBTC.toFixed(8)),
+
+                totalElectricityUSD: parseFloat(totalElectricityUSD.toFixed(2)),
+                totalElectricityBTC: parseFloat(totalElectricityBTC.toFixed(8)),
 
                 durationHours,                       // e.g. 24h per cycle
                 cycleDurationHours: durationHours,
@@ -21065,6 +21907,11 @@ app.post('/api/mining/calculator', async (req, res) => {
                 durationHours: plan.duration,
                 durationDays: parseFloat((plan.duration / 24).toFixed(2)),
                 cyclesPerMonth,
+
+                hardwareModel: plan.hardwareModel || '',
+                hardwareVendor: plan.hardwareVendor || '',
+                joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+
                 minAmount: plan.minAmount,
                 maxAmount: plan.maxAmount,
                 minAmountMoney: buildMoney(plan.minAmount / btcPrice, plan.minAmount),
@@ -21081,7 +21928,13 @@ app.post('/api/mining/calculator', async (req, res) => {
             success: true,
             btcPriceUSD: parseFloat(btcPrice.toFixed(2)),
             btcPriceFormatted: formatUSD(btcPrice),
-            btcLogoUrl                                // ← canonical BTC logo
+            btcLogoUrl,                                // ← canonical BTC logo
+            electricityContext: {
+                rateBaseUSDPerKWh: globalRates.rateBaseUSDPerKWh,
+                rateDemandUSDPerKWh: globalRates.rateDemandUSDPerKWh,
+                rateAllInUSDPerKWh: globalRates.rateAllInUSDPerKWh,
+                wallPowerDerating: globalRates.wallPowerDerating
+            }
         };
 
         if (calcType === 'single_cycle') {
@@ -21091,6 +21944,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                 const hashrateOptions = plans.map(plan => {
                     const feePercent = resolveCycleFeePercent(plan);
                     const feeDecimal = feePercent / 100;
+                    const rates = resolvePlanRates(plan);
 
                     const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.duration;
                     const btcReturnNeeded = requestedTH * btcMinedPerTH;
@@ -21112,6 +21966,17 @@ app.post('/api/mining/calculator', async (req, res) => {
                     return {
                         planId: plan._id.toString(),
                         planName: plan.name,
+
+                        hardwareModel: plan.hardwareModel || '',
+                        hardwareVendor: plan.hardwareVendor || '',
+                        joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+                        electricityRate: {
+                            baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                            demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                            allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                        },
+                        wallPowerDerating: rates.wallPowerDerating,
+
                         requestedTH,
                         requiredInvestment: buildMoney(grossInvestment / btcPrice, grossInvestment),
                         effectiveInvestment: buildMoney(effectiveInvestment / btcPrice, effectiveInvestment),
@@ -21151,6 +22016,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                         planName: bestOption.planName,
                         investment: bestOption.effectiveInvestment,
 
+                        hardwareModel: bestOption.hardwareModel,
+                        hardwareVendor: bestOption.hardwareVendor,
+                        joulesPerTH: bestOption.joulesPerTH,
+                        electricityRate: bestOption.electricityRate,
+                        wallPowerDerating: bestOption.wallPowerDerating,
+
                         durationHours: bestOption.projection.durationHours,
                         planDurationHours: bestOption.projection.durationHours,
                         cycleDurationHours: bestOption.projection.durationHours,
@@ -21162,6 +22033,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                         totalProfit: bestOption.projection.totalProfit,
                         totalReturn: bestOption.projection.totalReturn,
                         monthlyNetPayout: bestOption.projection.monthlyNetPayout,
+                        electricity: bestOption.projection.electricity,
+                        netAfterPower: bestOption.projection.netAfterPower,
                         roiPercent: bestOption.projection.roiPercent,
                         cycleFeePercent: bestOption.projection.cycleFeePercent,
                         recommendedDuration: bestOption.recommendedDuration,
@@ -21176,6 +22049,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
                 const projections = plans.map(plan => {
                     const projection = calculateSingleCycleProjection(amount, plan, btcPrice);
+                    const rates = resolvePlanRates(plan);
+
                     return {
                         planId: plan._id.toString(),
                         planName: plan.name,
@@ -21183,6 +22058,16 @@ app.post('/api/mining/calculator', async (req, res) => {
                         planBadge: plan.badge,
                         planTier: plan.tier,
                         planPercentage: plan.percentage,
+
+                        hardwareModel: plan.hardwareModel || '',
+                        hardwareVendor: plan.hardwareVendor || '',
+                        joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+                        electricityRate: {
+                            baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                            demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                            allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                        },
+                        wallPowerDerating: rates.wallPowerDerating,
 
                         durationHours: plan.duration,
                         planDurationHours: plan.duration,
@@ -21197,7 +22082,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                     };
                 });
 
-                projections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
+                projections.sort((a, b) => b.netAfterPowerUSD - a.netAfterPowerUSD);
                 const eligibleSorted = projections.filter(p => p.isEligible);
                 const bestPlan = eligibleSorted[0] || projections[0];
 
@@ -21217,11 +22102,16 @@ app.post('/api/mining/calculator', async (req, res) => {
                         planTier: bestPlan.planTier,
                         planPercentage: bestPlan.planPercentage,
 
+                        hardwareModel: bestPlan.hardwareModel,
+                        hardwareVendor: bestPlan.hardwareVendor,
+                        joulesPerTH: bestPlan.joulesPerTH,
+                        electricityRate: bestPlan.electricityRate,
+                        wallPowerDerating: bestPlan.wallPowerDerating,
+
                         durationHours: bestPlan.durationHours,                // e.g. 24
                         planDurationHours: bestPlan.durationHours,            // alias
                         cycleDurationHours: bestPlan.durationHours,           // alias
                         planDurationDays: bestPlan.planDurationDays,          // e.g. 1.0
-
 
                         cycleFeePercent: bestPlan.cycleFeePercent,
                         investment: buildMoney(amount / btcPrice, amount),
@@ -21230,12 +22120,14 @@ app.post('/api/mining/calculator', async (req, res) => {
                         totalProfit: bestPlan.totalProfit,
                         totalReturn: bestPlan.totalReturn,
                         monthlyNetPayout: bestPlan.monthlyNetPayout,
+                        electricity: bestPlan.electricity,
+                        netAfterPower: bestPlan.netAfterPower,
                         roiPercent: bestPlan.roiPercent,
                         totalFees: bestPlan.totalFees,
                         recommendedDuration: bestPlan.recommendedDuration,
                         monthlyBreakdown: [],
                         payoutPerMonth: bestPlan.payoutPerMonth,
-                        reason: `Best single-cycle profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI over ${bestPlan.durationHours}h)`
+                        reason: `Best net profit after power: ${bestPlan.netAfterPower.display} (${bestPlan.roiPercent}% ROI over ${bestPlan.durationHours}h)`
                     }
                 };
             }
@@ -21249,6 +22141,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                 const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
                 const feePercent = resolveCycleFeePercent(sourcePlan);
                 const feeDecimal = feePercent / 100;
+                const rates = resolvePlanRates(sourcePlan);
 
                 const btcMinedPerTH = BTC_PER_TH_PER_HOUR * plan.durationHours;
                 const btcReturnNeeded = requestedTH * btcMinedPerTH;
@@ -21271,6 +22164,17 @@ app.post('/api/mining/calculator', async (req, res) => {
                 return {
                     planId: plan.planId,
                     planName: plan.name,
+
+                    hardwareModel: plan.hardwareModel,
+                    hardwareVendor: plan.hardwareVendor,
+                    joulesPerTH: plan.joulesPerTH,
+                    electricityRate: {
+                        baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                        demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                        allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                    },
+                    wallPowerDerating: rates.wallPowerDerating,
+
                     requestedTH,
                     requiredInvestment: buildMoney(grossInvestment / btcPrice, grossInvestment),
                     effectiveInvestment: buildMoney(effectiveInvestment / btcPrice, effectiveInvestment),
@@ -21313,12 +22217,21 @@ app.post('/api/mining/calculator', async (req, res) => {
                     investment: bestOption.effectiveInvestment,
                     hashpower: bestOption.effectiveHashpower,
                     costPerTH: bestOption.costPerTH,
+
+                    hardwareModel: bestOption.hardwareModel,
+                    hardwareVendor: bestOption.hardwareVendor,
+                    joulesPerTH: bestOption.joulesPerTH,
+                    electricityRate: bestOption.electricityRate,
+                    wallPowerDerating: bestOption.wallPowerDerating,
+
                     recommendedDuration: bestOption.recommendedDuration,
                     projection: bestOption.projection,
                     monthlyBreakdown: bestOption.projection.monthlyBreakdown,
                     payoutPerMonth: bestOption.projection.payoutPerMonth,
                     totalReturn: bestOption.projection.totalReturn,
                     totalProfit: bestOption.projection.totalProfit,
+                    electricity: bestOption.projection.electricity,
+                    netAfterPower: bestOption.projection.netAfterPower,
                     monthlyNetPayout: bestOption.projection.monthlyNetPayout,
                     roiPercent: bestOption.projection.roiPercent,
                     totalFees: bestOption.projection.totalFees,
@@ -21371,6 +22284,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             } else {
                 const planProjections = eligiblePlans.map(plan => {
                     const projection = calculateContractProjection(amount, plan, monthsToUse, btcPrice);
+                    const rates = resolvePlanRates(plan);
 
                     return {
                         planId: plan._id.toString(),
@@ -21383,12 +22297,23 @@ app.post('/api/mining/calculator', async (req, res) => {
                         durationHours: plan.duration,
                         planDurationDays: parseFloat((plan.duration / 24).toFixed(2)),
                         cyclesPerMonth: calculateCyclesPerMonth(plan.duration),
+
+                        hardwareModel: plan.hardwareModel || '',
+                        hardwareVendor: plan.hardwareVendor || '',
+                        joulesPerTH: Number(plan.joulesPerTH) || 15.0,
+                        electricityRate: {
+                            baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                            demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                            allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                        },
+                        wallPowerDerating: rates.wallPowerDerating,
+
                         recommendedDuration: buildRecommendedDuration(plan, monthsToUse),
                         ...projection
                     };
                 });
 
-                planProjections.sort((a, b) => b.totalProfitUSD - a.totalProfitUSD);
+                planProjections.sort((a, b) => b.netAfterPowerUSD - a.netAfterPowerUSD);
                 const bestPlan = planProjections[0];
 
                 result.investmentCalculation = {
@@ -21404,6 +22329,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                         planBadge: bestPlan.planBadge,
                         planTier: bestPlan.planTier,
                         planPercentage: bestPlan.planPercentage,
+
+                        hardwareModel: bestPlan.hardwareModel,
+                        hardwareVendor: bestPlan.hardwareVendor,
+                        joulesPerTH: bestPlan.joulesPerTH,
+                        electricityRate: bestPlan.electricityRate,
+                        wallPowerDerating: bestPlan.wallPowerDerating,
 
                         durationHours: bestPlan.durationHours,
                         planDurationHours: bestPlan.durationHours,
@@ -21425,6 +22356,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                         totalReturn: bestPlan.totalReturn,
                         totalPayout: bestPlan.totalPayout,
                         totalProfit: bestPlan.totalProfit,
+                        electricity: bestPlan.electricity,
+                        netAfterPower: bestPlan.netAfterPower,
                         monthlyNetPayout: bestPlan.monthlyNetPayout,
                         finalPayout: bestPlan.finalPayout,
                         netMonthlyPayout: bestPlan.netMonthlyPayout,
@@ -21439,6 +22372,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                         totalPayoutBTC: bestPlan.totalPayoutBTC,
                         totalProfitUSD: bestPlan.totalProfitUSD,
                         totalProfitBTC: bestPlan.totalProfitBTC,
+                        netAfterPowerUSD: bestPlan.netAfterPowerUSD,
+                        netAfterPowerBTC: bestPlan.netAfterPowerBTC,
                         monthlyNetPayoutUSD: bestPlan.monthlyNetPayoutUSD,
                         monthlyNetPayoutBTC: bestPlan.monthlyNetPayoutBTC,
                         finalPayoutUSD: bestPlan.finalPayoutUSD,
@@ -21451,7 +22386,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                         monthlyBreakdown: bestPlan.monthlyBreakdown,
                         payoutPerMonth: bestPlan.payoutPerMonth,
 
-                        reason: `Highest profit: ${bestPlan.totalProfit.display} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`
+                        reason: `Highest net after power: ${bestPlan.netAfterPower.display} (${bestPlan.roiPercent}% ROI) over ${bestPlan.durationMonths} month(s)`
                     }
                 };
             }
@@ -21463,6 +22398,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             const durationOptions = planMetrics.map(plan => {
                 const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
                 const projection = calculateContractProjection(plan.minAmount, sourcePlan, months, btcPrice);
+                const rates = resolvePlanRates(sourcePlan);
 
                 return {
                     planId: plan.planId,
@@ -21475,6 +22411,17 @@ app.post('/api/mining/calculator', async (req, res) => {
                     durationHours: plan.durationHours,
                     planDurationDays: plan.durationDays,
                     cyclesPerMonth: plan.cyclesPerMonth,
+
+                    hardwareModel: plan.hardwareModel,
+                    hardwareVendor: plan.hardwareVendor,
+                    joulesPerTH: plan.joulesPerTH,
+                    electricityRate: {
+                        baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                        demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                        allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                    },
+                    wallPowerDerating: rates.wallPowerDerating,
+
                     minInvestment: buildMoney(plan.minAmount / btcPrice, plan.minAmount),
                     recommendedDuration: buildRecommendedDuration(sourcePlan, months),
                     ...projection
@@ -21494,6 +22441,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                     planName: bestPlan.planName,
                     planPercentage: bestPlan.planPercentage,
 
+                    hardwareModel: bestPlan.hardwareModel,
+                    hardwareVendor: bestPlan.hardwareVendor,
+                    joulesPerTH: bestPlan.joulesPerTH,
+                    electricityRate: bestPlan.electricityRate,
+                    wallPowerDerating: bestPlan.wallPowerDerating,
+
                     durationHours: bestPlan.durationHours,
                     planDurationHours: bestPlan.durationHours,
                     cycleDurationHours: bestPlan.durationHours,
@@ -21505,6 +22458,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                     totalPayout: bestPlan.totalPayout,
                     totalProfit: bestPlan.totalProfit,
                     totalReturn: bestPlan.totalReturn,
+                    electricity: bestPlan.electricity,
+                    netAfterPower: bestPlan.netAfterPower,
                     monthlyNetPayout: bestPlan.monthlyNetPayout,
                     roiPercent: bestPlan.roiPercent,
                     roiPerMonth: bestPlan.roiPerMonth,
@@ -21516,7 +22471,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                     monthlyBreakdown: bestPlan.monthlyBreakdown,
                     payoutPerMonth: bestPlan.payoutPerMonth,
 
-                    reason: `Best ROI per month: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`
+                    reason: `Best ROI per month after power: ${bestPlan.roiPerMonth}% (${bestPlan.roiPercent}% total over ${months} month(s))`
                 }
             };
         }
@@ -21525,6 +22480,7 @@ app.post('/api/mining/calculator', async (req, res) => {
             const planComparisons = planMetrics.map(plan => {
                 const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
                 const projection = calculateContractProjection(plan.minAmount, sourcePlan, 1, btcPrice);
+                const rates = resolvePlanRates(sourcePlan);
 
                 return {
                     planId: plan.planId,
@@ -21537,6 +22493,17 @@ app.post('/api/mining/calculator', async (req, res) => {
                     durationHours: plan.durationHours,
                     planDurationDays: plan.durationDays,
                     cyclesPerMonth: plan.cyclesPerMonth,
+
+                    hardwareModel: plan.hardwareModel,
+                    hardwareVendor: plan.hardwareVendor,
+                    joulesPerTH: plan.joulesPerTH,
+                    electricityRate: {
+                        baseUSDPerKWh: rates.rateBaseUSDPerKWh,
+                        demandUSDPerKWh: rates.rateDemandUSDPerKWh,
+                        allInUSDPerKWh: rates.rateAllInUSDPerKWh
+                    },
+                    wallPowerDerating: rates.wallPowerDerating,
+
                     minAmount: plan.minAmount,
                     maxAmount: plan.maxAmount,
                     minAmountMoney: plan.minAmountMoney,
@@ -21546,6 +22513,8 @@ app.post('/api/mining/calculator', async (req, res) => {
                     minInvestmentHashpower: projection.hashpower,
                     minInvestmentMonthlyProfit: projection.totalProfit,
                     minInvestmentMonthlyProfitUSD: projection.totalProfitUSD,
+                    minInvestmentMonthlyNetAfterPower: projection.netAfterPower,
+                    minInvestmentMonthlyNetAfterPowerUSD: projection.netAfterPowerUSD,
                     minInvestmentMonthlyROI: projection.roiPercent,
                     monthlyBreakdown: projection.monthlyBreakdown,
                     payoutPerMonth: projection.payoutPerMonth
@@ -21565,6 +22534,13 @@ app.post('/api/mining/calculator', async (req, res) => {
                 mostCostEffectivePlan: {
                     planId: mostCostEffective.planId,
                     planName: mostCostEffective.planName,
+
+                    hardwareModel: mostCostEffective.hardwareModel,
+                    hardwareVendor: mostCostEffective.hardwareVendor,
+                    joulesPerTH: mostCostEffective.joulesPerTH,
+                    electricityRate: mostCostEffective.electricityRate,
+                    wallPowerDerating: mostCostEffective.wallPowerDerating,
+
                     costPerTH: mostCostEffective.costPerTH,
                     costPerTHUSD: mostCostEffective.costPerTH.costPerTHUSD,
                     costPerTHBTC: mostCostEffective.costPerTH.costPerTHBTC,
@@ -21650,25 +22626,33 @@ app.post('/api/mining/calculator', async (req, res) => {
                 summary = {
                     investmentAmount: result.singleCycleCalculation.investmentUSD || null,
                     requestedTH: result.singleCycleCalculation.requestedTH || null,
-                    recommendedPlan: result.singleCycleCalculation.recommendedPlan?.planName || null
+                    recommendedPlan: result.singleCycleCalculation.recommendedPlan?.planName || null,
+                    netAfterPowerUSD: result.singleCycleCalculation.recommendedPlan?.netAfterPowerUSD || null,
+                    electricityTotalUSD: result.singleCycleCalculation.recommendedPlan?.electricity?.totalUSD || null
                 };
             } else if (calcType === 'hashrate' && result.hashrateCalculation) {
                 summary = {
                     requestedTH: result.hashrateCalculation.requestedTH,
                     recommendedPlan: result.hashrateCalculation.recommendedPlan?.planName || null,
-                    durationMonths: parsedDurationMonths
+                    durationMonths: parsedDurationMonths,
+                    netAfterPowerUSD: result.hashrateCalculation.recommendedPlan?.netAfterPowerUSD || null,
+                    electricityTotalUSD: result.hashrateCalculation.recommendedPlan?.electricity?.totalUSD || null
                 };
             } else if (calcType === 'investment' && result.investmentCalculation) {
                 summary = {
                     investmentAmount: result.investmentCalculation.investmentUSD,
                     eligiblePlansCount: result.investmentCalculation.eligiblePlansCount || 0,
                     recommendedPlan: result.investmentCalculation.recommendedPlan?.planName || null,
-                    durationMonths: parsedDurationMonths
+                    durationMonths: parsedDurationMonths,
+                    netAfterPowerUSD: result.investmentCalculation.recommendedPlan?.netAfterPowerUSD || null,
+                    electricityTotalUSD: result.investmentCalculation.recommendedPlan?.electricity?.totalUSD || null
                 };
             } else if (calcType === 'duration' && result.durationCalculation) {
                 summary = {
                     durationMonths: result.durationCalculation.durationMonths,
-                    recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null
+                    recommendedPlan: result.durationCalculation.recommendedPlan?.planName || null,
+                    netAfterPowerUSD: result.durationCalculation.recommendedPlan?.netAfterPowerUSD || null,
+                    electricityTotalUSD: result.durationCalculation.recommendedPlan?.electricity?.totalUSD || null
                 };
             } else if (result.overview) {
                 summary = {
@@ -21702,6 +22686,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                     durationMonths: parsedDurationMonths,
                     btcPriceAtCalculation: btcPrice,
                     plansAvailable: plans.length,
+                    electricityContext: result.electricityContext,
                     summary,
                     processingTimeMs: Date.now() - startTime
                 }
@@ -21756,13 +22741,6 @@ app.post('/api/mining/calculator', async (req, res) => {
         });
     }
 });
-
-
-
-
-
-
-
 
 
 
@@ -31817,24 +32795,571 @@ app.delete('/api/admin/cards/:id', adminProtect, async (req, res) => {
 
 
 
+app.delete('/api/admin/investment/plans/:id', adminProtect, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Invalid plan ID'
+      });
+    }
+
+    const plan = await Plan.findById(id);
+    if (!plan) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Investment plan not found'
+      });
+    }
+
+    const activeInvestments = await Investment.countDocuments({ 
+      plan: id, 
+      status: 'active' 
+    });
+
+    if (activeInvestments > 0) {
+      return res.status(400).json({
+        status: 'fail',
+        message: `Cannot delete plan. ${activeInvestments} active investment(s) are using this plan.`
+      });
+    }
+
+    await Plan.findByIdAndDelete(id);
+
+    await logActivity(
+      'investment_plan_deleted',
+      'Plan',
+      id,
+      req.admin._id,
+      'Admin',
+      req,
+      {
+        planName: plan.name
+      }
+    );
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Investment plan deleted successfully'
+    });
+
+  } catch (err) {
+    console.error('Error deleting investment plan:', err);
+    res.status(500).json({
+      status: 'error',
+      message: err.message || 'Failed to delete investment plan'
+    });
+  }
+});
 
 
 
 
 
 
+app.get('/api/admin/investments/active', adminProtect, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const investments = await Investment.find({ status: 'active' })
+      .populate('user', 'firstName lastName email')
+      .populate('plan', 'name percentage duration minAmount maxAmount')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    const total = await Investment.countDocuments({ status: 'active' });
+    const totalPages = Math.ceil(total / limit);
+
+    const formattedInvestments = investments.map(inv => {
+      const user = inv.user || {};
+      const firstName = user.firstName || 'Deleted';
+      const lastName = user.lastName || 'User';
+      const userEmail = user.email || 'unknown@deleted.com';
+      
+      const plan = inv.plan || {};
+      const planName = plan.name || 'Unknown Plan';
+      const planPercentage = plan.percentage || 0;
+      const planDurationHours = plan.duration || 0;
+      
+      const now = new Date();
+      const startDate = new Date(inv.startDate || inv.createdAt);
+      
+      const endDate = new Date(startDate.getTime() + (planDurationHours * 60 * 60 * 1000));
+      
+      const timeLeftMs = Math.max(0, endDate - now);
+      
+      const hoursLeft = Math.floor(timeLeftMs / (1000 * 60 * 60));
+      const minutesLeft = Math.floor((timeLeftMs % (1000 * 60 * 60)) / (1000 * 60));
+      const secondsLeft = Math.floor((timeLeftMs % (1000 * 60)) / 1000);
+      
+      const countdownDisplay = timeLeftMs <= 0 ? '00:00:00' : 
+        `${hoursLeft.toString().padStart(2, '0')}:${minutesLeft.toString().padStart(2, '0')}:${secondsLeft.toString().padStart(2, '0')}`;
+      
+      const daysLeft = Math.floor(hoursLeft / 24);
+      const remainingHours = hoursLeft % 24;
+      const humanReadableDisplay = timeLeftMs <= 0 ? 'Matured' :
+        (daysLeft > 0 ? `${daysLeft}d ${remainingHours}h` : `${hoursLeft}h ${minutesLeft}m`);
+      
+      const totalDurationMs = planDurationHours * 60 * 60 * 1000;
+      const elapsedMs = Math.min(totalDurationMs, Math.max(0, now - startDate));
+      const progressPercentage = totalDurationMs > 0 ? (elapsedMs / totalDurationMs) * 100 : 0;
+      
+      const dailyProfit = (inv.amount * planPercentage) / 100;
+      
+      const totalProfit = progressPercentage > 0 ? (dailyProfit * (progressPercentage / 100)) : 0;
+      
+      const expectedReturn = inv.expectedReturn || (inv.amount + dailyProfit);
+      
+      const isMatured = timeLeftMs <= 0;
+      
+      return {
+        _id: inv._id,
+        user: {
+          _id: user._id || null,
+          firstName: firstName,
+          lastName: lastName,
+          email: userEmail,
+          fullName: `${firstName} ${lastName}`.trim()
+        },
+        plan: {
+          _id: plan._id || null,
+          name: planName,
+          percentage: planPercentage,
+          duration: planDurationHours
+        },
+        amount: inv.amount || 0,
+        startDate: startDate,
+        endDate: endDate,
+        timeRemaining: {
+          milliseconds: timeLeftMs,
+          seconds: secondsLeft,
+          minutes: minutesLeft,
+          hours: hoursLeft,
+          days: daysLeft,
+          countdown: countdownDisplay,        // HH:MM:SS format
+          humanReadable: humanReadableDisplay, // "2d 5h" or "Matured"
+          isMatured: isMatured
+        },
+        dailyProfit: dailyProfit,
+        totalProfit: totalProfit,
+        expectedReturn: expectedReturn,
+        progressPercentage: progressPercentage.toFixed(2),
+        status: inv.status || 'active'
+      };
+    });
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        investments: formattedInvestments,
+        pagination: {
+          currentPage: page,
+          totalPages: totalPages,
+          totalItems: total,
+          itemsPerPage: limit,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Error fetching active investments:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch active investments'
+    });
+  }
+});
 
 
 
 
+app.get('/api/admin/investments/completed', adminProtect, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const investments = await Investment.find({ 
+      status: { $in: ['completed', 'cancelled'] } 
+    })
+      .populate('user', 'firstName lastName email')
+      .populate('plan', 'name percentage duration')
+      .sort({ completedAt: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    const total = await Investment.countDocuments({ 
+      status: { $in: ['completed', 'cancelled'] } 
+    });
+    const totalPages = Math.ceil(total / limit);
+
+    const formattedInvestments = investments.map(inv => {
+      const user = inv.user || {};
+      const firstName = user.firstName || 'Deleted';
+      const lastName = user.lastName || 'User';
+      const userEmail = user.email || 'unknown@deleted.com';
+      
+      const plan = inv.plan || {};
+      const planName = plan.name || 'Unknown Plan';
+      
+      const actualReturn = inv.actualReturn || inv.expectedReturn || 0;
+      const profit = actualReturn - (inv.amount || 0);
+      
+      return {
+        _id: inv._id,
+        user: {
+          _id: user._id || null,
+          firstName: firstName,
+          lastName: lastName,
+          email: userEmail,
+          fullName: `${firstName} ${lastName}`.trim()
+        },
+        plan: {
+          _id: plan._id || null,
+          name: planName
+        },
+        amount: inv.amount || 0,
+        expectedReturn: inv.expectedReturn || 0,
+        actualReturn: actualReturn,
+        profit: profit,
+        startDate: inv.startDate || inv.createdAt,
+        endDate: inv.endDate,
+        completedAt: inv.completedAt || inv.endDate || inv.updatedAt,
+        status: inv.status || 'completed'
+      };
+    });
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        investments: formattedInvestments,
+        pagination: {
+          currentPage: page,
+          totalPages: totalPages,
+          totalItems: total,
+          itemsPerPage: limit,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Error fetching completed investments:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch completed investments'
+    });
+  }
+});
 
 
 
 
+app.get('/api/admin/investment/plans', adminProtect, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const plans = await Plan.find({})
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    const total = await Plan.countDocuments({});
+    const totalPages = Math.ceil(total / limit);
+
+    const formattedPlans = plans.map(plan => ({
+      _id: plan._id,
+      name: plan.name || 'Unnamed Plan',
+      description: plan.description || '',
+      minAmount: plan.minAmount || 0,
+      maxAmount: plan.maxAmount || 0,
+      duration: plan.duration || 0,
+      dailyProfit: plan.percentage || 0,  // HTML expects dailyProfit
+      totalProfit: plan.percentage || 0,   // HTML expects totalProfit
+      percentage: plan.percentage || 0,
+      status: plan.isActive ? 'active' : 'inactive',
+      isActive: plan.isActive || false,
+      referralBonus: plan.referralBonus || 0,
+      createdAt: plan.createdAt,
+      updatedAt: plan.updatedAt
+    }));
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        plans: formattedPlans,
+        pagination: {
+          currentPage: page,
+          totalPages: totalPages,
+          totalItems: total,
+          itemsPerPage: limit,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Error fetching investment plans:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch investment plans'
+    });
+  }
+});
 
 
 
+app.get('/api/admin/investment/plans/:id', adminProtect, async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Invalid plan ID'
+      });
+    }
+
+    const plan = await Plan.findById(id).lean();
+
+    if (!plan) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Investment plan not found'
+      });
+    }
+
+    const formattedPlan = {
+      _id: plan._id,
+      name: plan.name || '',
+      description: plan.description || '',
+      minAmount: plan.minAmount || 0,
+      maxAmount: plan.maxAmount || 0,
+      duration: plan.duration || 0,
+      dailyProfit: plan.percentage || 0,
+      totalProfit: plan.percentage || 0,
+      status: plan.isActive ? 'active' : 'inactive'
+    };
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        plan: formattedPlan
+      }
+    });
+
+  } catch (err) {
+    console.error('Error fetching plan:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch investment plan'
+    });
+  }
+});
+
+
+app.put('/api/admin/investment/plans/:id', adminProtect, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      name, 
+      description, 
+      minAmount, 
+      maxAmount, 
+      duration, 
+      dailyProfit, 
+      totalProfit, 
+      status 
+    } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Invalid plan ID'
+      });
+    }
+
+    const existingPlan = await Plan.findById(id);
+    if (!existingPlan) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Investment plan not found'
+      });
+    }
+
+    const updateData = {};
+    
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (minAmount !== undefined) updateData.minAmount = parseFloat(minAmount);
+    if (maxAmount !== undefined) updateData.maxAmount = parseFloat(maxAmount);
+    if (duration !== undefined) updateData.duration = parseInt(duration);
+    
+    if (dailyProfit !== undefined) updateData.percentage = parseFloat(dailyProfit);
+    if (totalProfit !== undefined && dailyProfit === undefined) updateData.percentage = parseFloat(totalProfit);
+    
+    if (status !== undefined) {
+      updateData.isActive = status === 'active';
+    }
+
+    const updatedPlan = await Plan.findByIdAndUpdate(
+      id, 
+      updateData, 
+      { new: true, runValidators: true }
+    );
+
+    if (!updatedPlan) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Investment plan not found'
+      });
+    }
+
+    const formattedPlan = {
+      _id: updatedPlan._id,
+      name: updatedPlan.name,
+      description: updatedPlan.description,
+      minAmount: updatedPlan.minAmount,
+      maxAmount: updatedPlan.maxAmount,
+      duration: updatedPlan.duration,
+      dailyProfit: updatedPlan.percentage,
+      totalProfit: updatedPlan.percentage,
+      status: updatedPlan.isActive ? 'active' : 'inactive',
+      referralBonus: updatedPlan.referralBonus
+    };
+
+    await logActivity(
+      'investment_plan_updated',
+      'Plan',
+      updatedPlan._id,
+      req.admin._id,
+      'Admin',
+      req,
+      {
+        planName: updatedPlan.name,
+        changes: updateData
+      }
+    );
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Investment plan updated successfully',
+      data: {
+        plan: formattedPlan
+      }
+    });
+
+  } catch (err) {
+    console.error('Error updating investment plan:', err);
+    res.status(500).json({
+      status: 'error',
+      message: err.message || 'Failed to update investment plan'
+    });
+  }
+});
+
+
+app.post('/api/admin/investment/plans', adminProtect, async (req, res) => {
+  try {
+    const { 
+      name, 
+      description, 
+      minAmount, 
+      maxAmount, 
+      duration, 
+      dailyProfit, 
+      totalProfit, 
+      status,
+      referralBonus 
+    } = req.body;
+
+    if (!name || !description || !minAmount || !maxAmount || !duration) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Missing required fields: name, description, minAmount, maxAmount, duration'
+      });
+    }
+
+    const existingPlan = await Plan.findOne({ name: name });
+    if (existingPlan) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Plan with this name already exists'
+      });
+    }
+
+    const percentage = dailyProfit || totalProfit || 0;
+
+    const newPlan = await Plan.create({
+      name: name,
+      description: description,
+      minAmount: parseFloat(minAmount),
+      maxAmount: parseFloat(maxAmount),
+      duration: parseInt(duration),
+      percentage: parseFloat(percentage),
+      isActive: status === 'active',
+      referralBonus: referralBonus ? parseFloat(referralBonus) : 5
+    });
+
+    const formattedPlan = {
+      _id: newPlan._id,
+      name: newPlan.name,
+      description: newPlan.description,
+      minAmount: newPlan.minAmount,
+      maxAmount: newPlan.maxAmount,
+      duration: newPlan.duration,
+      dailyProfit: newPlan.percentage,
+      totalProfit: newPlan.percentage,
+      status: newPlan.isActive ? 'active' : 'inactive',
+      referralBonus: newPlan.referralBonus
+    };
+
+    await logActivity(
+      'investment_plan_created',
+      'Plan',
+      newPlan._id,
+      req.admin._id,
+      'Admin',
+      req,
+      {
+        planName: newPlan.name,
+        minAmount: newPlan.minAmount,
+        maxAmount: newPlan.maxAmount,
+        duration: newPlan.duration,
+        percentage: newPlan.percentage
+      }
+    );
+
+    res.status(201).json({
+      status: 'success',
+      message: 'Investment plan created successfully',
+      data: {
+        plan: formattedPlan
+      }
+    });
+
+  } catch (err) {
+    console.error('Error creating investment plan:', err);
+    res.status(500).json({
+      status: 'error',
+      message: err.message || 'Failed to create investment plan'
+    });
+  }
+});
 
 
 app.get('/api/admin/transactions', adminProtect, async (req, res) => {
@@ -32797,1728 +34322,7 @@ app.get('/api/admin/statements', adminProtect, async (req, res) => {
 
 
 
-/* ============================================================
- * ADMIN INVESTMENT ENDPOINTS — UPGRADED FOR NEW CONTRACT MODEL
- * ============================================================
- * Fields surfaced from the new Investment model:
- *  - cyclesPerMonth, currentCycle, currentMonth, totalCycles
- *  - autoCompoundMonths, isAutoCompoundActive
- *  - monthStartingPrincipalUSD/BTC
- *  - monthToDateReturnUSD/BTC
- *  - cumulativeReturnUSD/BTC
- *  - currentHashrate, hashrateHistory
- *  - cycleHistory (with fees, returns, prices)
- *  - investmentFeeUSD/BTC, originalAmount/BTC
- *  - btcPriceAtInvestment
- *
- * Real-time BTC/USD earnings via getCryptoPrice('BTC')
- * Bitcoin logo via getCryptoLogo('BTC')
- * ============================================================ */
 
-// ---------- SHARED HELPERS ----------
-
-/**
- * Resolve plan cycle fee percent — falls back to global default.
- */
-function resolveAdminCycleFeePercent(plan) {
-    if (plan && typeof plan.cycleFeePercent === 'number' && plan.cycleFeePercent >= 0) {
-        return plan.cycleFeePercent;
-    }
-    return CYCLE_FEE_PERCENT;
-}
-
-/**
- * Calculate how many cycles fit in one 30-day month for a given plan duration.
- */
-function calcCyclesPerMonthSafe(durationHours) {
-    if (!durationHours || durationHours <= 0) return 1;
-    const cycleMinutes = durationHours * 60;
-    return Math.max(1, Math.floor(MINUTES_PER_MONTH / cycleMinutes));
-}
-
-/**
- * Safely resolve a live BTC price. Returns null on failure (so the caller
- * can decide whether to fall back to a locked price).
- */
-async function tryGetLiveBtcPrice() {
-    try {
-        const p = await getCryptoPrice('BTC');
-        if (p && p > 0) return p;
-    } catch (err) {
-        console.warn('[ADMIN INVEST] Live BTC price fetch failed:', err.message);
-    }
-    return null;
-}
-
-/**
- * Build the base "contract shape" used by admin investment views.
- * All USD/BTC values are computed against `liveBtcPrice` (or fallback).
- */
-function buildAdminContractView(investment, liveBtcPrice, fallbackBtcPrice) {
-    const plan = investment.plan || {};
-    const user = investment.user || {};
-
-    const btcPrice = (liveBtcPrice && liveBtcPrice > 0)
-        ? liveBtcPrice
-        : (fallbackBtcPrice && fallbackBtcPrice > 0
-            ? fallbackBtcPrice
-            : (investment.btcPriceAtInvestment || 1));
-
-    const isLivePrice = !!(liveBtcPrice && liveBtcPrice > 0);
-
-    const cycleFeePercent = resolveAdminCycleFeePercent(plan);
-    const planPercentage = Number(plan.percentage) || 0;
-    const durationHours = Number(plan.duration) || 0;
-    const planName = plan.name || 'Mining Contract';
-    const hashrateUnit = plan.hashrateUnit || 'TH/s';
-
-    // ---- Contract model fields ----
-    const netPrincipalUSD = Number(investment.amount) || 0;
-    const netPrincipalBTC = Number(investment.amountBTC) || 0;
-    const grossPrincipalUSD = Number(investment.originalAmount) || netPrincipalUSD;
-    const grossPrincipalBTC = Number(investment.originalAmountBTC) || netPrincipalBTC;
-    const investmentFeeUSD = Number(investment.investmentFee) || 0;
-    const investmentFeeBTC = Number(investment.investmentFeeBTC) || 0;
-
-    const cyclesPerMonth = Number(investment.cyclesPerMonth) || calcCyclesPerMonthSafe(durationHours);
-    const totalCycles = Number(investment.totalCycles) || 1;
-    const currentCycle = Number(investment.currentCycle) || 1;
-    const currentMonth = Number(investment.currentMonth) || 1;
-    const autoCompoundMonths = Number(investment.autoCompoundMonths) || 1;
-    const isAutoCompoundActive = Boolean(investment.isAutoCompoundActive);
-
-    const monthStartingPrincipalUSD = Number(investment.monthStartingPrincipalUSD) || netPrincipalUSD;
-    const monthStartingPrincipalBTC = Number(investment.monthStartingPrincipalBTC) || netPrincipalBTC;
-    const monthToDateReturnUSD = Number(investment.monthToDateReturnUSD) || 0;
-    const monthToDateReturnBTC = Number(investment.monthToDateReturnBTC) || 0;
-    const cumulativeReturnUSD = Number(investment.cumulativeReturnUSD) || 0;
-    const cumulativeReturnBTC = Number(investment.cumulativeReturnBTC) || 0;
-
-    const currentHashrate = Number(investment.currentHashrate) || 0;
-    const hashrateHistory = Array.isArray(investment.hashrateHistory) ? investment.hashrateHistory : [];
-    const cycleHistory = Array.isArray(investment.cycleHistory) ? investment.cycleHistory : [];
-
-    // ---- Derived real-time P&L ----
-    // Month-to-date net profit (USD)
-    const monthToDateProfitUSD = Math.max(0, monthToDateReturnUSD - monthStartingPrincipalUSD);
-    const monthToDateProfitBTC = btcPrice > 0 ? monthToDateProfitUSD / btcPrice : 0;
-
-    // Cumulative net profit (USD) = cumulative return − gross principal
-    const cumulativeNetProfitUSD = cumulativeReturnUSD - grossPrincipalUSD;
-    const cumulativeNetProfitBTC = btcPrice > 0 ? cumulativeNetProfitUSD / btcPrice : 0;
-
-    // Live expected cycle return (what the current cycle will pay)
-    const expectedCycleReturnUSD = Number(investment.expectedReturn) || 0;
-    const expectedCycleReturnBTC = Number(investment.expectedReturnBTC) ||
-        (btcPrice > 0 ? expectedCycleReturnUSD / btcPrice : 0);
-
-    // Per-cycle fee (informational, what next cycle will charge)
-    const perCycleFeeUSD = netPrincipalUSD * (cycleFeePercent / 100);
-    const perCycleFeeBTC = netPrincipalBTC * (cycleFeePercent / 100);
-
-    // Total fees paid so far (from cycleHistory)
-    let totalFeesPaidUSD = 0;
-    let totalFeesPaidBTC = 0;
-    let cyclesCharged = 0;
-    for (const c of cycleHistory) {
-        const fUSD = Number(c.feeUSD) || 0;
-        const fBTC = Number(c.feeBTC) || 0;
-        totalFeesPaidUSD += fUSD;
-        totalFeesPaidBTC += fBTC;
-        if (fUSD > 0 || fBTC > 0) cyclesCharged += 1;
-    }
-    if (totalFeesPaidUSD === 0 && investmentFeeUSD > 0) {
-        totalFeesPaidUSD = investmentFeeUSD;
-    }
-    if (totalFeesPaidBTC === 0 && investmentFeeBTC > 0) {
-        totalFeesPaidBTC = investmentFeeBTC;
-    }
-
-    // ---- Timing ----
-    const startDate = investment.startDate ? new Date(investment.startDate) : null;
-    const endDate = investment.endDate ? new Date(investment.endDate) : null;
-    const nowMs = Date.now();
-    const startMs = startDate ? startDate.getTime() : null;
-    const endMs = endDate ? endDate.getTime() : null;
-
-    const timeLeftMs = endMs ? Math.max(0, endMs - nowMs) : 0;
-    const isMatured = investment.status === 'active' && timeLeftMs <= 0;
-
-    const hoursLeft = Math.floor(timeLeftMs / (1000 * 60 * 60));
-    const minutesLeft = Math.floor((timeLeftMs % (1000 * 60 * 60)) / (1000 * 60));
-    const secondsLeft = Math.floor((timeLeftMs % (1000 * 60)) / 1000);
-
-    const countdownDisplay = timeLeftMs <= 0
-        ? '00:00:00'
-        : `${String(hoursLeft).padStart(2, '0')}:${String(minutesLeft).padStart(2, '0')}:${String(secondsLeft).padStart(2, '0')}`;
-
-    const daysLeft = Math.floor(hoursLeft / 24);
-    const remainingHours = hoursLeft % 24;
-    const humanReadableDisplay = timeLeftMs <= 0
-        ? 'Matured'
-        : daysLeft > 0
-            ? `${daysLeft}d ${remainingHours}h`
-            : `${hoursLeft}h ${minutesLeft}m`;
-
-    const isFinalCycle = currentCycle >= cyclesPerMonth;
-    const isFinalMonth = currentMonth >= autoCompoundMonths;
-    const isContractComplete = isFinalCycle && isFinalMonth;
-
-    const completedCycles = Math.max(0, currentCycle - 1);
-    const cyclesCompletedTotal = (currentMonth - 1) * cyclesPerMonth + completedCycles;
-    const remainingCycles = Math.max(0, totalCycles - cyclesCompletedTotal);
-
-    const contractProgressPercent = totalCycles > 0
-        ? Math.min(100, (cyclesCompletedTotal / totalCycles) * 100)
-        : 0;
-
-    const monthProgressPercent = cyclesPerMonth > 0
-        ? Math.min(100, (completedCycles / cyclesPerMonth) * 100)
-        : 0;
-
-    // Determine contract type (single cycle vs long term)
-    const isSingleCycle = !isAutoCompoundActive && totalCycles === 1 && autoCompoundMonths === 1;
-    const contractType = isSingleCycle ? 'single_cycle' : 'long_term';
-
-    // ---- BTC logo ----
-    const btcLogoUrl = getCryptoLogo('BTC');
-
-    // ---- Recent cycle history (last 5) ----
-    const recentCycles = cycleHistory.slice(-5).map(c => ({
-        cycleNumber: c.cycleNumber,
-        monthNumber: c.monthNumber,
-        incomingBalanceUSD: Number(c.incomingBalanceUSD) || 0,
-        incomingBalanceBTC: Number(c.incomingBalanceBTC) || 0,
-        feeUSD: Number(c.feeUSD) || 0,
-        feeBTC: Number(c.feeBTC) || 0,
-        netPrincipalUSD: Number(c.netPrincipalUSD) || 0,
-        netPrincipalBTC: Number(c.netPrincipalBTC) || 0,
-        returnUSD: Number(c.returnUSD) || 0,
-        returnBTC: Number(c.returnBTC) || 0,
-        btcPriceAtStart: c.btcPriceAtStart || null,
-        btcPriceAtEnd: c.btcPriceAtEnd || null,
-        startDate: c.startDate || null,
-        endDate: c.endDate || null,
-        status: c.status || 'unknown'
-    }));
-
-    // ---- Latest hashrate entry ----
-    const latestHashrateEntry = hashrateHistory.length > 0
-        ? hashrateHistory[hashrateHistory.length - 1]
-        : null;
-
-    return {
-        _id: investment._id,
-
-        user: {
-            _id: user._id || null,
-            firstName: user.firstName || 'Deleted',
-            lastName: user.lastName || 'User',
-            email: user.email || 'unknown@deleted.com',
-            fullName: `${user.firstName || 'Deleted'} ${user.lastName || 'User'}`.trim()
-        },
-
-        plan: {
-            _id: plan._id || null,
-            name: planName,
-            percentage: planPercentage,
-            duration: durationHours,
-            cycleFeePercent,
-            hashrateUnit,
-            badge: plan.badge || 'Standard',
-            tier: plan.tier || 'standard',
-            color: plan.color || '#F7A600',
-            bgColor: plan.bgColor || 'rgba(247,166,0,0.12)',
-            borderColor: plan.borderColor || 'rgba(247,166,0,0.3)'
-        },
-
-        // ============ CONTRACT MODEL ============
-        contractType,                 // 'single_cycle' | 'long_term'
-        isSingleCycle,
-
-        principal: {
-            grossUSD: grossPrincipalUSD,
-            grossBTC: grossPrincipalBTC,
-            netUSD: netPrincipalUSD,
-            netBTC: netPrincipalBTC,
-            monthStartingUSD: monthStartingPrincipalUSD,
-            monthStartingBTC: monthStartingPrincipalBTC
-        },
-
-        fees: {
-            totalPaidUSD: parseFloat(totalFeesPaidUSD.toFixed(2)),
-            totalPaidBTC: parseFloat(totalFeesPaidBTC.toFixed(8)),
-            perCyclePercent: cycleFeePercent,
-            perCycleUSD: parseFloat(perCycleFeeUSD.toFixed(2)),
-            perCycleBTC: parseFloat(perCycleFeeBTC.toFixed(8)),
-            creationFeeUSD: parseFloat(investmentFeeUSD.toFixed(2)),
-            creationFeeBTC: parseFloat(investmentFeeBTC.toFixed(8)),
-            cyclesCharged
-        },
-
-        cycleInfo: {
-            currentCycle,
-            currentMonth,
-            totalCycles,
-            cyclesPerMonth,
-            autoCompoundMonths,
-            isAutoCompoundActive,
-            isFinalCycle,
-            isFinalMonth,
-            isContractComplete,
-            completedCyclesTotal: cyclesCompletedTotal,
-            remainingCycles
-        },
-
-        returns: {
-            // Live cycle (what this cycle will pay when it matures)
-            currentCycle: {
-                expectedReturnUSD: expectedCycleReturnUSD,
-                expectedReturnBTC: expectedCycleReturnBTC
-            },
-            // Month-to-date net profit
-            monthToDate: {
-                returnUSD: monthToDateReturnUSD,
-                returnBTC: monthToDateReturnBTC,
-                profitUSD: parseFloat(monthToDateProfitUSD.toFixed(2)),
-                profitBTC: parseFloat(monthToDateProfitBTC.toFixed(8))
-            },
-            // Cumulative across contract life
-            cumulative: {
-                returnUSD: cumulativeReturnUSD,
-                returnBTC: cumulativeReturnBTC,
-                netProfitUSD: parseFloat(cumulativeNetProfitUSD.toFixed(2)),
-                netProfitBTC: parseFloat(cumulativeNetProfitBTC.toFixed(8))
-            }
-        },
-
-        hashrate: {
-            current: currentHashrate,
-            unit: hashrateUnit,
-            historyCount: hashrateHistory.length,
-            latestCalculatedAt: latestHashrateEntry?.calculatedAt || null,
-            btcPriceAtLastCalculation: latestHashrateEntry?.btcPriceAtCalculation || null
-        },
-
-        timing: {
-            startDate,
-            endDate,
-            durationHours,
-            timeRemaining: {
-                milliseconds: timeLeftMs,
-                hours: hoursLeft,
-                minutes: minutesLeft,
-                seconds: secondsLeft,
-                days: daysLeft,
-                countdown: countdownDisplay,
-                humanReadable: humanReadableDisplay
-            }
-        },
-
-        progress: {
-            contractPercent: parseFloat(contractProgressPercent.toFixed(2)),
-            monthPercent: parseFloat(monthProgressPercent.toFixed(2))
-        },
-
-        status: investment.status,
-        isMatured,
-
-        // ============ LIVE PRICE DATA ============
-        btcPrice: {
-            current: parseFloat(btcPrice.toFixed(2)),
-            live: isLivePrice,
-            lockedAtInvestment: investment.btcPriceAtInvestment || null,
-            logoUrl: btcLogoUrl
-        },
-
-        recentCycles,
-
-        // Flat legacy-friendly fields for the admin table
-        amount: parseFloat(netPrincipalUSD.toFixed(2)),
-        amountBTC: parseFloat(netPrincipalBTC.toFixed(8)),
-        originalAmount: parseFloat(grossPrincipalUSD.toFixed(2)),
-        originalAmountBTC: parseFloat(grossPrincipalBTC.toFixed(8)),
-        dailyProfit: parseFloat((netPrincipalUSD * planPercentage / 100).toFixed(2)),
-        totalProfit: parseFloat(cumulativeNetProfitUSD.toFixed(2)),
-        expectedReturn: parseFloat(expectedCycleReturnUSD.toFixed(2)),
-        startDate,
-        endDate,
-        currentCycle,
-        currentMonth,
-        totalCycles,
-        cyclesPerMonth,
-        autoCompoundMonths,
-        isAutoCompoundActive,
-        currentHashrate,
-        createdAt: investment.createdAt,
-        updatedAt: investment.updatedAt
-    };
-}
-
-/* ============================================================
- * GET /api/admin/investments/active
- * Query params:
- *   - page, limit
- *   - contractType: 'all' | 'single_cycle' | 'long_term'
- *   - durationHours: numeric filter (optional)
- *   - search: user email / name / plan name
- * ============================================================ */
-app.get('/api/admin/investments/active', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-        const skip = (page - 1) * limit;
-
-        const contractTypeFilter = (req.query.contractType || 'all').toLowerCase();
-        const durationFilter = req.query.durationHours ? Number(req.query.durationHours) : null;
-        const search = (req.query.search || '').trim();
-
-        // Base query — always active contracts
-        const query = { status: 'active' };
-
-        // Contract-type filter
-        if (contractTypeFilter === 'single_cycle') {
-            query.totalCycles = 1;
-            query.autoCompoundMonths = 1;
-            query.isAutoCompoundActive = false;
-        } else if (contractTypeFilter === 'long_term') {
-            query.$or = [
-                { totalCycles: { $gt: 1 } },
-                { isAutoCompoundActive: true },
-                { autoCompoundMonths: { $gt: 1 } }
-            ];
-        }
-
-        if (durationFilter && durationFilter > 0) {
-            // We need to join on plan.duration — use aggregation-friendly approach:
-            // First collect plan IDs whose duration matches, then filter investments.
-            const matchingPlans = await Plan.find({ duration: durationFilter }).select('_id').lean();
-            const planIds = matchingPlans.map(p => p._id);
-            if (planIds.length === 0) {
-                return res.status(200).json({
-                    status: 'success',
-                    data: {
-                        investments: [],
-                        pagination: {
-                            currentPage: page,
-                            totalPages: 1,
-                            totalItems: 0,
-                            itemsPerPage: limit,
-                            hasNextPage: false,
-                            hasPrevPage: false
-                        },
-                        filters: { contractType: contractTypeFilter, durationHours: durationFilter, search },
-                        btcPrice: null,
-                        btcLogoUrl: getCryptoLogo('BTC'),
-                        priceStale: true,
-                        generatedAt: new Date().toISOString()
-                    }
-                });
-            }
-            query.plan = { $in: planIds };
-        }
-
-        // Search filter (on populated user fields)
-        if (search) {
-            const matchingUsers = await User.find({
-                $or: [
-                    { firstName: { $regex: search, $options: 'i' } },
-                    { lastName: { $regex: search, $options: 'i' } },
-                    { email: { $regex: search, $options: 'i' } }
-                ]
-            }).select('_id').lean();
-            const userIds = matchingUsers.map(u => u._id);
-
-            const matchingPlansByName = await Plan.find({
-                name: { $regex: search, $options: 'i' }
-            }).select('_id').lean();
-            const planIdsByName = matchingPlansByName.map(p => p._id);
-
-            query.$and = query.$and || [];
-            query.$and.push({
-                $or: [
-                    { user: { $in: userIds } },
-                    { plan: { $in: planIdsByName } }
-                ]
-            });
-        }
-
-        const [investments, total] = await Promise.all([
-            Investment.find(query)
-                .populate('user', 'firstName lastName email')
-                .populate('plan', 'name percentage duration minAmount maxAmount badge tier color bgColor borderColor cycleFeePercent hashrateUnit')
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean(),
-            Investment.countDocuments(query)
-        ]);
-
-        // Fetch live BTC price once for all contracts
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const priceStale = !liveBtcPrice;
-
-        const enriched = investments.map(inv =>
-            buildAdminContractView(inv, liveBtcPrice, inv.btcPriceAtInvestment)
-        );
-
-        const totalPages = Math.max(1, Math.ceil(total / limit));
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                investments: enriched,
-                pagination: {
-                    currentPage: page,
-                    totalPages,
-                    totalItems: total,
-                    itemsPerPage: limit,
-                    hasNextPage: page < totalPages,
-                    hasPrevPage: page > 1
-                },
-                filters: {
-                    contractType: contractTypeFilter,
-                    durationHours: durationFilter,
-                    search
-                },
-                btcPrice: liveBtcPrice || null,
-                btcLogoUrl: getCryptoLogo('BTC'),
-                priceStale,
-                priceSource: priceStale ? 'locked' : 'live',
-                generatedAt: new Date().toISOString()
-            }
-        });
-
-    } catch (err) {
-        console.error('Error fetching active investments:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to fetch active investments'
-        });
-    }
-});
-
-/* ============================================================
- * GET /api/admin/investments/completed
- * ============================================================ */
-app.get('/api/admin/investments/completed', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-        const skip = (page - 1) * limit;
-
-        const contractTypeFilter = (req.query.contractType || 'all').toLowerCase();
-        const search = (req.query.search || '').trim();
-
-        const query = { status: { $in: ['completed', 'cancelled'] } };
-
-        if (contractTypeFilter === 'single_cycle') {
-            query.totalCycles = 1;
-            query.autoCompoundMonths = 1;
-        } else if (contractTypeFilter === 'long_term') {
-            query.$or = [
-                { totalCycles: { $gt: 1 } },
-                { autoCompoundMonths: { $gt: 1 } }
-            ];
-        }
-
-        if (search) {
-            const matchingUsers = await User.find({
-                $or: [
-                    { firstName: { $regex: search, $options: 'i' } },
-                    { lastName: { $regex: search, $options: 'i' } },
-                    { email: { $regex: search, $options: 'i' } }
-                ]
-            }).select('_id').lean();
-            const userIds = matchingUsers.map(u => u._id);
-            query.user = { $in: userIds };
-        }
-
-        const [investments, total] = await Promise.all([
-            Investment.find(query)
-                .populate('user', 'firstName lastName email')
-                .populate('plan', 'name percentage duration badge tier color bgColor borderColor cycleFeePercent hashrateUnit')
-                .sort({ completionDate: -1, createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean(),
-            Investment.countDocuments(query)
-        ]);
-
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const priceStale = !liveBtcPrice;
-
-        const enriched = investments.map(inv => {
-            const view = buildAdminContractView(inv, liveBtcPrice, inv.btcPriceAtInvestment);
-            const actualReturnUSD = Number(inv.actualReturn) || Number(inv.expectedReturn) || 0;
-            const profitUSD = actualReturnUSD - (Number(inv.originalAmount) || Number(inv.amount) || 0);
-
-            return {
-                ...view,
-                completedAt: inv.completionDate || inv.updatedAt || inv.endDate,
-                actualReturnUSD,
-                actualReturnBTC: inv.actualReturnBTC || 0,
-                profitUSD: parseFloat(profitUSD.toFixed(2)),
-                profitBTC: liveBtcPrice && liveBtcPrice > 0
-                    ? parseFloat((profitUSD / liveBtcPrice).toFixed(8))
-                    : 0,
-                btcPriceAtCompletion: inv.btcPriceAtCompletion || null
-            };
-        });
-
-        const totalPages = Math.max(1, Math.ceil(total / limit));
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                investments: enriched,
-                pagination: {
-                    currentPage: page,
-                    totalPages,
-                    totalItems: total,
-                    itemsPerPage: limit,
-                    hasNextPage: page < totalPages,
-                    hasPrevPage: page > 1
-                },
-                btcPrice: liveBtcPrice || null,
-                btcLogoUrl: getCryptoLogo('BTC'),
-                priceStale,
-                generatedAt: new Date().toISOString()
-            }
-        });
-
-    } catch (err) {
-        console.error('Error fetching completed investments:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to fetch completed investments'
-        });
-    }
-});
-
-/* ============================================================
- * GET /api/admin/investment/plans
- * ============================================================ */
-app.get('/api/admin/investment/plans', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const page = Math.max(1, parseInt(req.query.page) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
-        const skip = (page - 1) * limit;
-
-        const search = (req.query.search || '').trim();
-        const statusFilter = (req.query.status || 'all').toLowerCase();
-        const tierFilter = (req.query.tier || 'all').toLowerCase();
-
-        const query = {};
-        if (search) {
-            query.$or = [
-                { name: { $regex: search, $options: 'i' } },
-                { description: { $regex: search, $options: 'i' } },
-                { badge: { $regex: search, $options: 'i' } }
-            ];
-        }
-        if (statusFilter === 'active') query.isActive = true;
-        else if (statusFilter === 'inactive') query.isActive = false;
-        if (tierFilter !== 'all') query.tier = tierFilter;
-
-        const [plans, total] = await Promise.all([
-            Plan.find(query)
-                .sort({ sortOrder: 1, minAmount: 1 })
-                .skip(skip)
-                .limit(limit)
-                .lean(),
-            Plan.countDocuments(query)
-        ]);
-
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const btcLogoUrl = getCryptoLogo('BTC');
-
-        const enrichedPlans = plans.map(plan => {
-            const cycleFeePercent = resolveAdminCycleFeePercent(plan);
-            const durationHours = Number(plan.duration) || 0;
-            const cyclesPerMonth = calcCyclesPerMonthSafe(durationHours);
-            const minAmountUSD = Number(plan.minAmount) || 0;
-            const maxAmountUSD = Number(plan.maxAmount) || 0;
-            const percentage = Number(plan.percentage) || 0;
-
-            const minAmountBTC = liveBtcPrice && liveBtcPrice > 0 ? minAmountUSD / liveBtcPrice : 0;
-            const maxAmountBTC = liveBtcPrice && liveBtcPrice > 0 ? maxAmountUSD / liveBtcPrice : 0;
-
-            const minNetPrincipal = minAmountUSD * (1 - cycleFeePercent / 100);
-            const maxNetPrincipal = maxAmountUSD * (1 - cycleFeePercent / 100);
-
-            const minHashpower = liveBtcPrice && liveBtcPrice > 0
-                ? calculateHashpower(minNetPrincipal, percentage, durationHours, liveBtcPrice)
-                : 0;
-            const maxHashpower = liveBtcPrice && liveBtcPrice > 0
-                ? calculateHashpower(maxNetPrincipal, percentage, durationHours, liveBtcPrice)
-                : 0;
-
-            return {
-                _id: plan._id,
-                name: plan.name || 'Unnamed Plan',
-                description: plan.description || '',
-                badge: plan.badge || 'Standard',
-                tier: plan.tier || 'standard',
-
-                // Financial
-                percentage,
-                duration: durationHours,
-                cyclesPerMonth,
-                minAmount: minAmountUSD,
-                maxAmount: maxAmountUSD,
-                minAmountBTC: parseFloat(minAmountBTC.toFixed(8)),
-                maxAmountBTC: parseFloat(maxAmountBTC.toFixed(8)),
-                cycleFeePercent,
-
-                // Display / status
-                isActive: plan.isActive || false,
-                status: plan.isActive ? 'active' : 'inactive',
-                isPopular: plan.isPopular || false,
-                isBestValue: plan.isBestValue || false,
-                sortOrder: plan.sortOrder || 0,
-
-                // Colors / branding
-                color: plan.color || '#2ECC71',
-                lightColor: plan.lightColor || '#58D68D',
-                bgColor: plan.bgColor || 'rgba(46, 204, 113, 0.12)',
-                borderColor: plan.borderColor || 'rgba(46, 204, 113, 0.3)',
-
-                features: Array.isArray(plan.features) ? plan.features : [],
-
-                // Auto-compound
-                allowAutoCompound: plan.allowAutoCompound !== false,
-                autoCompoundOptions: Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length
-                    ? plan.autoCompoundOptions
-                    : [1, 3, 6, 9, 12],
-                defaultAutoCompoundMonths: plan.defaultAutoCompoundMonths || 1,
-                minAutoCompoundMonths: plan.minAutoCompoundMonths || 1,
-                maxAutoCompoundMonths: plan.maxAutoCompoundMonths || 12,
-
-                // Hashrate
-                hashrateUnit: plan.hashrateUnit || 'TH/s',
-                hashrateDisplayOverride: plan.hashrateDisplayOverride || null,
-                minHashpower,
-                maxHashpower,
-
-                // Referral
-                referralBonus: plan.referralBonus || 0,
-
-                // Meta
-                videoUrl: plan.videoUrl || '',
-                createdAt: plan.createdAt,
-                updatedAt: plan.updatedAt,
-
-                // Legacy aliases used by older admin UI
-                dailyProfit: percentage,
-                totalProfit: percentage,
-
-                // BTC context
-                btcPrice: liveBtcPrice || null,
-                btcLogoUrl
-            };
-        });
-
-        const totalPages = Math.max(1, Math.ceil(total / limit));
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                plans: enrichedPlans,
-                pagination: {
-                    currentPage: page,
-                    totalPages,
-                    totalItems: total,
-                    itemsPerPage: limit,
-                    hasNextPage: page < totalPages,
-                    hasPrevPage: page > 1
-                },
-                btcPrice: liveBtcPrice || null,
-                btcLogoUrl
-            }
-        });
-
-    } catch (err) {
-        console.error('Error fetching investment plans:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to fetch investment plans'
-        });
-    }
-});
-
-/* ============================================================
- * GET /api/admin/investment/plans/:id
- * ============================================================ */
-app.get('/api/admin/investment/plans/:id', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Invalid plan ID'
-            });
-        }
-
-        const plan = await Plan.findById(id).lean();
-        if (!plan) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'Investment plan not found'
-            });
-        }
-
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const btcLogoUrl = getCryptoLogo('BTC');
-
-        const cycleFeePercent = resolveAdminCycleFeePercent(plan);
-        const durationHours = Number(plan.duration) || 0;
-        const cyclesPerMonth = calcCyclesPerMonthSafe(durationHours);
-        const minAmountUSD = Number(plan.minAmount) || 0;
-        const maxAmountUSD = Number(plan.maxAmount) || 0;
-        const percentage = Number(plan.percentage) || 0;
-
-        const minAmountBTC = liveBtcPrice && liveBtcPrice > 0 ? minAmountUSD / liveBtcPrice : 0;
-        const maxAmountBTC = liveBtcPrice && liveBtcPrice > 0 ? maxAmountUSD / liveBtcPrice : 0;
-
-        const minNetPrincipal = minAmountUSD * (1 - cycleFeePercent / 100);
-        const maxNetPrincipal = maxAmountUSD * (1 - cycleFeePercent / 100);
-
-        const minHashpower = liveBtcPrice && liveBtcPrice > 0
-            ? calculateHashpower(minNetPrincipal, percentage, durationHours, liveBtcPrice)
-            : 0;
-        const maxHashpower = liveBtcPrice && liveBtcPrice > 0
-            ? calculateHashpower(maxNetPrincipal, percentage, durationHours, liveBtcPrice)
-            : 0;
-
-        const formattedPlan = {
-            _id: plan._id,
-            name: plan.name || '',
-            description: plan.description || '',
-            badge: plan.badge || 'Standard',
-            tier: plan.tier || 'standard',
-
-            percentage,
-            duration: durationHours,
-            cyclesPerMonth,
-            minAmount: minAmountUSD,
-            maxAmount: maxAmountUSD,
-            minAmountBTC: parseFloat(minAmountBTC.toFixed(8)),
-            maxAmountBTC: parseFloat(maxAmountBTC.toFixed(8)),
-            cycleFeePercent,
-
-            isActive: plan.isActive || false,
-            status: plan.isActive ? 'active' : 'inactive',
-            isPopular: plan.isPopular || false,
-            isBestValue: plan.isBestValue || false,
-            sortOrder: plan.sortOrder || 0,
-
-            color: plan.color || '#2ECC71',
-            lightColor: plan.lightColor || '#58D68D',
-            bgColor: plan.bgColor || 'rgba(46, 204, 113, 0.12)',
-            borderColor: plan.borderColor || 'rgba(46, 204, 113, 0.3)',
-
-            features: Array.isArray(plan.features) ? plan.features : [],
-
-            allowAutoCompound: plan.allowAutoCompound !== false,
-            autoCompoundOptions: Array.isArray(plan.autoCompoundOptions) && plan.autoCompoundOptions.length
-                ? plan.autoCompoundOptions
-                : [1, 3, 6, 9, 12],
-            defaultAutoCompoundMonths: plan.defaultAutoCompoundMonths || 1,
-            minAutoCompoundMonths: plan.minAutoCompoundMonths || 1,
-            maxAutoCompoundMonths: plan.maxAutoCompoundMonths || 12,
-
-            hashrateUnit: plan.hashrateUnit || 'TH/s',
-            hashrateDisplayOverride: plan.hashrateDisplayOverride || null,
-            minHashpower,
-            maxHashpower,
-
-            referralBonus: plan.referralBonus || 0,
-            videoUrl: plan.videoUrl || '',
-
-            createdAt: plan.createdAt,
-            updatedAt: plan.updatedAt,
-
-            // Legacy aliases
-            dailyProfit: percentage,
-            totalProfit: percentage,
-
-            btcPrice: liveBtcPrice || null,
-            btcLogoUrl
-        };
-
-        res.status(200).json({
-            status: 'success',
-            data: { plan: formattedPlan }
-        });
-
-    } catch (err) {
-        console.error('Error fetching plan:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to fetch investment plan'
-        });
-    }
-});
-
-/* ============================================================
- * POST /api/admin/investment/plans
- * Create a new plan (full new-contract-model awareness)
- * ============================================================ */
-app.post('/api/admin/investment/plans', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const {
-            name,
-            description,
-            badge,
-            tier,
-            percentage,
-            dailyProfit,
-            totalProfit,
-            duration,
-            minAmount,
-            maxAmount,
-            status,
-            isActive,
-            isPopular,
-            isBestValue,
-            sortOrder,
-            color,
-            lightColor,
-            bgColor,
-            borderColor,
-            features,
-            allowAutoCompound,
-            autoCompoundOptions,
-            defaultAutoCompoundMonths,
-            minAutoCompoundMonths,
-            maxAutoCompoundMonths,
-            hashrateUnit,
-            hashrateDisplayOverride,
-            cycleFeePercent,
-            referralBonus,
-            videoUrl
-        } = req.body;
-
-        // ---- Required fields ----
-        const missing = [];
-        if (!name || !String(name).trim()) missing.push('name');
-        if (!description || !String(description).trim()) missing.push('description');
-        if (minAmount === undefined || minAmount === null || minAmount === '') missing.push('minAmount');
-        if (maxAmount === undefined || maxAmount === null || maxAmount === '') missing.push('maxAmount');
-        if (duration === undefined || duration === null || duration === '') missing.push('duration');
-
-        if (missing.length > 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Missing required fields: ${missing.join(', ')}`
-            });
-        }
-
-        // Duplicate name check
-        const existingPlan = await Plan.findOne({ name: String(name).trim() });
-        if (existingPlan) {
-            return res.status(409).json({
-                status: 'fail',
-                message: 'A plan with this name already exists'
-            });
-        }
-
-        // ---- Resolve percentage ----
-        const numericPercentage = parseFloat(percentage ?? dailyProfit ?? totalProfit ?? 0);
-        if (isNaN(numericPercentage) || numericPercentage < 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Plan percentage must be a valid non-negative number'
-            });
-        }
-
-        const numericDuration = parseInt(duration);
-        if (isNaN(numericDuration) || numericDuration <= 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Duration must be a positive integer (hours)'
-            });
-        }
-
-        const numericMin = parseFloat(minAmount);
-        const numericMax = parseFloat(maxAmount);
-        if (isNaN(numericMin) || numericMin < 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Minimum amount must be a valid non-negative number'
-            });
-        }
-        if (isNaN(numericMax) || numericMax <= numericMin) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Maximum amount must be greater than the minimum amount'
-            });
-        }
-
-        // ---- Resolve auto-compound settings ----
-        const allowAuto = allowAutoCompound !== false;
-        const rawOptions = Array.isArray(autoCompoundOptions) && autoCompoundOptions.length
-            ? autoCompoundOptions
-            : [1, 3, 6, 9, 12];
-        const cleanedOptions = rawOptions
-            .map(v => parseInt(v))
-            .filter(v => Number.isInteger(v) && v >= 1 && v <= 24);
-
-        const defaultMonths = Number.isInteger(parseInt(defaultAutoCompoundMonths))
-            ? parseInt(defaultAutoCompoundMonths)
-            : (cleanedOptions[0] || 1);
-
-        const minMonths = Number.isInteger(parseInt(minAutoCompoundMonths))
-            ? parseInt(minAutoCompoundMonths)
-            : (cleanedOptions[0] || 1);
-
-        const maxMonths = Number.isInteger(parseInt(maxAutoCompoundMonths))
-            ? parseInt(maxAutoCompoundMonths)
-            : (cleanedOptions[cleanedOptions.length - 1] || 12);
-
-        // ---- Resolve cycle fee ----
-        const parsedCycleFee = cycleFeePercent === undefined || cycleFeePercent === null || cycleFeePercent === ''
-            ? null
-            : parseFloat(cycleFeePercent);
-        const finalCycleFee = (parsedCycleFee !== null && !isNaN(parsedCycleFee) && parsedCycleFee >= 0)
-            ? parsedCycleFee
-            : null; // null → use global CYCLE_FEE_PERCENT
-
-        // ---- Resolve status ----
-        const resolvedStatus = (status !== undefined && status !== null)
-            ? String(status).toLowerCase() === 'active'
-            : Boolean(isActive);
-
-        // ---- Resolve colors ----
-        const finalColor = color || '#2ECC71';
-        const finalLightColor = lightColor || '#58D68D';
-        const finalBgColor = bgColor || 'rgba(46, 204, 113, 0.12)';
-        const finalBorderColor = borderColor || 'rgba(46, 204, 113, 0.3)';
-
-        const newPlan = await Plan.create({
-            name: String(name).trim(),
-            description: String(description).trim(),
-            badge: badge || 'Standard',
-            tier: tier || 'standard',
-
-            percentage: numericPercentage,
-            duration: numericDuration,
-
-            minAmount: numericMin,
-            maxAmount: numericMax,
-
-            isActive: resolvedStatus,
-            isPopular: Boolean(isPopular),
-            isBestValue: Boolean(isBestValue),
-            sortOrder: Number.isInteger(parseInt(sortOrder)) ? parseInt(sortOrder) : 0,
-
-            color: finalColor,
-            lightColor: finalLightColor,
-            bgColor: finalBgColor,
-            borderColor: finalBorderColor,
-
-            features: Array.isArray(features)
-                ? features.filter(f => typeof f === 'string' && f.trim()).map(f => f.trim())
-                : [],
-
-            allowAutoCompound: allowAuto,
-            autoCompoundOptions: cleanedOptions.length ? cleanedOptions : [1, 3, 6, 9, 12],
-            defaultAutoCompoundMonths: defaultMonths,
-            minAutoCompoundMonths: minMonths,
-            maxAutoCompoundMonths: maxMonths,
-
-            hashrateUnit: hashrateUnit || 'TH/s',
-            hashrateDisplayOverride: hashrateDisplayOverride || null,
-            cycleFeePercent: finalCycleFee,
-
-            referralBonus: (referralBonus !== undefined && referralBonus !== null && !isNaN(parseFloat(referralBonus)))
-                ? parseFloat(referralBonus)
-                : 5,
-
-            videoUrl: videoUrl || ''
-        });
-
-        await logActivity(
-            'investment_plan_created',
-            'Plan',
-            newPlan._id,
-            req.admin._id,
-            'Admin',
-            req,
-            {
-                planName: newPlan.name,
-                minAmount: newPlan.minAmount,
-                maxAmount: newPlan.maxAmount,
-                duration: newPlan.duration,
-                percentage: newPlan.percentage,
-                tier: newPlan.tier,
-                badge: newPlan.badge
-            }
-        );
-
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const btcLogoUrl = getCryptoLogo('BTC');
-
-        res.status(201).json({
-            status: 'success',
-            message: 'Investment plan created successfully',
-            data: {
-                plan: {
-                    _id: newPlan._id,
-                    name: newPlan.name,
-                    description: newPlan.description,
-                    badge: newPlan.badge,
-                    tier: newPlan.tier,
-                    percentage: newPlan.percentage,
-                    duration: newPlan.duration,
-                    minAmount: newPlan.minAmount,
-                    maxAmount: newPlan.maxAmount,
-                    status: newPlan.isActive ? 'active' : 'inactive',
-                    isActive: newPlan.isActive,
-                    color: newPlan.color,
-                    lightColor: newPlan.lightColor,
-                    bgColor: newPlan.bgColor,
-                    borderColor: newPlan.borderColor,
-                    features: newPlan.features,
-                    allowAutoCompound: newPlan.allowAutoCompound,
-                    autoCompoundOptions: newPlan.autoCompoundOptions,
-                    hashrateUnit: newPlan.hashrateUnit,
-                    cycleFeePercent: newPlan.cycleFeePercent,
-                    referralBonus: newPlan.referralBonus,
-                    btcPrice: liveBtcPrice || null,
-                    btcLogoUrl
-                }
-            }
-        });
-
-    } catch (err) {
-        console.error('Error creating investment plan:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to create investment plan'
-        });
-    }
-});
-
-/* ============================================================
- * PUT /api/admin/investment/plans/:id
- * Update a plan (full new-contract-model awareness, partial updates)
- * ============================================================ */
-app.put('/api/admin/investment/plans/:id', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Invalid plan ID'
-            });
-        }
-
-        const existingPlan = await Plan.findById(id);
-        if (!existingPlan) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'Investment plan not found'
-            });
-        }
-
-        const {
-            name,
-            description,
-            badge,
-            tier,
-            percentage,
-            dailyProfit,
-            totalProfit,
-            duration,
-            minAmount,
-            maxAmount,
-            status,
-            isActive,
-            isPopular,
-            isBestValue,
-            sortOrder,
-            color,
-            lightColor,
-            bgColor,
-            borderColor,
-            features,
-            allowAutoCompound,
-            autoCompoundOptions,
-            defaultAutoCompoundMonths,
-            minAutoCompoundMonths,
-            maxAutoCompoundMonths,
-            hashrateUnit,
-            hashrateDisplayOverride,
-            cycleFeePercent,
-            referralBonus,
-            videoUrl
-        } = req.body;
-
-        const updateData = {};
-
-        // ---- Simple string / status fields ----
-        if (name !== undefined && String(name).trim()) {
-            const trimmedName = String(name).trim();
-            const dupe = await Plan.findOne({ name: trimmedName, _id: { $ne: id } });
-            if (dupe) {
-                return res.status(409).json({
-                    status: 'fail',
-                    message: 'Another plan already uses this name'
-                });
-            }
-            updateData.name = trimmedName;
-        }
-        if (description !== undefined) updateData.description = String(description).trim();
-        if (badge !== undefined) updateData.badge = badge;
-        if (tier !== undefined) updateData.tier = tier;
-        if (isPopular !== undefined) updateData.isPopular = Boolean(isPopular);
-        if (isBestValue !== undefined) updateData.isBestValue = Boolean(isBestValue);
-        if (sortOrder !== undefined && Number.isInteger(parseInt(sortOrder))) {
-            updateData.sortOrder = parseInt(sortOrder);
-        }
-        if (hashrateUnit !== undefined) updateData.hashrateUnit = hashrateUnit;
-        if (hashrateDisplayOverride !== undefined) updateData.hashrateDisplayOverride = hashrateDisplayOverride;
-        if (videoUrl !== undefined) updateData.videoUrl = videoUrl;
-
-        // ---- Percentage (accept dailyProfit / totalProfit aliases) ----
-        const rawPercentage = percentage ?? dailyProfit ?? totalProfit;
-        if (rawPercentage !== undefined) {
-            const p = parseFloat(rawPercentage);
-            if (isNaN(p) || p < 0) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'Plan percentage must be a valid non-negative number'
-                });
-            }
-            updateData.percentage = p;
-        }
-
-        // ---- Duration ----
-        if (duration !== undefined) {
-            const d = parseInt(duration);
-            if (isNaN(d) || d <= 0) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'Duration must be a positive integer (hours)'
-                });
-            }
-            updateData.duration = d;
-        }
-
-        // ---- Min / Max amounts ----
-        const nextMin = minAmount !== undefined ? parseFloat(minAmount) : existingPlan.minAmount;
-        const nextMax = maxAmount !== undefined ? parseFloat(maxAmount) : existingPlan.maxAmount;
-        if (minAmount !== undefined) {
-            if (isNaN(nextMin) || nextMin < 0) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'Minimum amount must be a valid non-negative number'
-                });
-            }
-            updateData.minAmount = nextMin;
-        }
-        if (maxAmount !== undefined) {
-            if (isNaN(nextMax) || nextMax <= nextMin) {
-                return res.status(400).json({
-                    status: 'fail',
-                    message: 'Maximum amount must be greater than the minimum amount'
-                });
-            }
-            updateData.maxAmount = nextMax;
-        }
-
-        // ---- Status ----
-        if (status !== undefined) {
-            updateData.isActive = String(status).toLowerCase() === 'active';
-        } else if (isActive !== undefined) {
-            updateData.isActive = Boolean(isActive);
-        }
-
-        // ---- Colors / branding ----
-        if (color !== undefined) updateData.color = color;
-        if (lightColor !== undefined) updateData.lightColor = lightColor;
-        if (bgColor !== undefined) updateData.bgColor = bgColor;
-        if (borderColor !== undefined) updateData.borderColor = borderColor;
-
-        // ---- Features ----
-        if (features !== undefined) {
-            updateData.features = Array.isArray(features)
-                ? features.filter(f => typeof f === 'string' && f.trim()).map(f => f.trim())
-                : [];
-        }
-
-        // ---- Auto-compound settings ----
-        if (allowAutoCompound !== undefined) {
-            updateData.allowAutoCompound = Boolean(allowAutoCompound);
-        }
-        if (autoCompoundOptions !== undefined) {
-            const cleaned = Array.isArray(autoCompoundOptions)
-                ? autoCompoundOptions.map(v => parseInt(v)).filter(v => Number.isInteger(v) && v >= 1 && v <= 24)
-                : [];
-            updateData.autoCompoundOptions = cleaned.length ? cleaned : [1, 3, 6, 9, 12];
-        }
-        if (defaultAutoCompoundMonths !== undefined) {
-            const v = parseInt(defaultAutoCompoundMonths);
-            if (Number.isInteger(v) && v >= 1) updateData.defaultAutoCompoundMonths = v;
-        }
-        if (minAutoCompoundMonths !== undefined) {
-            const v = parseInt(minAutoCompoundMonths);
-            if (Number.isInteger(v) && v >= 1) updateData.minAutoCompoundMonths = v;
-        }
-        if (maxAutoCompoundMonths !== undefined) {
-            const v = parseInt(maxAutoCompoundMonths);
-            if (Number.isInteger(v) && v >= 1) updateData.maxAutoCompoundMonths = v;
-        }
-
-        // ---- Cycle fee (null → use global default) ----
-        if (cycleFeePercent !== undefined) {
-            if (cycleFeePercent === null || cycleFeePercent === '') {
-                updateData.cycleFeePercent = null;
-            } else {
-                const f = parseFloat(cycleFeePercent);
-                if (!isNaN(f) && f >= 0 && f <= 100) {
-                    updateData.cycleFeePercent = f;
-                } else {
-                    return res.status(400).json({
-                        status: 'fail',
-                        message: 'Cycle fee must be between 0 and 100 (or null for default)'
-                    });
-                }
-            }
-        }
-
-        // ---- Referral bonus ----
-        if (referralBonus !== undefined) {
-            const r = parseFloat(referralBonus);
-            if (!isNaN(r) && r >= 0) updateData.referralBonus = r;
-        }
-
-        const updatedPlan = await Plan.findByIdAndUpdate(id, updateData, {
-            new: true,
-            runValidators: true
-        });
-
-        await logActivity(
-            'investment_plan_updated',
-            'Plan',
-            updatedPlan._id,
-            req.admin._id,
-            'Admin',
-            req,
-            {
-                planName: updatedPlan.name,
-                changes: updateData
-            }
-        );
-
-        const liveBtcPrice = await tryGetLiveBtcPrice();
-        const btcLogoUrl = getCryptoLogo('BTC');
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Investment plan updated successfully',
-            data: {
-                plan: {
-                    _id: updatedPlan._id,
-                    name: updatedPlan.name,
-                    description: updatedPlan.description,
-                    badge: updatedPlan.badge,
-                    tier: updatedPlan.tier,
-                    percentage: updatedPlan.percentage,
-                    duration: updatedPlan.duration,
-                    minAmount: updatedPlan.minAmount,
-                    maxAmount: updatedPlan.maxAmount,
-                    status: updatedPlan.isActive ? 'active' : 'inactive',
-                    isActive: updatedPlan.isActive,
-                    isPopular: updatedPlan.isPopular,
-                    isBestValue: updatedPlan.isBestValue,
-                    sortOrder: updatedPlan.sortOrder,
-                    color: updatedPlan.color,
-                    lightColor: updatedPlan.lightColor,
-                    bgColor: updatedPlan.bgColor,
-                    borderColor: updatedPlan.borderColor,
-                    features: updatedPlan.features,
-                    allowAutoCompound: updatedPlan.allowAutoCompound,
-                    autoCompoundOptions: updatedPlan.autoCompoundOptions,
-                    defaultAutoCompoundMonths: updatedPlan.defaultAutoCompoundMonths,
-                    minAutoCompoundMonths: updatedPlan.minAutoCompoundMonths,
-                    maxAutoCompoundMonths: updatedPlan.maxAutoCompoundMonths,
-                    hashrateUnit: updatedPlan.hashrateUnit,
-                    hashrateDisplayOverride: updatedPlan.hashrateDisplayOverride,
-                    cycleFeePercent: updatedPlan.cycleFeePercent,
-                    referralBonus: updatedPlan.referralBonus,
-                    videoUrl: updatedPlan.videoUrl,
-                    updatedAt: updatedPlan.updatedAt,
-                    dailyProfit: updatedPlan.percentage,
-                    totalProfit: updatedPlan.percentage,
-                    btcPrice: liveBtcPrice || null,
-                    btcLogoUrl
-                }
-            }
-        });
-
-    } catch (err) {
-        console.error('Error updating investment plan:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to update investment plan'
-        });
-    }
-});
-
-/* ============================================================
- * DELETE /api/admin/investment/plans/:id
- * ============================================================ */
-app.delete('/api/admin/investment/plans/:id', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Invalid plan ID'
-            });
-        }
-
-        const plan = await Plan.findById(id);
-        if (!plan) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'Investment plan not found'
-            });
-        }
-
-        // Refuse deletion if active contracts reference this plan
-        const activeInvestments = await Investment.countDocuments({
-            plan: id,
-            status: 'active'
-        });
-
-        if (activeInvestments > 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Cannot delete plan. ${activeInvestments} active investment(s) are using this plan.`
-            });
-        }
-
-        await Plan.findByIdAndDelete(id);
-
-        await logActivity(
-            'investment_plan_deleted',
-            'Plan',
-            id,
-            req.admin._id,
-            'Admin',
-            req,
-            {
-                planName: plan.name,
-                minAmount: plan.minAmount,
-                maxAmount: plan.maxAmount,
-                duration: plan.duration
-            }
-        );
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Investment plan deleted successfully'
-        });
-
-    } catch (err) {
-        console.error('Error deleting investment plan:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to delete investment plan'
-        });
-    }
-});
-
-/* ============================================================
- * POST /api/admin/investments/:id/cancel
- * Cancel an active contract — refunds to matured wallet at
- * the live BTC price, records cancellation metadata, and logs it.
- * ============================================================ */
-app.post('/api/admin/investments/:id/cancel', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { reason } = req.body;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Invalid investment ID'
-            });
-        }
-
-        const investment = await Investment.findById(id)
-            .populate('user', 'firstName lastName email balances')
-            .populate('plan', 'name percentage duration badge tier color cycleFeePercent hashrateUnit');
-
-        if (!investment) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'Investment not found'
-            });
-        }
-
-        if (investment.status !== 'active') {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Cannot cancel investment with status: ${investment.status}. Only active investments can be cancelled.`
-            });
-        }
-
-        const user = investment.user;
-        if (!user) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'User not found for this investment'
-            });
-        }
-
-        // ---- Fetch live BTC price for the refund ----
-        let realBTCPrice = await tryGetLiveBtcPrice();
-        if (!realBTCPrice || realBTCPrice <= 0) {
-            realBTCPrice = investment.btcPriceAtInvestment || 0;
-        }
-        if (!realBTCPrice || realBTCPrice <= 0) {
-            return res.status(503).json({
-                status: 'error',
-                message: 'Unable to fetch current BTC price and no locked price available. Please try again later.'
-            });
-        }
-
-        // ---- Compute refund ----
-        // Refund = the net principal currently sitting in the active wallet for this contract.
-        // monthStartingPrincipalUSD/BTC represent the current cycle's net principal.
-        const refundAmountUSD = Number(investment.monthStartingPrincipalUSD)
-            || Number(investment.amount)
-            || 0;
-        const refundAmountBTC = Number(investment.monthStartingPrincipalBTC)
-            || Number(investment.amountBTC)
-            || (realBTCPrice > 0 ? refundAmountUSD / realBTCPrice : 0);
-
-        if (refundAmountUSD <= 0) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'Contract has no refundable principal'
-            });
-        }
-
-        // ---- Update user balances ----
-        if (!user.balances) {
-            user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-        }
-        if (!user.balances.matured) user.balances.matured = new Map();
-        if (!user.balances.active) user.balances.active = new Map();
-
-        // Add refund to matured wallet
-        const beforeMaturedBTC = user.balances.matured.get('btc') || 0;
-        const beforeMaturedUSD = user.balances.matured.get('usd') || 0;
-
-        const newMaturedBTC = beforeMaturedBTC + refundAmountBTC;
-        const newMaturedUSD = newMaturedBTC * realBTCPrice;
-
-        user.balances.matured.set('btc', newMaturedBTC);
-        user.balances.matured.set('usd', newMaturedUSD);
-
-        // Remove the refunded principal from active wallet
-        const beforeActiveBTC = user.balances.active.get('btc') || 0;
-        const newActiveBTC = beforeActiveBTC - refundAmountBTC;
-        if (newActiveBTC <= 0.00000001) {
-            user.balances.active.delete('btc');
-        } else {
-            user.balances.active.set('btc', newActiveBTC);
-        }
-
-        const newActiveUSD = newActiveBTC * realBTCPrice;
-        if (newActiveUSD <= 0.01) {
-            user.balances.active.delete('usd');
-        } else {
-            user.balances.active.set('usd', newActiveUSD);
-        }
-
-        await user.save();
-
-        // ---- Mark the contract as cancelled ----
-        investment.status = 'cancelled';
-        investment.completionDate = new Date();
-        investment.adminNotes = reason || `Cancelled by admin: ${req.admin.name}`;
-        investment.cancellationBTCPrice = realBTCPrice;
-        investment.cancellationBTCAmount = refundAmountBTC;
-        investment.isAutoCompoundActive = false;
-
-        await investment.save();
-
-        // ---- Refund transaction ----
-        const refundReference = `REFUND-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-
-        const refundTransaction = await Transaction.create({
-            user: user._id,
-            type: 'refund',
-            amount: refundAmountUSD,
-            asset: 'BTC',
-            assetAmount: refundAmountBTC,
-            currency: 'USD',
-            status: 'completed',
-            method: 'INTERNAL',
-            reference: refundReference,
-            details: {
-                type: 'investment_cancellation_refund',
-                investmentId: investment._id,
-                planName: investment.plan?.name || 'Unknown Plan',
-                originalAmountUSD: investment.amount,
-                originalAmountBTC: investment.amountBTC,
-                refundAmountUSD,
-                refundAmountBTC,
-                btcPriceAtCancellation: realBTCPrice,
-                cancelledBy: req.admin.name,
-                cancellationReason: reason || 'Cancelled by admin',
-                targetWallet: 'matured',
-                isRefund: true,
-                cycleInfo: {
-                    currentCycle: investment.currentCycle,
-                    currentMonth: investment.currentMonth,
-                    cyclesPerMonth: investment.cyclesPerMonth,
-                    totalCycles: investment.totalCycles
-                }
-            },
-            fee: 0,
-            netAmount: refundAmountUSD,
-            processedBy: req.admin._id,
-            processedAt: new Date(),
-            exchangeRateAtTime: realBTCPrice,
-            adminNotes: `Investment cancelled by ${req.admin.name}. Refund processed to matured wallet.`
-        });
-
-        // ---- Refund creation fee (if any) ----
-        if (investment.investmentFee && investment.investmentFee > 0) {
-            try {
-                await PlatformRevenue.create({
-                    source: 'refund',
-                    amount: investment.investmentFee,
-                    currency: 'USD',
-                    transactionId: refundTransaction._id,
-                    investmentId: investment._id,
-                    userId: user._id,
-                    description: `REFUND: Investment fee for cancelled ${investment.plan?.name} investment`,
-                    metadata: {
-                        type: 'refund',
-                        originalInvestmentId: investment._id,
-                        originalFeeAmount: investment.investmentFee,
-                        originalFeeBTC: investment.investmentFeeBTC,
-                        cancelledBy: req.admin.name,
-                        cancellationReason: reason || 'Cancelled by admin',
-                        isRefund: true,
-                        reference: refundReference
-                    },
-                    recordedAt: new Date()
-                });
-            } catch (feeError) {
-                console.error('Failed to record fee refund:', feeError);
-            }
-        }
-
-        // ---- Email (best-effort) ----
-        try {
-            const cryptoLogoUrl = getCryptoLogo('BTC');
-            const formattedRefundBTC = refundAmountBTC.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-            const formattedRefundUSD = refundAmountUSD.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedBTCPrice = realBTCPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const formattedOriginalAmount = investment.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            const planName = investment.plan?.name || 'your investment plan';
-
-            const emailHtml = `
-                <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                    <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                        <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                        <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                    </div>
-                    <div style="padding: 30px; background: #FFFFFF;">
-                        <div style="background: #FEF2F2; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                            <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%; margin-bottom: 8px;">
-                            <h2 style="color: #F7A600; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">INVESTMENT CANCELLED</h2>
-                            <p style="color: #92400E; font-size: 13px; margin: 0;">Your mining contract has been cancelled</p>
-                        </div>
-
-                        <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                        <p style="color: #333333; line-height: 1.6;">Your mining contract in the <strong>${planName}</strong> plan has been cancelled by our administration team.</p>
-
-                        <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                            <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                                <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                                <div>
-                                    <div style="font-weight: bold; font-size: 18px; color: #10B981;">+ ${formattedRefundBTC} BTC</div>
-                                    <div style="color: #64748B; font-size: 12px;">≈ $${formattedRefundUSD} USD</div>
-                                </div>
-                            </div>
-                            <table style="width: 100%; border-collapse: collapse;">
-                                <tr><td style="padding: 8px 0;"><strong>Plan:</strong></td><td style="padding: 8px 0; text-align: right;">${planName}</td></tr>
-                                <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Original Investment:</strong></td><td style="padding: 8px 0; text-align: right;">$${formattedOriginalAmount} USD</td></tr>
-                                <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Refund:</strong></td><td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">+ ${formattedRefundBTC} BTC (≈ $${formattedRefundUSD})</td></tr>
-                                <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>BTC Price:</strong></td><td style="padding: 8px 0; text-align: right;">1 BTC = $${formattedBTCPrice}</td></tr>
-                                <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Wallet Credited:</strong></td><td style="padding: 8px 0; text-align: right;">Matured Wallet</td></tr>
-                            </table>
-                        </div>
-
-                        ${reason ? `<div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;"><p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">Cancellation Reason</p><p style="color: #78350F; margin: 0; font-size: 14px;">${reason}</p></div>` : ''}
-
-                        <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${new Date().toLocaleString()}</p>
-                    </div>
-                    <div style="text-align: center; padding: 20px; background: #0B0E11;">
-                        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                    </div>
-                </div>
-            `;
-
-            await infoTransporter.sendMail({
-                from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-                to: user.email,
-                subject: `⛔ Investment Cancelled - ₿itHash Capital`,
-                html: emailHtml
-            });
-        } catch (emailErr) {
-            console.error('Failed to send cancellation email:', emailErr);
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: `Investment cancelled successfully. ${refundAmountBTC.toFixed(8)} BTC (≈ $${refundAmountUSD.toLocaleString()}) refunded to matured wallet.`,
-            data: {
-                investment: {
-                    _id: investment._id,
-                    status: investment.status,
-                    cancelledAt: investment.completionDate,
-                    planName: investment.plan?.name || 'Unknown Plan'
-                },
-                refund: {
-                    amountBTC: refundAmountBTC,
-                    amountUSD: refundAmountUSD,
-                    btcPrice: realBTCPrice,
-                    walletType: 'matured',
-                    reference: refundReference,
-                    isRefund: true
-                },
-                transaction: {
-                    id: refundTransaction._id,
-                    type: 'refund',
-                    reference: refundReference
-                },
-                btcLogoUrl: getCryptoLogo('BTC')
-            }
-        });
-
-    } catch (err) {
-        console.error('Error cancelling investment:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to cancel investment'
-        });
-    }
-});
 
 
 
