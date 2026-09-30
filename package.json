@@ -5,8 +5,8 @@
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node -r ./conversion-route-bootstrap.js -r ./tracking-body-safety.js -r ./app-download-bootstrap.js server.js",
-    "dev": "node -r ./conversion-route-bootstrap.js -r ./tracking-body-safety.js -r ./app-download-bootstrap.js ./node_modules/nodemon/bin/nodemon.js server.js",
+    "start": "node -r ./tracking-body-safety.js -r ./app-download-bootstrap.js server.js",
+    "dev": "node -r ./tracking-body-safety.js -r ./app-download-bootstrap.js ./node_modules/nodemon/bin/nodemon.js server.js",
     "worker": "node price-aggregator-worker.js",
     "worker:dev": "nodemon price-aggregator-worker.js",
     "test": "jest --watchAll --detectOpenHandles",
