@@ -13,7 +13,6 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const Redis = require('ioredis');require('dotenv').config();
-const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const moment = require('moment');
