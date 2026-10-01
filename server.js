@@ -21284,12 +21284,13 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
-
 app.post('/api/mining/calculator', async (req, res) => {
     const startTime = Date.now();
 
     try {
+        // ------------------------------------------------------------------
+        // 1. PARSE REQUEST BODY (must match frontend payload exactly)
+        // ------------------------------------------------------------------
         const {
             investmentAmount,
             hashrateTH,
@@ -21304,6 +21305,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                 ? 0
                 : parseInt(durationMonths, 10);
 
+        // ------------------------------------------------------------------
+        // 2. VALIDATION
+        // ------------------------------------------------------------------
         const errors = [];
 
         if (calculationType && !['investment', 'hashrate', 'duration', 'single_cycle'].includes(calculationType)) {
@@ -21341,6 +21345,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             });
         }
 
+        // ------------------------------------------------------------------
+        // 3. FETCH BTC PRICE (fail fast, no fallbacks)
+        // ------------------------------------------------------------------
         let btcPrice;
         try {
             btcPrice = await getCryptoPrice('BTC');
@@ -21363,6 +21370,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             });
         }
 
+        // ------------------------------------------------------------------
+        // 4. LOAD ACTIVE PLANS
+        // ------------------------------------------------------------------
         const plans = await Plan.find({ isActive: true }).sort({ minAmount: 1 }).lean();
 
         if (!plans || plans.length === 0) {
@@ -21373,11 +21383,16 @@ app.post('/api/mining/calculator', async (req, res) => {
             });
         }
 
-        // ---------- Resolve global electricity rates (once per request) ----------
+        // ------------------------------------------------------------------
+        // 5. RESOLVE GLOBAL ELECTRICITY RATES (once per request)
+        // ------------------------------------------------------------------
         const globalRates = await resolveElectricityRates(null);
 
         const btcLogoUrl = getCryptoLogo('BTC');
 
+        // ------------------------------------------------------------------
+        // 6. FORMATTING HELPERS
+        // ------------------------------------------------------------------
         const formatUSD = (value) => {
             const n = Number(value);
             if (!Number.isFinite(n)) return '$0.00';
@@ -21393,11 +21408,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             return n.toFixed(8);
         };
 
-        /**
-         * Structured money object used everywhere in the response.
-         * The frontend can read either the nested shape (principal.btc)
-         * OR the flat shape (principalBTC) — both are always present.
-         */
         const buildMoney = (btcValue, usdValue) => {
             const btc = Number.isFinite(Number(btcValue)) ? Number(btcValue) : 0;
             const usd = Number.isFinite(Number(usdValue)) ? Number(usdValue) : 0;
@@ -21420,11 +21430,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             return CYCLE_FEE_PERCENT;
         };
 
-        /**
-         * Resolve per-plan electricity rates using:
-         *   plan override → global SystemSettings → ELEC_FALLBACK
-         * Returns the rate bundle the calculator uses to compute power cost.
-         */
         const resolvePlanRates = (plan) => {
             const baseOverride = Number(plan && plan.electricityRateBaseUSDPerKWh);
             const demandOverride = Number(plan && plan.electricityRateDemandUSDPerKWh);
@@ -21450,10 +21455,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         };
 
-        /**
-         * Compute electricity cost for a given hashpower over a duration.
-         * Uses wall power = hashpower × J/TH × derating.
-         */
         const computePowerCostUSD = (hashpowerTH, joulesPerTH, durationHours, rates) => {
             if (!hashpowerTH || hashpowerTH <= 0) return 0;
             if (!joulesPerTH || joulesPerTH <= 0) return 0;
@@ -21464,15 +21465,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             return kwh * rates.rateAllInUSDPerKWh;
         };
 
-        /**
-         * Every projection must expose these four facts:
-         *   1. energyEfficiency (J/TH)     — hardware descriptor
-         *   2. powerCostPerCycle            — electricity fee per mining cycle (USD + BTC)
-         *   3. electricityRate              — base / demand / all-in USD per kWh
-         *   4. electricityFee               — total electricity fee for the projection (USD + BTC)
-         *
-         * `buildElectricityBlock` produces this contract shape consistently.
-         */
         const buildElectricityBlock = (hashpowerTH, plan, durationHours, rates, cycles) => {
             const jPerTH = Number(plan.joulesPerTH) || 15.0;
             const perCycleUSD = computePowerCostUSD(hashpowerTH, jPerTH, durationHours, rates);
@@ -21482,17 +21474,14 @@ app.post('/api/mining/calculator', async (req, res) => {
             const kwhPerCycle = (hashpowerTH * jPerTH * rates.wallPowerDerating * durationHours) / 1000;
 
             return {
-                // ---- Hardware identity ----
                 hardwareModel: plan.hardwareModel || '',
                 hardwareVendor: plan.hardwareVendor || '',
 
-                // ---- (1) Energy efficiency ----
                 energyEfficiency: {
                     joulesPerTH: jPerTH,
                     label: `${jPerTH.toFixed(1)} J/TH`
                 },
 
-                // ---- (2) Power cost per mining cycle ----
                 powerCostPerCycle: {
                     usd: parseFloat(perCycleUSD.toFixed(2)),
                     usdFormatted: formatUSD(perCycleUSD),
@@ -21501,7 +21490,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                     display: `${formatUSD(perCycleUSD)} / cycle`
                 },
 
-                // ---- (3) Electricity rate ----
                 electricityRate: {
                     baseUSDPerKWh: rates.rateBaseUSDPerKWh,
                     demandUSDPerKWh: rates.rateDemandUSDPerKWh,
@@ -21509,7 +21497,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                     display: `$${rates.rateAllInUSDPerKWh.toFixed(3)}/kWh`
                 },
 
-                // ---- (4) Total electricity fee for the projection ----
                 electricityFee: {
                     usd: parseFloat(totalUSD.toFixed(2)),
                     usdFormatted: formatUSD(totalUSD),
@@ -21518,13 +21505,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                     display: `${formatUSD(totalUSD)} total`
                 },
 
-                // ---- Supporting fields ----
                 wallPowerDerating: rates.wallPowerDerating,
                 durationHours,
                 cycles: cycles || 1,
                 kwhPerCycle: parseFloat(kwhPerCycle.toFixed(4)),
 
-                // ---- Backwards-compatible flat aliases ----
+                // Flat aliases for backwards compatibility
                 joulesPerTH: jPerTH,
                 rateBaseUSDPerKWh: rates.rateBaseUSDPerKWh,
                 rateDemandUSDPerKWh: rates.rateDemandUSDPerKWh,
@@ -21536,6 +21522,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         };
 
+        // ------------------------------------------------------------------
+        // 7. PROJECTION CALCULATORS
+        // ------------------------------------------------------------------
         const calculateSingleCycleProjection = (principalUSD, plan, currentBtcPrice) => {
             const planReturnDecimal = plan.percentage / 100;
             const durationHours = Number(plan.duration) || 0;
@@ -21565,7 +21554,6 @@ app.post('/api/mining/calculator', async (req, res) => {
             const totalProfitUSD = totalReturnUSD - netPrincipalUSD;
             const totalProfitBTC = totalReturnBTC - netPrincipalBTC;
 
-            // ---------- Electricity (single cycle = 1 charge) ----------
             const electricity = buildElectricityBlock(hashpower, plan, durationHours, rates, 1);
 
             const netAfterPowerUSD = totalProfitUSD - electricity.electricityFee.usd;
@@ -21584,13 +21572,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                 totalFees: buildMoney(firstCycleFeeBTC, firstCycleFeeUSD),
                 hashpower,
 
-                // ---- Canonical hardware + electricity descriptor ----
                 hardwareModel: plan.hardwareModel || '',
                 hardwareVendor: plan.hardwareVendor || '',
-                energyEfficiency: electricity.energyEfficiency,        // (1)
-                powerCostPerCycle: electricity.powerCostPerCycle,       // (2)
-                electricityRate: electricity.electricityRate,           // (3)
-                electricityFee: electricity.electricityFee,             // (4)
+                energyEfficiency: electricity.energyEfficiency,
+                powerCostPerCycle: electricity.powerCostPerCycle,
+                electricityRate: electricity.electricityRate,
+                electricityFee: electricity.electricityFee,
                 electricity,
 
                 totalReturn: buildMoney(totalReturnBTC, totalReturnUSD),
@@ -21695,8 +21682,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                 currentBtcPrice
             );
 
-            // Canonical electricity descriptor for the whole contract.
-            // Per-cycle electricity uses the same frozen rate + J/TH.
             const totalCycles = cyclesPerMonth * totalMonths;
             const electricity = buildElectricityBlock(
                 initialHashpower,
@@ -21822,13 +21807,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                 totalFees: buildMoney(totalFeesBTC, totalFeesUSD),
                 hashpower: initialHashpower,
 
-                // ---- Canonical hardware + electricity descriptor ----
                 hardwareModel: plan.hardwareModel || '',
                 hardwareVendor: plan.hardwareVendor || '',
-                energyEfficiency: electricity.energyEfficiency,        // (1)
-                powerCostPerCycle: electricity.powerCostPerCycle,       // (2)
-                electricityRate: electricity.electricityRate,           // (3)
-                electricityFee: electricity.electricityFee,             // (4)
+                energyEfficiency: electricity.energyEfficiency,
+                powerCostPerCycle: electricity.powerCostPerCycle,
+                electricityRate: electricity.electricityRate,
+                electricityFee: electricity.electricityFee,
                 electricity,
 
                 totalReturn: buildMoney(totalPayoutBTC, totalPayoutUSD),
@@ -21945,6 +21929,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         };
 
+        // ------------------------------------------------------------------
+        // 8. PLAN METRICS (shared across calc types)
+        // ------------------------------------------------------------------
         const planMetrics = plans.map(plan => {
             const costData = calculateCostPerTH(plan, btcPrice);
             const cyclesPerMonth = calculateCyclesPerMonth(plan.duration);
@@ -21962,14 +21949,12 @@ app.post('/api/mining/calculator', async (req, res) => {
                 hardwareModel: plan.hardwareModel || '',
                 hardwareVendor: plan.hardwareVendor || '',
 
-                // Energy efficiency
                 energyEfficiency: {
                     joulesPerTH: Number(plan.joulesPerTH) || 15.0,
                     label: `${(Number(plan.joulesPerTH) || 15.0).toFixed(1)} J/TH`
                 },
                 joulesPerTH: Number(plan.joulesPerTH) || 15.0,
 
-                // Electricity rate
                 electricityRate: {
                     baseUSDPerKWh: rates.rateBaseUSDPerKWh,
                     demandUSDPerKWh: rates.rateDemandUSDPerKWh,
@@ -21988,6 +21973,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         });
 
+        // ------------------------------------------------------------------
+        // 9. RESULT CONTAINER
+        // ------------------------------------------------------------------
         let result = {
             calculationType: calcType,
             timestamp: new Date().toISOString(),
@@ -22003,6 +21991,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             }
         };
 
+        // ------------------------------------------------------------------
+        // 10. CALC TYPE: single_cycle
+        // ------------------------------------------------------------------
         if (calcType === 'single_cycle') {
             if (hasHashrate) {
                 const requestedTH = parseFloat(hashrateTH);
@@ -22204,6 +22195,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             }
         }
 
+        // ------------------------------------------------------------------
+        // 11. CALC TYPE: hashrate
+        // ------------------------------------------------------------------
         else if (calcType === 'hashrate' && hasHashrate) {
             const requestedTH = parseFloat(hashrateTH);
             const monthsToUse = parsedDurationMonths;
@@ -22318,6 +22312,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         }
 
+        // ------------------------------------------------------------------
+        // 12. CALC TYPE: investment
+        // ------------------------------------------------------------------
         else if (calcType === 'investment' && hasAmount) {
             const amount = parseFloat(investmentAmount);
             const monthsToUse = parsedDurationMonths;
@@ -22468,6 +22465,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             }
         }
 
+        // ------------------------------------------------------------------
+        // 13. CALC TYPE: duration
+        // ------------------------------------------------------------------
         else if (calcType === 'duration' && parsedDurationMonths > 0) {
             const months = parsedDurationMonths;
 
@@ -22554,6 +22554,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         }
 
+        // ------------------------------------------------------------------
+        // 14. FALLBACK: overview
+        // ------------------------------------------------------------------
         else {
             const planComparisons = planMetrics.map(plan => {
                 const sourcePlan = plans.find(p => p._id.toString() === plan.planId);
@@ -22638,14 +22641,13 @@ app.post('/api/mining/calculator', async (req, res) => {
             };
         }
 
-        // ============================================================
-        // USER CONTEXT — CRITICAL
-        // ------------------------------------------------------------
-        // The fields `userId`, `email`, `firstName`, `lastName`,
-        // `fullName` are ALL carried forward so the activity log can
-        // attribute the request to the actual authenticated user
-        // instead of falling back to "Guest User".
-        // ============================================================
+        // ==================================================================
+        // 15. USER CONTEXT — MUST correctly attribute logged-in users
+        // ==================================================================
+        // The frontend sends the token in the Authorization header as:
+        //    Authorization: Bearer <jwtToken>
+        // The backend must parse it, verify it, and load the user.
+        // ==================================================================
         const authHeader = req.headers.authorization;
         const cookieToken = req.cookies && req.cookies.jwt;
         const token = (authHeader && authHeader.startsWith('Bearer '))
@@ -22687,8 +22689,8 @@ app.post('/api/mining/calculator', async (req, res) => {
 
                     result.userContext = {
                         isLoggedIn: true,
-                        userId: dbUser._id,                          // ← needed for log attribution
-                        email: dbUser.email || null,                 // ← needed for log attribution
+                        userId: dbUser._id,
+                        email: dbUser.email || null,
                         firstName: dbUser.firstName || null,
                         lastName: dbUser.lastName || null,
                         fullName: fullName || null,
@@ -22703,12 +22705,16 @@ app.post('/api/mining/calculator', async (req, res) => {
                     result.userContext = { isLoggedIn: false };
                 }
             } catch (authErr) {
+                console.error('Calculator auth error:', authErr.message);
                 result.userContext = { isLoggedIn: false };
             }
         } else {
             result.userContext = { isLoggedIn: false };
         }
 
+        // ==================================================================
+        // 16. ACTIVITY LOG — attributed to the real user when logged in
+        // ==================================================================
         try {
             const deviceInfo = await getUserDeviceInfo(req);
 
@@ -22762,13 +22768,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                 };
             }
 
-            // ============================================================
-            // ACTIVITY LOG — correctly attributed
-            // ------------------------------------------------------------
-            // `performedBy` MUST be the user's ObjectId, never the
-            // string name. `performedByEmail` is read from the
-            // userContext that now carries it.
-            // ============================================================
             await SystemLog.create({
                 action: isLoggedIn ? 'calculator_used' : 'calculator_used_guest',
                 entity: 'system',
@@ -22803,6 +22802,9 @@ app.post('/api/mining/calculator', async (req, res) => {
             console.error('Calculator activity log failed:', logErr.message);
         }
 
+        // ==================================================================
+        // 17. RESPONSE
+        // ==================================================================
         const processingTime = Date.now() - startTime;
 
         res.status(200).json({
