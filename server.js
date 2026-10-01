@@ -21282,7 +21282,6 @@ app.get('/api/plans', async (req, res) => {
 
 
 
-
 app.post('/api/mining/calculator', async (req, res) => {
     const startTime = Date.now();
 
@@ -22643,27 +22642,24 @@ app.post('/api/mining/calculator', async (req, res) => {
         // ==================================================================
         // 15. USER CONTEXT — CORRECTLY IDENTIFY LOGGED-IN USERS
         // ==================================================================
-        // The frontend sends the token in the Authorization header as:
-        //    Authorization: Bearer <jwtToken>
+        // ROOT CAUSE FIX:
+        //   User.findById(...).lean() returns a PLAIN OBJECT, not a Mongoose
+        //   document. Mongoose Map fields (balances.main, balances.matured)
+        //   are serialized by lean() to plain objects that DO NOT have a
+        //   .entries() method. The previous code called
+        //       dbUser.balances.main.entries()
+        //   which throws "entries is not a function", gets swallowed by the
+        //   surrounding try/catch, and silently downgrades the user to guest.
         //
-        // This block:
-        //   1. Extracts the token robustly (handles case variations, whitespace,
-        //      and missing req.cookies).
-        //   2. Verifies the JWT.
-        //   3. Loads the user document.
-        //   4. Sets result.userContext.isLoggedIn = true ONLY when a real user
-        //      is found; otherwise stays false (guest).
-        //   5. Logs exactly why a token was rejected so misidentification is
-        //      never silent again.
+        //   Fix: use safeEntries() which handles both a Mongoose Map AND a
+        //   lean plain object.
         // ==================================================================
         let authToken = null;
         let authSource = 'none';
 
-        // 1a. Try Authorization header (primary method used by index.html)
+        // 1a. Authorization header (primary method used by index.html)
         if (req.headers && typeof req.headers.authorization === 'string') {
             const rawAuth = req.headers.authorization.trim();
-            // Accept both "Bearer <token>" and "bearer <token>" (case-insensitive),
-            // and tolerate extra whitespace.
             const bearerMatch = rawAuth.match(/^Bearer\s+(.+)$/i);
             if (bearerMatch && bearerMatch[1]) {
                 authToken = bearerMatch[1].trim();
@@ -22671,14 +22667,22 @@ app.post('/api/mining/calculator', async (req, res) => {
             }
         }
 
-        // 1b. Fallback: httpOnly cookie (safe guard for missing cookieParser)
+        // 1b. Fallback: httpOnly cookie (only if cookieParser is mounted)
         if (!authToken && req.cookies && typeof req.cookies.jwt === 'string' && req.cookies.jwt.trim()) {
             authToken = req.cookies.jwt.trim();
             authSource = 'cookie';
         }
 
-        // 1c. Default result: guest until proven otherwise
+        // Default: guest until proven otherwise
         result.userContext = { isLoggedIn: false, authSource };
+
+        // Helper: iterate a Mongoose Map OR a lean() plain object safely
+        const safeEntries = (container) => {
+            if (!container) return [];
+            if (container instanceof Map) return Array.from(container.entries());
+            if (typeof container === 'object') return Object.entries(container);
+            return [];
+        };
 
         if (authToken) {
             try {
@@ -22698,25 +22702,22 @@ app.post('/api/mining/calculator', async (req, res) => {
                             `[Calculator Auth] Token valid but no user found for id=${decoded.id}; treating as guest.`
                         );
                     } else {
-                        // Compute real USD balances from on-chain quantities
+                        // Compute real USD balances from on-chain quantities.
+                        // dbUser is a lean plain object, so use safeEntries.
                         let userMainUSD = 0;
                         let userMaturedUSD = 0;
 
                         if (dbUser.balances) {
-                            if (dbUser.balances.main) {
-                                for (const [asset, balance] of dbUser.balances.main.entries()) {
-                                    if (balance > 0 && asset !== 'usd') {
-                                        const p = await getCryptoPrice(asset.toUpperCase());
-                                        if (p && p > 0) userMainUSD += balance * p;
-                                    }
+                            for (const [asset, balance] of safeEntries(dbUser.balances.main)) {
+                                if (balance > 0 && asset !== 'usd') {
+                                    const p = await getCryptoPrice(asset.toUpperCase());
+                                    if (p && p > 0) userMainUSD += balance * p;
                                 }
                             }
-                            if (dbUser.balances.matured) {
-                                for (const [asset, balance] of dbUser.balances.matured.entries()) {
-                                    if (balance > 0 && asset !== 'usd') {
-                                        const p = await getCryptoPrice(asset.toUpperCase());
-                                        if (p && p > 0) userMaturedUSD += balance * p;
-                                    }
+                            for (const [asset, balance] of safeEntries(dbUser.balances.matured)) {
+                                if (balance > 0 && asset !== 'usd') {
+                                    const p = await getCryptoPrice(asset.toUpperCase());
+                                    if (p && p > 0) userMaturedUSD += balance * p;
                                 }
                             }
                         }
@@ -22749,7 +22750,6 @@ app.post('/api/mining/calculator', async (req, res) => {
                     }
                 }
             } catch (authErr) {
-                // Token was present but invalid/expired — explicit log so we can see it
                 console.warn(
                     `[Calculator Auth] Token provided (source=${authSource}) but verification failed: ${authErr.message}. Treating as guest.`
                 );
@@ -22822,7 +22822,9 @@ app.post('/api/mining/calculator', async (req, res) => {
                 performedBy: isLoggedIn ? result.userContext.userId : null,
                 performedByModel: isLoggedIn ? 'User' : 'System',
                 performedByEmail: isLoggedIn ? result.userContext.email : null,
-                performedByName: isLoggedIn ? (result.userContext.fullName || result.userContext.email || 'User') : 'Guest User',
+                performedByName: isLoggedIn
+                    ? (result.userContext.fullName || result.userContext.email || 'User')
+                    : 'Guest User',
                 status: 'success',
                 ip: deviceInfo.ip,
                 userAgent: req.headers['user-agent'] || 'Unknown',
@@ -22842,7 +22844,7 @@ app.post('/api/mining/calculator', async (req, res) => {
                     plansAvailable: plans.length,
                     electricityContext: result.electricityContext,
                     summary,
-                    // Extra attribution context for debugging / auditing
+                    // Attribution diagnostics
                     authSource: result.userContext?.authSource || 'none',
                     authError: result.userContext?.authError || null,
                     processingTimeMs: Date.now() - startTime
