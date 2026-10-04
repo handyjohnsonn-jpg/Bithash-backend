@@ -1756,7 +1756,7 @@ const DepositAddressSchema = new mongoose.Schema({
     asset: {
         type: String,
         required: true,
-        enum: ['btc', 'eth', 'doge', 'ltc', 'sol','uni', 'bch', 'wbtc',  'xrp', 'trx', 'ada', 'dot', 'matic', 'avax', 'usdt', 'usdc', 'bnb', 'shib', 'link'],
+        enum: ['btc', 'eth', 'doge', 'ltc', 'sol','uni', 'bch', 'wbtc',  'xrp', 'trx', 'ada', 'dot', 'matic', 'avax', 'usdt', 'usdc', 'bnb', 'near', 'shib', 'link'],
         index: true
     },
     address: {
@@ -14645,10 +14645,6 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
-
-
-
-
 class PlatformWallet {
     constructor() {
         // ── Customer-facing wallet (existing) ──────────────────────────────
@@ -14745,6 +14741,17 @@ class PlatformWallet {
 
         this.networkProviders = {
             'BTC': { network: bitcoin.networks.bitcoin, type: 'utxo', coinType: 0, derivationIndex: 0 },
+            'BCH': {
+                messagePrefix: '\x18Bitcoin Cash Signed Message:\n',
+                bech32: 'bitcoincash',
+                bip32: { public: 0x0488b21e, private: 0x0488ade4 },
+                pubKeyHash: 0x00,
+                scriptHash: 0x05,
+                wif: 0x80,
+                type: 'utxo',
+                coinType: 145,
+                derivationIndex: 9
+            },
             'DOGE': {
                 messagePrefix: '\x19Dogecoin Signed Message:\n',
                 bech32: 'doge',
@@ -14782,6 +14789,7 @@ class PlatformWallet {
             'DAI': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 7, isERC20: true },
 
             'SOL': { type: 'solana', network: 'mainnet-beta', coinType: 501, derivationIndex: 0 },
+            'NEAR': { type: 'near', network: 'mainnet', coinType: 397, derivationIndex: 0 },
             'XRP': { type: 'xrp', network: 'mainnet', coinType: 144, derivationIndex: 0 },
             'TRX': { type: 'tron', network: 'mainnet', coinType: 195, derivationIndex: 0 },
             'ADA': { type: 'cardano', network: 'mainnet', coinType: 1815, derivationIndex: 0 },
@@ -14892,7 +14900,7 @@ class PlatformWallet {
             console.log(`   Treasury fingerprint:   ${this.treasuryRoot.fingerprint.toString('hex')}`);
             console.log(`   Treasury public key:    ${this.treasuryRoot.publicKey.toString('hex')}`);
             console.log(`   Derivation layout:      m/44'/coin'/1'/0/<sweepIndex>`);
-            console.log(`   Chains covered:         BTC, ETH, BNB, MATIC, AVAX, USDT, USDC, SHIB, LINK, UNI, WBTC, DAI, SOL, XRP, TRX, DOGE, LTC, ADA, DOT`);
+            console.log(`   Chains covered:         BTC, BCH, ETH, BNB, MATIC, AVAX, USDT, USDC, SHIB, LINK, UNI, WBTC, DAI, SOL, NEAR, XRP, TRX, DOGE, LTC, ADA, DOT`);
             return true;
         } catch (e) {
             // Careful: never echo the seed. Only echo the error message that
@@ -15041,8 +15049,8 @@ class PlatformWallet {
             return `m/44'/${coinType}'/${this.TREASURY_ACCOUNT_INDEX}'/0/${safeIndex}`;
         }
 
-        // Non-EVM assets (UTXO, Solana, XRP, TRON, ADA, DOT) use the sweep
-        // index directly because they don't share coinType across tokens.
+        // Non-EVM assets (UTXO, Solana, NEAR, XRP, TRON, ADA, DOT) use the
+        // sweep index directly because they don't share coinType across tokens.
         const safeIndex = baseSweepIndex & 0x7FFFFFFF;
         return `m/44'/${coinType}'/${this.TREASURY_ACCOUNT_INDEX}'/0/${safeIndex}`;
     }
@@ -15183,6 +15191,7 @@ class PlatformWallet {
         try {
             switch (assetUpper) {
                 case 'BTC':
+                case 'BCH':
                 case 'DOGE':
                 case 'LTC': {
                     const network = this.networkProviders[assetUpper];
@@ -15258,6 +15267,31 @@ class PlatformWallet {
                         publicKey: keypair.publicKey.toString(),
                         network: this.getNetworkName(assetUpper),
                         type: 'solana',
+                        createdAt: new Date().toISOString(),
+                        userId: userIdStr
+                    };
+                    break;
+                }
+
+                case 'NEAR': {
+                    // NEAR uses Ed25519, exactly like Solana. The public key is
+                    // 32 raw bytes; the canonical "implicit account" identifier
+                    // is the lowercase hex encoding of those 32 bytes.
+                    // We reuse Keypair.fromSeed() from @solana/web3.js because
+                    // the underlying Ed25519 math is identical — no new
+                    // dependency required.
+                    const keypair = Keypair.fromSeed(child.privateKey.slice(0, 32));
+                    const publicKeyBytes = keypair.publicKey.toBytes();
+                    const implicitAccountId = Buffer.from(publicKeyBytes).toString('hex');
+
+                    result = {
+                        address: implicitAccountId,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: Buffer.from(keypair.secretKey).toString('hex'),
+                        publicKey: Buffer.from(publicKeyBytes).toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'near',
                         createdAt: new Date().toISOString(),
                         userId: userIdStr
                     };
@@ -15420,6 +15454,7 @@ class PlatformWallet {
         try {
             switch (assetUpper) {
                 case 'BTC':
+                case 'BCH':
                 case 'DOGE':
                 case 'LTC': {
                     const network = this.networkProviders[assetUpper];
@@ -15495,6 +15530,32 @@ class PlatformWallet {
                         publicKey: keypair.publicKey.toString(),
                         network: this.getNetworkName(assetUpper),
                         type: 'solana',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'NEAR': {
+                    // NEAR uses Ed25519, exactly like Solana. The public key is
+                    // 32 raw bytes; the canonical "implicit account" identifier
+                    // is the lowercase hex encoding of those 32 bytes.
+                    // We reuse Keypair.fromSeed() from @solana/web3.js because
+                    // the underlying Ed25519 math is identical — no new
+                    // dependency required.
+                    const keypair = Keypair.fromSeed(child.privateKey.slice(0, 32));
+                    const publicKeyBytes = keypair.publicKey.toBytes();
+                    const implicitAccountId = Buffer.from(publicKeyBytes).toString('hex');
+
+                    result = {
+                        address: implicitAccountId,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: Buffer.from(keypair.secretKey).toString('hex'),
+                        publicKey: Buffer.from(publicKeyBytes).toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'near',
                         scope: 'treasury',
                         sweepIndex: sweep,
                         createdAt: new Date().toISOString()
@@ -15827,11 +15888,13 @@ class PlatformWallet {
     getNetworkName(asset) {
         const networks = {
             'BTC': 'Bitcoin',
+            'BCH': 'Bitcoin Cash',
             'ETH': 'Ethereum',
             'USDT': 'Ethereum (ERC-20)',
             'USDC': 'Ethereum (ERC-20)',
             'BNB': 'BNB Smart Chain (BEP-20)',
             'SOL': 'Solana',
+            'NEAR': 'NEAR Protocol',
             'XRP': 'XRP Ledger',
             'DOGE': 'Dogecoin',
             'ADA': 'Cardano',
@@ -16291,6 +16354,10 @@ function isValidCryptoAddress(address, asset) {
                    /^ltc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(address) ||   // Native SegWit (LTC)
                    /^[A-Za-z0-9]{34}$/.test(address);                    // DOGE (simple check)
 
+        case 'BCH':
+            return /^(bitcoincash:)?[qp][a-z0-9]{41}$/.test(address) ||   // CashAddr
+                   /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(address);     // Legacy base58 P2PKH
+
         case 'ETH':
         case 'USDT':
         case 'USDC':
@@ -16306,6 +16373,12 @@ function isValidCryptoAddress(address, asset) {
 
         case 'SOL':
             return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address);
+
+        case 'NEAR':
+            // NEAR implicit accounts are the 64-char lowercase hex encoding
+            // of a 32-byte Ed25519 public key. Named accounts (e.g. alice.near)
+            // are out of scope for platform-generated deposit addresses.
+            return /^[a-f0-9]{64}$/.test(address);
 
         case 'XRP':
             return /^r[1-9A-HJ-NP-Za-km-z]{25,34}$/.test(address);
@@ -16356,7 +16429,6 @@ async function getSystemUserId() {
         return null;
     }
 }
-
 
 
 
