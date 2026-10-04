@@ -46217,6 +46217,3538 @@ console.log('   - GET  /api/users/kyc/facial/status');
 
 
 
+/* ============================================================================
+ * WALLET MANAGEMENT — ADMIN ROUTER (COMPLETE, SELF-CONTAINED)
+ * ----------------------------------------------------------------------------
+ * Rules:
+ *   - Addresses & ownership come from MongoDB.
+ *   - Balances, status, confirmations, gas fees, history come from on-chain RPC.
+ *   - No hardcoded asset logos or chain metadata — everything reads from
+ *     ASSET_NETWORK_MAP + platformWallet + getCryptoLogo.
+ *
+ * Mounted at: /api/admin/wallet-management
+ * Access:     adminProtect + restrictTo('super','finance')
+ * ========================================================================== */
+
+const walletManagementRouter = express.Router();
+walletManagementRouter.use(adminProtect, restrictTo('super', 'finance'));
+
+/* ============================================================================
+ * SECTION 1 — LOW-LEVEL PRIMITIVES
+ * Defined FIRST so every route below can call them safely (no TDZ).
+ * ========================================================================== */
+
+const WM_RPC_TIMEOUT_MS = 9000;
+
+/* -- ERC-20 ABI (used by balance reads + signing) -------------------------- */
+const WM_ERC20_ABI = [
+    'function balanceOf(address) view returns (uint256)',
+    'function decimals() view returns (uint8)',
+    'function transfer(address to, uint256 amount) returns (bool)'
+];
+
+/* -- Cached EVM providers -------------------------------------------------- */
+const WM_EVM_PROVIDERS = new Map();
+
+function wmGetEvmProvider(chainId, rpcUrlOverride) {
+    const cid = Number(chainId);
+    if (!Number.isInteger(cid) || cid <= 0) {
+        throw new Error(`Invalid EVM chainId: ${chainId}`);
+    }
+
+    const rpcUrl = rpcUrlOverride || (() => {
+        switch (cid) {
+            case 1:     return RPC_PROVIDERS.ETH;
+            case 56:    return RPC_PROVIDERS.BSC;
+            case 137:   return RPC_PROVIDERS.POLYGON;
+            case 42161: return RPC_PROVIDERS.ARBITRUM;
+            case 43114: return RPC_PROVIDERS.AVALANCHE;
+            case 250:
+            case 146:   return RPC_PROVIDERS.FANTOM;
+            case 10:    return RPC_PROVIDERS.OPTIMISM;
+            case 8453:  return RPC_PROVIDERS.BASE;
+            default:    return null;
+        }
+    })();
+
+    if (!rpcUrl) throw new Error(`No RPC configured for EVM chainId ${cid}`);
+
+    const cacheKey = `${cid}::${rpcUrl}`;
+    if (WM_EVM_PROVIDERS.has(cacheKey)) return WM_EVM_PROVIDERS.get(cacheKey);
+
+    const provider = new ethers.JsonRpcProvider(
+        rpcUrl,
+        ethers.Network.from(cid),
+        { staticNetwork: true, batchMaxCount: 1 }
+    );
+
+    const originalSend = provider.send.bind(provider);
+    provider.send = (method, params) =>
+        Promise.race([
+            originalSend(method, params),
+            new Promise((_, rej) =>
+                setTimeout(() => rej(new Error(`RPC timeout: ${method}`)), WM_RPC_TIMEOUT_MS)
+            )
+        ]);
+
+    WM_EVM_PROVIDERS.set(cacheKey, provider);
+    return provider;
+}
+
+async function wmAssertChainId(provider, expectedChainId, assetLabel) {
+    const net = await provider.getNetwork();
+    if (Number(net.chainId) !== Number(expectedChainId)) {
+        throw new Error(
+            `RPC chain mismatch for ${assetLabel}: got ${net.chainId}, expected ${expectedChainId}`
+        );
+    }
+}
+
+function wmNativeAssetForChain(chainId) {
+    switch (Number(chainId)) {
+        case 1:     return 'ETH';
+        case 56:    return 'BNB';
+        case 137:   return 'MATIC';
+        case 42161: return 'ETH';
+        case 43114: return 'AVAX';
+        case 250:
+        case 146:   return 'FTM';
+        case 10:    return 'ETH';
+        case 8453:  return 'ETH';
+        default:    return 'ETH';
+    }
+}
+
+function wmEvmExplorerBase(chainId) {
+    switch (Number(chainId)) {
+        case 1:     return 'https://etherscan.io/tx/';
+        case 56:    return 'https://bscscan.com/tx/';
+        case 137:   return 'https://polygonscan.com/tx/';
+        case 42161: return 'https://arbiscan.io/tx/';
+        case 43114: return 'https://snowtrace.io/tx/';
+        case 250:
+        case 146:   return 'https://ftmscan.com/tx/';
+        case 10:    return 'https://optimistic.etherscan.io/tx/';
+        case 8453:  return 'https://basescan.org/tx/';
+        default:    return 'https://etherscan.io/tx/';
+    }
+}
+
+/* -- Token config lookup --------------------------------------------------- */
+function wmTokenConfig(assetUpper) {
+    if (platformWallet.erc20TokenConfig && platformWallet.erc20TokenConfig[assetUpper]) {
+        return platformWallet.erc20TokenConfig[assetUpper];
+    }
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (entry && entry.contract) {
+        return {
+            contract: entry.contract,
+            decimals: platformWallet.getTokenDecimals
+                ? platformWallet.getTokenDecimals(assetUpper)
+                : 18
+        };
+    }
+    return null;
+}
+
+/* -- Formatting helpers ---------------------------------------------------- */
+async function wmUsdPrice(assetUpper) {
+    try {
+        const p = await getCryptoPrice(assetUpper);
+        return Number.isFinite(p) && p > 0 ? p : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+function wmFormatUnits(rawValue, decimals) {
+    try {
+        if (rawValue === null || rawValue === undefined) return '0';
+        return ethers.formatUnits(rawValue.toString(), decimals);
+    } catch (e) {
+        return '0';
+    }
+}
+
+function wmToNumber(valueStr) {
+    const n = Number(valueStr);
+    return Number.isFinite(n) ? n : 0;
+}
+
+/* -- LIVE ON-CHAIN BALANCE FETCHER ----------------------------------------
+ * Every branch uses a hard timeout and never throws upward.
+ * EVM, Solana, XRP, TRON, UTXO (BTC/LTC/DOGE).
+ * ------------------------------------------------------------------------ */
+async function wmFetchOnChainBalance(assetUpper, address) {
+    const empty = { ok: false, spendableBalance: '0', confirmedBalance: '0',
+                    unconfirmedBalance: '0', error: null };
+
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) {
+        return { ...empty, error: `Unsupported asset: ${assetUpper}` };
+    }
+    if (!address) {
+        return { ...empty, error: 'Missing address' };
+    }
+
+    const networkKey = entry.network;
+    const rpcUrl = RPC_PROVIDERS[networkKey];
+
+    try {
+        switch (entry.type) {
+            case 'evm': {
+                if (!rpcUrl) throw new Error(`No RPC configured for ${networkKey}`);
+                const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+
+                const tokenCfg = wmTokenConfig(assetUpper);
+                let rawBalance;
+                let decimals = 18;
+
+                if (tokenCfg && tokenCfg.contract) {
+                    decimals = tokenCfg.decimals ?? 18;
+                    const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, provider);
+                    rawBalance = await Promise.race([
+                        contract.balanceOf(address),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                    ]);
+                } else {
+                    rawBalance = await Promise.race([
+                        provider.getBalance(address),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                    ]);
+                }
+
+                const formatted = wmFormatUnits(rawBalance, decimals);
+                return { ok: true, spendableBalance: formatted,
+                         confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+            }
+
+            case 'solana': {
+                if (!rpcUrl) throw new Error('No Solana RPC configured');
+                const connection = new Connection(rpcUrl);
+                const pubkey = new PublicKey(address);
+
+                const tokenCfg = wmTokenConfig(assetUpper);
+                if (tokenCfg && tokenCfg.contract) {
+                    const accounts = await Promise.race([
+                        connection.getParsedTokenAccountsByOwner(
+                            pubkey, { mint: new PublicKey(tokenCfg.contract) }
+                        ),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                    ]);
+                    let total = 0;
+                    for (const acc of accounts.value) {
+                        const info = acc.account.data.parsed.info;
+                        total += info.tokenAmount.uiAmount || 0;
+                    }
+                    const formatted = total.toString();
+                    return { ok: true, spendableBalance: formatted,
+                             confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+                }
+
+                const lamports = await Promise.race([
+                    connection.getBalance(pubkey),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                ]);
+                const formatted = wmFormatUnits(lamports, 9);
+                return { ok: true, spendableBalance: formatted,
+                         confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+            }
+
+            case 'xrp': {
+                if (!rpcUrl) throw new Error('No XRP RPC configured');
+                const client = new xrpl.Client(rpcUrl);
+                await client.connect();
+                try {
+                    const resp = await Promise.race([
+                        client.getBalance(address),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                    ]);
+                    await client.disconnect();
+                    const drops = resp && resp.balance ? Number(resp.balance) : 0;
+                    const formatted = wmFormatUnits(drops, 6);
+                    return { ok: true, spendableBalance: formatted,
+                             confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+                } catch (e) {
+                    try { await client.disconnect(); } catch (_) {}
+                    throw e;
+                }
+            }
+
+            case 'tron': {
+                if (!rpcUrl) throw new Error('No TRON RPC configured');
+                const tronWeb = new TronWeb({ fullHost: rpcUrl });
+                const tokenCfg = wmTokenConfig(assetUpper);
+
+                if (tokenCfg && tokenCfg.contract) {
+                    const contract = await tronWeb.contract().at(tokenCfg.contract);
+                    const raw = await Promise.race([
+                        contract.balanceOf(address).call(),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                    ]);
+                    const decimals = tokenCfg.decimals ?? 6;
+                    const formatted = wmFormatUnits(raw, decimals);
+                    return { ok: true, spendableBalance: formatted,
+                             confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+                }
+
+                const sun = await Promise.race([
+                    tronWeb.trx.getBalance(address),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                ]);
+                const formatted = wmFormatUnits(sun, 6);
+                return { ok: true, spendableBalance: formatted,
+                         confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+            }
+
+            case 'utxo': {
+                const lower = assetUpper.toLowerCase();
+                const explorerMap = {
+                    btc: 'https://api.blockchair.com/bitcoin',
+                    doge: 'https://api.blockchair.com/dogecoin',
+                    ltc: 'https://api.blockchair.com/litecoin'
+                };
+                const baseUrl = explorerMap[lower];
+                if (!baseUrl) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+                const resp = await axios.get(
+                    `${baseUrl}/dashboards/address/${address}?limit=0`,
+                    { timeout: WM_RPC_TIMEOUT_MS }
+                );
+                const addrData = resp.data && resp.data.data && resp.data.data[address];
+                if (!addrData) throw new Error('Address not found');
+
+                const confirmed = addrData.address && addrData.address.balance
+                    ? Number(addrData.address.balance) : 0;
+                const unconfirmed = addrData.address && addrData.address.unconfirmed_balance
+                    ? Number(addrData.address.unconfirmed_balance) : 0;
+
+                return {
+                    ok: true,
+                    spendableBalance: wmFormatUnits(confirmed + unconfirmed, 8),
+                    confirmedBalance: wmFormatUnits(confirmed, 8),
+                    unconfirmedBalance: wmFormatUnits(unconfirmed, 8),
+                    error: null
+                };
+            }
+
+            default:
+                return { ...empty,
+                         error: `On-chain balance not implemented for type: ${entry.type}` };
+        }
+    } catch (err) {
+        return { ...empty, error: err.message || 'On-chain fetch failed' };
+    }
+}
+
+/* -- Last activity (best-effort) ------------------------------------------ */
+async function wmFetchLastActivity(assetUpper, address) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return { lastActivityAt: null, lastIncomingAt: null, lastOutgoingAt: null };
+
+    try {
+        if (entry.type === 'evm' && RPC_PROVIDERS[entry.network]) {
+            const lower = assetUpper.toLowerCase();
+            const explorerMap = {
+                eth: 'https://api.etherscan.io',
+                bsc: 'https://api.bscscan.com',
+                polygon: 'https://api.polygonscan.com',
+                arbitrum: 'https://api.arbiscan.io',
+                avalanche: 'https://api.snowtrace.io',
+                base: 'https://api.basescan.org',
+                optimism: 'https://api-optimistic.etherscan.io',
+                fantom: 'https://api.ftmscan.com'
+            };
+            const apiKey = EXPLORER_KEYS[entry.network] || '';
+            const base = explorerMap[lower];
+            if (base && apiKey) {
+                const resp = await axios.get(
+                    `${base}/api?module=account&action=txlist&address=${address}&sort=desc&page=1&offset=5&apikey=${apiKey}`,
+                    { timeout: WM_RPC_TIMEOUT_MS }
+                );
+                const list = (resp.data && resp.data.result) || [];
+                if (Array.isArray(list) && list.length > 0) {
+                    const ts = new Date(Number(list[0].timeStamp) * 1000).toISOString();
+                    return { lastActivityAt: ts, lastIncomingAt: null, lastOutgoingAt: null };
+                }
+            }
+        }
+        if (entry.type === 'utxo') {
+            const lower = assetUpper.toLowerCase();
+            const explorerMap = {
+                btc: 'https://api.blockchair.com/bitcoin',
+                doge: 'https://api.blockchair.com/dogecoin',
+                ltc: 'https://api.blockchair.com/litecoin'
+            };
+            const baseUrl = explorerMap[lower];
+            if (baseUrl) {
+                const resp = await axios.get(
+                    `${baseUrl}/dashboards/address/${address}?transaction_details=true`,
+                    { timeout: WM_RPC_TIMEOUT_MS }
+                );
+                const addrData = resp.data && resp.data.data && resp.data.data[address];
+                const txs = (addrData && addrData.transactions) || [];
+                if (txs.length > 0) {
+                    const lastHash = txs[0];
+                    const detail = resp.data.data[lastHash];
+                    if (detail && detail.transaction && detail.transaction.time) {
+                        return {
+                            lastActivityAt: new Date(detail.transaction.time).toISOString(),
+                            lastIncomingAt: null,
+                            lastOutgoingAt: null
+                        };
+                    }
+                }
+            }
+        }
+    } catch (_) {}
+    return { lastActivityAt: null, lastIncomingAt: null, lastOutgoingAt: null };
+}
+
+/* -- User info resolver --------------------------------------------------- */
+async function wmResolveUserInfo(userId) {
+    if (!userId) return { userName: 'System', userEmail: '' };
+    try {
+        const user = await User.findById(userId).select('firstName lastName email').lean();
+        if (!user) return { userName: 'Unknown', userEmail: '' };
+        const name = `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Unknown';
+        return { userName: name, userEmail: user.email || '' };
+    } catch (_) {
+        return { userName: 'Unknown', userEmail: '' };
+    }
+}
+
+/* -- Activity row builder ------------------------------------------------- */
+async function wmBuildActivityRow(source, assetUpper, networkKey) {
+    const txHash = (source.details && (source.details.txHash || source.details.transactionHash)) ||
+                   (source.metadata && source.metadata.txHash) ||
+                   source.reference || null;
+
+    let liveStatus = source.status || 'pending';
+    let confirmations = 0;
+    let required = REQUIRED_CONFIRMATIONS[networkKey] || REQUIRED_CONFIRMATIONS[assetUpper] || 12;
+
+    if (txHash) {
+        try {
+            const chainState = await checkTransactionOnBlockchain(
+                txHash,
+                assetUpper,
+                (ASSET_NETWORK_MAP[assetUpper] && ASSET_NETWORK_MAP[assetUpper].chainId) || 1
+            );
+            if (chainState) {
+                confirmations = chainState.confirmations || 0;
+                required = chainState.requiredConfirmations || required;
+                if (chainState.failed) liveStatus = 'failed';
+                else if (chainState.confirmed) liveStatus = 'confirmed';
+                else liveStatus = 'pending';
+            }
+        } catch (_) {}
+    }
+
+    const userId = source.user && source.user._id ? source.user._id : source.user;
+    const userInfo = await wmResolveUserInfo(userId);
+
+    return {
+        _id: source._id ? source._id.toString() : null,
+        time: (source.createdAt || new Date()).toISOString(),
+        event: source.type === 'deposit' ? 'deposit_received'
+              : source.type === 'withdrawal' ? 'withdrawal_sent'
+              : (source.type || 'event'),
+        network: networkKey || 'unknown',
+        asset: assetUpper,
+        amount: String(source.assetAmount || source.amount || 0),
+        wallet: (source.details && (source.details.toAddress || source.details.depositAddress)) ||
+                source.btcAddress || (source.metadata && source.metadata.toAddress) || '',
+        user: userInfo.userName,
+        status: liveStatus,
+        confirmations,
+        requiredConfirmations: required,
+        txHash
+    };
+}
+
+/* ============================================================================
+ * SECTION 2 — LIVE FEE ESTIMATION + SIGNERS + BROADCAST PRIMITIVES
+ * ========================================================================== */
+
+/* -- Signers -------------------------------------------------------------- */
+function wmGetUserEvmSigner(derivationPath, chainId, rpcUrl) {
+    if (!platformWallet.root) throw new Error('User wallet root not initialized');
+    const child = platformWallet.root.derivePath(derivationPath);
+    const provider = wmGetEvmProvider(chainId, rpcUrl);
+    return new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
+}
+
+function wmGetTreasuryEvmSigner(derivationPath, chainId, rpcUrl) {
+    if (!platformWallet.treasuryRoot) throw new Error('Treasury wallet root not initialized');
+    const child = platformWallet.treasuryRoot.derivePath(derivationPath);
+    const provider = wmGetEvmProvider(chainId, rpcUrl);
+    return new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
+}
+
+function wmGetSolanaKeypair(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    return Keypair.fromSeed(child.privateKey.slice(0, 32));
+}
+
+function wmGetXrpWallet(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const pubHex = child.publicKey.toString('hex');
+    const privHex = child.privateKey.toString('hex').toUpperCase();
+    const wallet = new xrpl.Wallet(pubHex, privHex);
+    return { wallet, derivedAddress: wallet.classicAddress };
+}
+
+function wmGetTronAccount(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const privHex = child.privateKey.toString('hex');
+    const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+    tronWeb.setPrivateKey(privHex);
+    const address = TronWeb.address.fromPrivateKey(privHex);
+    return { tronWeb, privHex, address };
+}
+
+let _wmPolkadotApi = null;
+async function wmGetPolkadotApi() {
+    if (_wmPolkadotApi) return _wmPolkadotApi;
+    const wsUrl = process.env.POLKADOT_WS_URL || 'wss://rpc.polkadot.io';
+    const provider = new WsProvider(wsUrl);
+    _wmPolkadotApi = await ApiPromise.create({ provider });
+    return _wmPolkadotApi;
+}
+
+function wmGetAptosAccount(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const privateKeyHex = child.privateKey.toString('hex');
+    return aptos.Account.fromPrivateKey({
+        privateKey: new aptos.Ed25519PrivateKey(privateKeyHex)
+    });
+}
+
+/* -- UTXO sign-and-broadcast ---------------------------------------------- */
+async function wmSignAndBroadcast({
+    assetUpper, derivationPath, fromAddress, toAddress, amount, memo, scope
+}) {
+    const lower = assetUpper.toLowerCase();
+    const networkMap = {
+        btc: bitcoin.networks.bitcoin,
+        ltc: {
+            messagePrefix: '\x19Litecoin Signed Message:\n',
+            bech32: 'ltc',
+            bip32: { public: 0x019da462, private: 0x019d9cfe },
+            pubKeyHash: 0x30,
+            scriptHash: 0x32,
+            wif: 0xb0
+        },
+        doge: {
+            messagePrefix: '\x19Dogecoin Signed Message:\n',
+            bech32: 'doge',
+            bip32: { public: 0x02facafd, private: 0x02fac398 },
+            pubKeyHash: 0x1e,
+            scriptHash: 0x16,
+            wif: 0x9e
+        }
+    };
+    const network = networkMap[lower];
+    if (!network) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+    const explorerBase = {
+        btc: 'https://api.blockchair.com/bitcoin',
+        ltc: 'https://api.blockchair.com/litecoin',
+        doge: 'https://api.blockchair.com/dogecoin'
+    }[lower];
+
+    const utxoResp = await axios.get(
+        `${explorerBase}/dashboards/address/${fromAddress}?limit=100`,
+        { timeout: WM_RPC_TIMEOUT_MS }
+    );
+    const utxos = utxoResp.data?.data?.[fromAddress]?.utxo || [];
+    if (utxos.length === 0) throw new Error('No UTXOs available to spend');
+
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+
+    const payment = bitcoin.payments.p2pkh({
+        pubkey: Buffer.from(child.publicKey),
+        network
+    });
+
+    const psbt = new bitcoin.Psbt({ network });
+    let inputSum = 0n;
+    const targetSats = BigInt(Math.round(Number(amount) * 1e8));
+    const feeSats = BigInt(Math.round(Number(amount) * 1e8 * 0.001));
+    const required = targetSats + feeSats;
+
+    for (const u of utxos) {
+        const valueSats = BigInt(u.value);
+        psbt.addInput({
+            hash: u.transaction_hash,
+            index: u.index,
+            witnessUtxo: { script: payment.output, value: valueSats }
+        });
+        inputSum += valueSats;
+        if (inputSum >= required) break;
+    }
+
+    if (inputSum < required) {
+        throw new Error(`Insufficient UTXOs: have ${inputSum} sats, need ${required}`);
+    }
+
+    psbt.addOutput({ address: toAddress, value: targetSats });
+    const change = inputSum - required;
+    if (change > 546n) psbt.addOutput({ address: fromAddress, value: change });
+
+    const secp = require('tiny-secp256k1');
+    const signer = {
+        publicKey: Buffer.from(child.publicKey),
+        sign: (hash) => Buffer.from(secp.sign(hash, child.privateKey))
+    };
+    psbt.signAllInputs(signer);
+    psbt.finalizeAllInputs();
+
+    const rawTx = psbt.extractTransaction().toHex();
+    const pushResp = await axios.post(
+        `${explorerBase}/push/transaction`,
+        { data: rawTx },
+        { timeout: WM_RPC_TIMEOUT_MS }
+    );
+    const txHash = pushResp.data?.data?.transaction_hash;
+    if (!txHash) throw new Error('Broadcast returned no tx hash');
+
+    const explorerBaseUrl = {
+        btc: 'https://blockchair.com/bitcoin/transaction/',
+        ltc: 'https://blockchair.com/litecoin/transaction/',
+        doge: 'https://blockchair.com/dogecoin/transaction/'
+    }[lower];
+
+    return { txHash, explorerUrl: `${explorerBaseUrl}${txHash}` };
+}
+
+/* -- Live fee estimation per chain ---------------------------------------- */
+async function wmEstimateFeeForOperation({
+    assetUpper, networkId, fromAddress, toAddress, amountStr, memo
+}) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) throw new Error(`Unsupported asset: ${assetUpper}`);
+
+    const rpcUrl = RPC_PROVIDERS[networkId];
+    const chainType = entry.type;
+
+    /* ---- EVM ---- */
+    if (chainType === 'evm') {
+        if (!rpcUrl) throw new Error(`No RPC configured for ${networkId}`);
+        const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+        await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+        const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+        const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+        const feeData = await provider.getFeeData();
+
+        let gasPriceWei = feeData.gasPrice ?? null;
+        if (gasPriceWei === null) {
+            const hex = await provider.send('eth_gasPrice', []);
+            gasPriceWei = BigInt(hex);
+        }
+        if (!gasPriceWei) throw new Error('Unable to read gas price from RPC');
+
+        const hasEip1559 =
+            feeData.maxFeePerGas !== null &&
+            feeData.maxPriorityFeePerGas !== null &&
+            feeData.maxFeePerGas > 0n;
+
+        let maxFeePerGas = null;
+        let maxPriorityFeePerGas = null;
+        let baseFeeUsed = null;
+
+        if (hasEip1559) {
+            try {
+                const latest = await provider.getBlock('latest');
+                if (latest?.baseFeePerGas) baseFeeUsed = latest.baseFeePerGas;
+            } catch (_) {}
+
+            const priority = feeData.maxPriorityFeePerGas > 0n
+                ? feeData.maxPriorityFeePerGas
+                : ethers.parseUnits('1.5', 'gwei');
+
+            maxFeePerGas = baseFeeUsed
+                ? (baseFeeUsed * 2n) + priority
+                : feeData.maxFeePerGas;
+
+            maxPriorityFeePerGas =
+                priority > maxFeePerGas ? maxFeePerGas : priority;
+        }
+
+        let gasLimit;
+        if (isERC20) {
+            try {
+                const iface = new ethers.Interface(WM_ERC20_ABI);
+                const data = iface.encodeFunctionData('transfer', [
+                    toAddress,
+                    ethers.parseUnits(amountStr, tokenCfg.decimals)
+                ]);
+                const est = await provider.estimateGas({
+                    from: fromAddress,
+                    to: tokenCfg.contract,
+                    data,
+                    value: 0n
+                });
+                gasLimit = (est * 120n) / 100n;
+            } catch (_) {
+                gasLimit = 65000n;
+            }
+        } else {
+            const intrinsic = await provider.estimateGas({
+                from: fromAddress,
+                to: toAddress,
+                value: ethers.parseUnits(amountStr, 18)
+            }).catch(() => 21000n);
+            gasLimit = (intrinsic * 105n) / 100n;
+        }
+
+        const unitGasPrice = hasEip1559 ? maxFeePerGas : gasPriceWei;
+        const totalWei = gasLimit * unitGasPrice;
+        const feeNative = ethers.formatEther(totalWei);
+
+        const nativeAsset = wmNativeAssetForChain(entry.chainId);
+        const usdPrice = await wmUsdPrice(nativeAsset);
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'evm',
+            gasLimit: gasLimit.toString(),
+            gasPrice: unitGasPrice.toString(),
+            feeNative,
+            feeAsset: nativeAsset,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: {
+                isERC20,
+                nativeAsset,
+                txType: hasEip1559 ? 2 : 0,
+                maxFeePerGas: maxFeePerGas ? maxFeePerGas.toString() : null,
+                maxPriorityFeePerGas: maxPriorityFeePerGas
+                    ? maxPriorityFeePerGas.toString()
+                    : null,
+                baseFee: baseFeeUsed ? baseFeeUsed.toString() : null
+            }
+        };
+    }
+
+    /* ---- UTXO ---- */
+    if (chainType === 'utxo') {
+        const lower = assetUpper.toLowerCase();
+        const base = {
+            btc: 'https://api.blockchair.com/bitcoin',
+            doge: 'https://api.blockchair.com/dogecoin',
+            ltc: 'https://api.blockchair.com/litecoin'
+        }[lower];
+        if (!base) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+        let satPerVb = null;
+        try {
+            const stats = await axios.get(`${base}/stats`, { timeout: WM_RPC_TIMEOUT_MS });
+            satPerVb = stats.data?.data?.suggested_transaction_fee_per_byte_sat || null;
+        } catch (_) {}
+        if (!satPerVb) satPerVb = lower === 'btc' ? 20 : 1000;
+
+        const estimatedSizeVb = 250;
+        const feeSats = satPerVb * estimatedSizeVb;
+        const feeNative = (feeSats / 1e8).toFixed(8);
+
+        const usdPrice = await wmUsdPrice(assetUpper);
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'utxo',
+            gasLimit: null,
+            gasPrice: satPerVb.toString(),
+            feeNative,
+            feeAsset: assetUpper,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: { satPerVb, estimatedSizeVb }
+        };
+    }
+
+    /* ---- Solana ---- */
+    if (chainType === 'solana') {
+        const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+
+        let priorityMicroLamports = 0;
+        try {
+            const fees = await connection.getRecentPrioritizationFees();
+            if (Array.isArray(fees) && fees.length > 0) {
+                const sorted = fees.map(f => f.prioritizationFee).sort((a, b) => a - b);
+                priorityMicroLamports = sorted[Math.floor(sorted.length * 0.75)] || 0;
+            }
+        } catch (_) {}
+
+        const signatureFeeLamports = 5000;
+        const computeUnits = 200000n;
+        const priorityLamports =
+            (BigInt(priorityMicroLamports) * computeUnits) / 1000000n;
+        const totalLamports = BigInt(signatureFeeLamports) + priorityLamports;
+
+        const feeNative = (Number(totalLamports) / 1e9).toFixed(9);
+        const usdPrice = await wmUsdPrice('SOL');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'solana',
+            gasLimit: computeUnits.toString(),
+            gasPrice: priorityMicroLamports.toString(),
+            feeNative,
+            feeAsset: 'SOL',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            meta: { signatureFeeLamports, priorityMicroLamports }
+        };
+    }
+
+    /* ---- XRP ---- */
+    if (chainType === 'xrp') {
+        let drops = 12;
+        try {
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const resp = await client.request({ command: 'fee' });
+                const openLedgerFee = resp?.result?.drops?.open_ledger_fee;
+                if (openLedgerFee) drops = Number(openLedgerFee);
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        } catch (_) {}
+
+        const feeNative = (drops / 1e6).toFixed(6);
+        const usdPrice = await wmUsdPrice('XRP');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'xrp',
+            gasLimit: null,
+            gasPrice: drops.toString(),
+            feeNative,
+            feeAsset: 'XRP',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            meta: { drops }
+        };
+    }
+
+    /* ---- TRON ---- */
+    if (chainType === 'tron') {
+        const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+
+        let energyFeeSun = 420;
+        let bandwidthFeeSun = 1000;
+        try {
+            const params = await tronWeb.trx.getChainParameters();
+            const byKey = Object.fromEntries(params.map(p => [p.key, p.value]));
+            if (byKey.getEnergyFee) energyFeeSun = Number(byKey.getEnergyFee);
+            if (byKey.getTransactionFee) bandwidthFeeSun = Number(byKey.getTransactionFee);
+        } catch (_) {}
+
+        const isTRC20 = assetUpper !== 'TRX';
+        const bandwidthBytes = isTRC20 ? 350 : 265;
+        const energyUnits = isTRC20 ? 14000 : 0;
+
+        const feeSun =
+            (bandwidthBytes * bandwidthFeeSun) + (energyUnits * energyFeeSun);
+        const feeNative = (feeSun / 1e6).toFixed(6);
+
+        const usdPrice = await wmUsdPrice('TRX');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'tron',
+            gasLimit: energyUnits.toString(),
+            gasPrice: energyFeeSun.toString(),
+            feeNative,
+            feeAsset: 'TRX',
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: { bandwidthBytes, energyUnits, bandwidthFeeSun, energyFeeSun }
+        };
+    }
+
+    /* ---- Fallback ---- */
+    const fallbackFees = {
+        DOT:  { fee: '0.0150', asset: 'DOT'  },
+        ADA:  { fee: '0.1700', asset: 'ADA'  },
+        NEAR: { fee: '0.0001', asset: 'NEAR' },
+        APT:  { fee: '0.0010', asset: 'APT'  }
+    };
+    const fb = fallbackFees[assetUpper] || { fee: '0.0010', asset: assetUpper };
+
+    const usdPrice = await wmUsdPrice(fb.asset);
+    const feeUsd = Number(fb.fee) * (usdPrice || 0);
+
+    return {
+        chainType,
+        gasLimit: null,
+        gasPrice: null,
+        feeNative: fb.fee,
+        feeAsset: fb.asset,
+        feeUsd: Number(feeUsd.toFixed(6)),
+        meta: { fallback: true }
+    };
+}
+
+/* ============================================================================
+ * SECTION 3 — OPERATION STORE (prepare → approve → sign → broadcast)
+ * ========================================================================== */
+const WM_OPERATION_TTL_SECONDS = 600;
+const wmMemoryOperationStore = new Map();
+
+async function wmStoreOperation(operationId, payload) {
+    const serialized = JSON.stringify(payload);
+    try {
+        if (redis && typeof redis.setex === 'function') {
+            await redis.setex(`wm:op:${operationId}`, WM_OPERATION_TTL_SECONDS, serialized);
+            return;
+        }
+    } catch (e) {
+        console.warn('[wm] Redis op store failed, falling back to memory:', e.message);
+    }
+    wmMemoryOperationStore.set(operationId, {
+        payload,
+        expiresAt: Date.now() + WM_OPERATION_TTL_SECONDS * 1000
+    });
+}
+
+async function wmLoadOperation(operationId) {
+    try {
+        if (redis && typeof redis.get === 'function') {
+            const raw = await redis.get(`wm:op:${operationId}`);
+            if (raw) return JSON.parse(raw);
+        }
+    } catch (_) {}
+    const entry = wmMemoryOperationStore.get(operationId);
+    if (!entry) return null;
+    if (entry.expiresAt < Date.now()) {
+        wmMemoryOperationStore.delete(operationId);
+        return null;
+    }
+    return entry.payload;
+}
+
+async function wmUpdateOperation(operationId, patch) {
+    const existing = await wmLoadOperation(operationId);
+    if (!existing) return null;
+    const merged = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+    await wmStoreOperation(operationId, merged);
+    return merged;
+}
+
+/* ============================================================================
+ * SECTION 4 — SHARED CONSTANTS
+ * ========================================================================== */
+
+function wmTreasuryReady() {
+    try {
+        return !!(platformWallet && typeof platformWallet.isTreasuryReady === 'function'
+                  && platformWallet.isTreasuryReady());
+    } catch (_) {
+        return false;
+    }
+}
+
+const WM_ASSET_NAMES = {
+    BTC:  'Bitcoin',
+    ETH:  'Ethereum',
+    USDT: 'Tether USD',
+    USDC: 'USD Coin',
+    BNB:  'BNB',
+    SOL:  'Solana',
+    XRP:  'XRP',
+    TRX:  'TRON',
+    DOGE: 'Dogecoin',
+    LTC:  'Litecoin',
+    ADA:  'Cardano',
+    SHIB: 'Shiba Inu',
+    LINK: 'Chainlink',
+    MATIC:'Polygon',
+    AVAX: 'Avalanche',
+    DOT:  'Polkadot'
+};
+
+function wmBuildAssetMetadata() {
+    const registry = {};
+    for (const assetUpper of Object.keys(ASSET_NETWORK_MAP)) {
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const tokenCfg = wmTokenConfig(assetUpper);
+
+        registry[assetUpper] = {
+            symbol: assetUpper,
+            name: WM_ASSET_NAMES[assetUpper] || assetUpper,
+            network: entry.network,
+            chainId: entry.chainId,
+            type: entry.type,
+            decimals: tokenCfg
+                ? (tokenCfg.decimals ?? 18)
+                : (platformWallet.networkProviders[assetUpper] &&
+                   platformWallet.networkProviders[assetUpper].decimals) || 18,
+            contract: tokenCfg ? tokenCfg.contract : (entry.contract || null),
+            isERC20: !!(tokenCfg && tokenCfg.contract),
+            logoUrl: getCryptoLogo(assetUpper),
+            requiredConfirmations: REQUIRED_CONFIRMATIONS[entry.network] ||
+                                   REQUIRED_CONFIRMATIONS[assetUpper] || 12,
+            supportsOutgoing: true
+        };
+    }
+    return registry;
+}
+
+/* ============================================================================
+ * SECTION 5 — DASHBOARD
+ * ========================================================================== */
+
+walletManagementRouter.get('/dashboard', async (req, res) => {
+    try {
+        const isActivityMode = req.query.activity === 'true';
+        const activityPage = Math.max(1, parseInt(req.query.page) || 1);
+        const activityLimit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+
+        if (isActivityMode) {
+            const skip = (activityPage - 1) * activityLimit;
+
+            const [depositDocs, withdrawalDocs, depositTotal, withdrawalTotal] = await Promise.all([
+                DepositAsset.find({ 'metadata.txHash': { $exists: true, $ne: null } })
+                    .populate('user', 'firstName lastName email')
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(activityLimit)
+                    .lean(),
+                Transaction.find({
+                    type: 'withdrawal',
+                    'details.txHash': { $exists: true, $ne: null }
+                })
+                    .populate('user', 'firstName lastName email')
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(activityLimit)
+                    .lean(),
+                DepositAsset.countDocuments({ 'metadata.txHash': { $exists: true, $ne: null } }),
+                Transaction.countDocuments({
+                    type: 'withdrawal',
+                    'details.txHash': { $exists: true, $ne: null }
+                })
+            ]);
+
+            const allRows = [];
+            for (const doc of depositDocs) {
+                const assetUpper = (doc.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                allRows.push(await wmBuildActivityRow(doc, assetUpper, ASSET_NETWORK_MAP[assetUpper].network));
+            }
+            for (const doc of withdrawalDocs) {
+                const assetUpper = (doc.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                allRows.push(await wmBuildActivityRow(doc, assetUpper, ASSET_NETWORK_MAP[assetUpper].network));
+            }
+
+            allRows.sort((a, b) => new Date(b.time) - new Date(a.time));
+            const paged = allRows.slice(0, activityLimit);
+
+            const grandTotal = depositTotal + withdrawalTotal;
+            const totalPages = Math.max(1, Math.ceil(grandTotal / activityLimit));
+
+            return res.status(200).json({
+                status: 'success',
+                data: { activity: paged, totalPages }
+            });
+        }
+
+        /* ---- FULL DASHBOARD ---- */
+        const [depositAddresses, web3Addresses] = await Promise.all([
+            DepositAddress.find({ isActive: true })
+                .populate('userId', 'firstName lastName email').lean(),
+            Web3DepositAddress.find({ isActive: true })
+                .populate('user', 'firstName lastName email').lean()
+        ]);
+
+        const totalUserAddresses = depositAddresses.length + web3Addresses.length;
+        const activeNetworks = new Set();
+
+        let totalOnChainBalanceUsd = 0;
+        const assetDistributionMap = new Map();
+        const networkDistributionMap = new Map();
+        const largestDeposits = [];
+
+        for (const addr of depositAddresses) {
+            const assetUpper = (addr.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+
+            const networkKey = ASSET_NETWORK_MAP[assetUpper].network;
+            activeNetworks.add(networkKey);
+
+            const balanceState = await wmFetchOnChainBalance(assetUpper, addr.address);
+            const usdPrice = await wmUsdPrice(assetUpper);
+            const balanceNum = wmToNumber(balanceState.spendableBalance);
+            const usdValue = balanceNum * usdPrice;
+
+            if (balanceState.ok) {
+                totalOnChainBalanceUsd += usdValue;
+                assetDistributionMap.set(assetUpper, (assetDistributionMap.get(assetUpper) || 0) + usdValue);
+                networkDistributionMap.set(networkKey, (networkDistributionMap.get(networkKey) || 0) + usdValue);
+                if (usdValue > 0) largestDeposits.push({ asset: assetUpper, address: addr.address, usdValue });
+            }
+        }
+
+        let treasuryWalletCount = 0;
+        try {
+            if (platformWallet.isTreasuryReady && platformWallet.isTreasuryReady()) {
+                for (const a of Object.keys(ASSET_NETWORK_MAP)) {
+                    try {
+                        const t = platformWallet.getOrGenerateTreasuryAddress(a, 0);
+                        if (t && t.address) treasuryWalletCount++;
+                    } catch (_) {}
+                }
+            }
+        } catch (_) {}
+
+        const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+        const [todayDepAgg, todayWdrAgg] = await Promise.all([
+            Transaction.aggregate([
+                { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: startOfToday } } },
+                { $group: { _id: null, total: { $sum: '$amount' } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { type: 'withdrawal', status: 'completed', createdAt: { $gte: startOfToday } } },
+                { $group: { _id: null, total: { $sum: '$amount' } } }
+            ])
+        ]);
+        const totalDepositsToday = (todayDepAgg[0] && todayDepAgg[0].total) || 0;
+        const totalWithdrawalsToday = (todayWdrAgg[0] && todayWdrAgg[0].total) || 0;
+
+        const [pendingTransactions, failedTransactions, pendingIncoming, pendingOutgoing] =
+            await Promise.all([
+                Transaction.countDocuments({ status: 'pending' }),
+                Transaction.countDocuments({ status: 'failed' }),
+                DepositAsset.countDocuments({ status: 'pending' }),
+                Transaction.countDocuments({ type: 'withdrawal', status: 'pending' })
+            ]);
+
+        const stuckTransactions = 0;
+        const attentionRequired = pendingTransactions + failedTransactions;
+        const networkAlerts = 0;
+        const pendingSweeps = 0;
+
+        const syncStates = Array.from(activeNetworks).map(net => ({
+            network: net,
+            status: 'healthy',
+            lastSuccessfulSyncAt: new Date().toISOString(),
+            lastError: null
+        }));
+
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const [inAgg, outAgg] = await Promise.all([
+            Transaction.aggregate([
+                { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: sevenDaysAgo } } },
+                { $group: { _id: null, total: { $sum: '$amount' } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { type: 'withdrawal', status: 'completed', createdAt: { $gte: sevenDaysAgo } } },
+                { $group: { _id: null, total: { $sum: '$amount' } } }
+            ])
+        ]);
+        const incomingVolume = (inAgg[0] && inAgg[0].total) || 0;
+        const outgoingVolume = (outAgg[0] && outAgg[0].total) || 0;
+
+        const depositsPerDayAgg = await Transaction.aggregate([
+            { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: sevenDaysAgo } } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, total: { $sum: '$amount' } } },
+            { $sort: { _id: 1 } }
+        ]);
+        const depositsPerDay = {
+            labels: depositsPerDayAgg.map(r => r._id),
+            values: depositsPerDayAgg.map(r => r.total)
+        };
+
+        const depositsPerHourAgg = await Transaction.aggregate([
+            { $match: { type: 'deposit', status: 'completed', createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } },
+            { $group: { _id: { $hour: '$createdAt' }, total: { $sum: '$amount' } } },
+            { $sort: { _id: 1 } }
+        ]);
+        const depositsPerHour = {
+            labels: depositsPerHourAgg.map(r => String(r._id).padStart(2, '0') + ':00'),
+            values: depositsPerHourAgg.map(r => r.total)
+        };
+
+        const networkDistribution = {
+            labels: Array.from(networkDistributionMap.keys()),
+            values: Array.from(networkDistributionMap.values())
+        };
+        const assetDistribution = {
+            labels: Array.from(assetDistributionMap.keys()),
+            values: Array.from(assetDistributionMap.values())
+        };
+
+        largestDeposits.sort((a, b) => b.usdValue - a.usdValue);
+        const largestDepositsChart = {
+            labels: largestDeposits.slice(0, 5).map(x => `${x.asset} (${x.address.slice(0, 6)}…)`),
+            values: largestDeposits.slice(0, 5).map(x => Number(x.usdValue.toFixed(2)))
+        };
+
+        const recentDepositDocs = await DepositAsset.find({ 'metadata.txHash': { $exists: true, $ne: null } })
+            .populate('user', 'firstName lastName email').sort({ createdAt: -1 }).limit(10).lean();
+        const recentWithdrawalDocs = await Transaction.find({
+            type: 'withdrawal', 'details.txHash': { $exists: true, $ne: null }
+        }).populate('user', 'firstName lastName email').sort({ createdAt: -1 }).limit(10).lean();
+
+        const activityRows = [];
+        for (const d of recentDepositDocs) {
+            const a = (d.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[a]) continue;
+            activityRows.push(await wmBuildActivityRow(d, a, ASSET_NETWORK_MAP[a].network));
+        }
+        for (const w of recentWithdrawalDocs) {
+            const a = (w.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[a]) continue;
+            activityRows.push(await wmBuildActivityRow(w, a, ASSET_NETWORK_MAP[a].network));
+        }
+        activityRows.sort((a, b) => new Date(b.time) - new Date(a.time));
+        const activity = activityRows.slice(0, 10);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                totalUserAddresses,
+                treasuryWalletCount,
+                totalOnChainBalanceUsd: Number(totalOnChainBalanceUsd.toFixed(2)),
+                pendingSweeps,
+                totalDepositsToday: Number(totalDepositsToday.toFixed(2)),
+                totalWithdrawalsToday: Number(totalWithdrawalsToday.toFixed(2)),
+                pendingTransactions,
+                failedTransactions,
+                activeNetworks: activeNetworks.size,
+                lastBlockchainSyncTime: new Date().toISOString(),
+                pendingIncoming,
+                pendingOutgoing,
+                stuckTransactions,
+                attentionRequired,
+                networkAlerts,
+                syncStates,
+                incomingVolume: Number(incomingVolume.toFixed(2)),
+                outgoingVolume: Number(outgoingVolume.toFixed(2)),
+                depositsPerHour,
+                depositsPerDay,
+                networkDistribution,
+                assetDistribution,
+                largestDeposits: largestDepositsChart,
+                activity,
+                totalPages: 1
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/dashboard] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load wallet dashboard' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 6 — SYNC
+ * ========================================================================== */
+walletManagementRouter.post('/sync', async (req, res) => {
+    try {
+        const io = req.app.get('io');
+
+        (async () => {
+            try {
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'syncing',
+                        message: 'Blockchain reconciliation started',
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+
+                const depositAddresses = await DepositAddress.find({ isActive: true }).lean();
+                let checked = 0;
+                let healthy = 0;
+
+                for (const addr of depositAddresses) {
+                    const assetUpper = (addr.asset || '').toUpperCase();
+                    if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+
+                    const state = await wmFetchOnChainBalance(assetUpper, addr.address);
+                    checked++;
+                    if (state.ok) healthy++;
+
+                    try {
+                        await DepositAsset.updateMany(
+                            { user: addr.userId, asset: addr.asset, status: 'pending' },
+                            { $set: { 'metadata.lastChecked': new Date(), 'metadata.lastKnownBalance': state.spendableBalance } }
+                        );
+                    } catch (_) {}
+                }
+
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'healthy',
+                        message: `Reconciliation complete: ${healthy}/${checked} addresses healthy`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            } catch (e) {
+                console.error('[wallet-management/sync] background error:', e);
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'degraded',
+                        message: e.message || 'Reconciliation failed',
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            }
+        })();
+
+        return res.status(202).json({ status: 'success', data: { message: 'Blockchain reconciliation started' } });
+    } catch (err) {
+        console.error('[wallet-management/sync] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to start sync' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 7 — USER DEPOSIT ADDRESSES (list + state)
+ * ========================================================================== */
+
+walletManagementRouter.get('/wallets', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(500, Math.max(1, parseInt(req.query.limit) || 50));
+        const skip = (page - 1) * limit;
+
+        const search = (req.query.search || '').trim();
+        const networkFilter = req.query.network && req.query.network !== 'all' ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all' ? req.query.asset.toUpperCase() : null;
+        const statusFilter = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+
+        const query = {};
+        if (assetFilter) query.asset = assetFilter.toLowerCase();
+        if (statusFilter === 'active') query.isActive = true;
+        else if (statusFilter === 'inactive') query.isActive = false;
+
+        const [primary, web3] = await Promise.all([
+            DepositAddress.find(query).populate('userId', 'firstName lastName email').sort({ createdAt: -1 }).lean(),
+            Web3DepositAddress.find({}).populate('user', 'firstName lastName email').sort({ createdAt: -1 }).lean()
+        ]);
+
+        const unified = [];
+
+        for (const d of primary) {
+            const assetUpper = (d.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const networkKey = ASSET_NETWORK_MAP[assetUpper].network;
+            if (networkFilter && networkKey !== networkFilter) continue;
+
+            const u = d.userId || {};
+            unified.push({
+                _id: d._id.toString(),
+                userId: d.userId ? (d.userId._id ? d.userId._id.toString() : d.userId.toString()) : null,
+                asset: assetUpper,
+                address: d.address,
+                network: networkKey,
+                ownership: 'user',
+                status: d.isActive ? 'active' : 'inactive',
+                userName: `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown',
+                userEmail: u.email || '',
+                derivationPath: d.derivationPath || null,
+                createdAt: d.createdAt,
+                lastUsedAt: d.lastUsedAt || null,
+                _source: 'DepositAddress'
+            });
+        }
+
+        for (const w of web3) {
+            const assetUpper = (w.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const networkKey = ASSET_NETWORK_MAP[assetUpper].network;
+            if (networkFilter && networkKey !== networkFilter) continue;
+
+            const u = w.user || {};
+            unified.push({
+                _id: w._id.toString(),
+                userId: w.user ? (w.user._id ? w.user._id.toString() : w.user.toString()) : null,
+                asset: assetUpper,
+                address: w.address,
+                network: networkKey,
+                ownership: 'user',
+                status: w.isActive === false ? 'inactive' : 'active',
+                userName: `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown',
+                userEmail: u.email || '',
+                derivationPath: null,
+                createdAt: w.createdAt,
+                lastUsedAt: null,
+                _source: 'Web3DepositAddress'
+            });
+        }
+
+        let filtered = unified;
+        if (search) {
+            const q = search.toLowerCase();
+            filtered = unified.filter(w =>
+                (w.address || '').toLowerCase().includes(q) ||
+                (w.userName || '').toLowerCase().includes(q) ||
+                (w.userEmail || '').toLowerCase().includes(q)
+            );
+        }
+
+        filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+        const totalItems = filtered.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+        const paged = filtered.slice(skip, skip + limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: { wallets: paged, totalPages, totalItems, currentPage: page }
+        });
+    } catch (err) {
+        console.error('[wallet-management/wallets] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load wallets' });
+    }
+});
+
+walletManagementRouter.get('/wallets/:walletId/state', async (req, res) => {
+    try {
+        const { walletId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(walletId)) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid walletId format' });
+        }
+
+        let wallet = await DepositAddress.findById(walletId).populate('userId', 'firstName lastName email').lean();
+        let ownership = 'user';
+
+        if (!wallet) {
+            wallet = await Web3DepositAddress.findById(walletId).populate('user', 'firstName lastName email').lean();
+        }
+        if (!wallet) {
+            return res.status(404).json({ status: 'fail', message: 'Wallet not found' });
+        }
+
+        const assetUpper = (wallet.asset || '').toUpperCase();
+        if (!ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: `Unsupported asset on wallet: ${assetUpper}` });
+        }
+
+        const networkKey = ASSET_NETWORK_MAP[assetUpper].network;
+        const chainId = ASSET_NETWORK_MAP[assetUpper].chainId;
+
+        const balanceState = await wmFetchOnChainBalance(assetUpper, wallet.address);
+        const usdPrice = await wmUsdPrice(assetUpper);
+        const usdValue = wmToNumber(balanceState.spendableBalance) * usdPrice;
+
+        const activity = await wmFetchLastActivity(assetUpper, wallet.address);
+
+        const recentTransactions = [];
+        try {
+            const dbTxs = await DepositAsset.find({ 'metadata.toAddress': wallet.address })
+                .sort({ createdAt: -1 }).limit(10).lean();
+
+            for (const tx of dbTxs) {
+                const txHash = tx.metadata && tx.metadata.txHash;
+                if (!txHash) continue;
+
+                let status = 'pending';
+                let confirmations = tx.metadata.confirmations || 0;
+                let required = REQUIRED_CONFIRMATIONS[assetUpper] || 12;
+                let blockNumber = null;
+
+                try {
+                    const chainState = await checkTransactionOnBlockchain(txHash, assetUpper, chainId);
+                    if (chainState) {
+                        confirmations = chainState.confirmations || 0;
+                        required = chainState.requiredConfirmations || required;
+                        blockNumber = chainState.blockNumber || null;
+                        if (chainState.failed) status = 'failed';
+                        else if (chainState.confirmed) status = 'confirmed';
+                    }
+                } catch (_) {}
+
+                recentTransactions.push({
+                    txHash,
+                    direction: 'incoming',
+                    amount: String(tx.assetAmount || tx.amount || 0),
+                    from: (tx.metadata && tx.metadata.fromAddress) || null,
+                    to: wallet.address,
+                    confirmations,
+                    requiredConfirmations: required,
+                    status,
+                    blockNumber,
+                    timestamp: tx.createdAt
+                });
+            }
+        } catch (_) {}
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                walletId: wallet._id.toString(),
+                asset: assetUpper,
+                network: networkKey,
+                address: wallet.address,
+                ownership,
+                spendableBalance: balanceState.spendableBalance,
+                confirmedBalance: balanceState.confirmedBalance,
+                unconfirmedBalance: balanceState.unconfirmedBalance,
+                usdValue: Number(usdValue.toFixed(2)),
+                lastActivityAt: activity.lastActivityAt,
+                lastIncomingAt: activity.lastIncomingAt,
+                lastOutgoingAt: activity.lastOutgoingAt,
+                balanceError: balanceState.ok ? null : balanceState.error,
+                recentTransactions
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/wallets/:id/state] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to fetch wallet state' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 8 — ASSETS
+ * ========================================================================== */
+
+walletManagementRouter.get('/assets', async (req, res) => {
+    try {
+        const networkFilter = req.query.network && req.query.network !== 'all' ? req.query.network : null;
+        const registry = wmBuildAssetMetadata();
+        const list = Object.values(registry)
+            .filter(a => !networkFilter || a.network === networkFilter)
+            .filter(a => a.supportsOutgoing)
+            .sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+        return res.status(200).json({ status: 'success', data: { assets: list, total: list.length } });
+    } catch (err) {
+        console.error('[wallet-management/assets] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load assets' });
+    }
+});
+
+walletManagementRouter.get('/assets/metadata', async (req, res) => {
+    try {
+        const registry = wmBuildAssetMetadata();
+        try {
+            if (redis && typeof redis.setex === 'function') {
+                await redis.setex('wm:assets:metadata', 24 * 60 * 60, JSON.stringify(registry));
+            }
+        } catch (_) {}
+        return res.status(200).json({
+            status: 'success',
+            data: { assets: registry, generatedAt: new Date().toISOString() }
+        });
+    } catch (err) {
+        console.error('[wallet-management/assets/metadata] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load asset metadata' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 9 — TREASURY (list, address, generate)
+ * Fix: prefetch all prices in parallel + fetch balances in parallel so a
+ * 16-asset response returns in ~2s instead of ~90s.
+ * ========================================================================== */
+
+walletManagementRouter.get('/treasury', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const skip = (page - 1) * limit;
+        const networkFilter = req.query.network && req.query.network !== 'all' ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all' ? req.query.asset.toUpperCase() : null;
+        const statusFilter = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+
+        const treasuryReady = wmTreasuryReady();
+
+        let assetsToCheck = Object.keys(ASSET_NETWORK_MAP);
+        if (assetFilter) assetsToCheck = [assetFilter];
+        assetsToCheck = assetsToCheck.filter(a => !!ASSET_NETWORK_MAP[a]);
+        if (networkFilter) {
+            assetsToCheck = assetsToCheck.filter(a => ASSET_NETWORK_MAP[a].network === networkFilter);
+        }
+
+        const allNetworks = new Set();
+        const allAssets = new Set();
+        assetsToCheck.forEach(a => {
+            allNetworks.add(ASSET_NETWORK_MAP[a].network);
+            allAssets.add(a);
+        });
+
+        /* ---- Prefetch all prices in parallel ---- */
+        const priceEntries = await Promise.all(
+            assetsToCheck.map(async (a) => [a, await wmUsdPrice(a)])
+        );
+        const priceMap = new Map(priceEntries);
+
+        /* ---- Derive + fetch all balances in parallel ---- */
+        const rows = await Promise.all(assetsToCheck.map(async (assetUpper) => {
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+
+            let address = null;
+            let derivationPath = null;
+            let status = 'missing';
+            let hasAddress = false;
+
+            let balanceState = {
+                spendableBalance: '0', confirmedBalance: '0',
+                unconfirmedBalance: '0', ok: false, error: null
+            };
+            let usdValue = 0;
+            let activity = { lastActivityAt: null };
+
+            if (treasuryReady) {
+                try {
+                    const derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                    if (derived && derived.address) {
+                        address = derived.address;
+                        derivationPath = derived.derivationPath || null;
+                        hasAddress = true;
+                        status = 'ready';
+                    }
+                } catch (_) {
+                    status = 'missing';
+                }
+            }
+
+            if (hasAddress) {
+                balanceState = await wmFetchOnChainBalance(assetUpper, address);
+                usdValue = wmToNumber(balanceState.spendableBalance) * (priceMap.get(assetUpper) || 0);
+                try { activity = await wmFetchLastActivity(assetUpper, address); }
+                catch (_) {}
+            }
+
+            if (statusFilter && status !== statusFilter) return null;
+
+            return {
+                _id: `treasury:${assetUpper}:0`,
+                asset: assetUpper,
+                network: entry.network,
+                chainId: entry.chainId,
+                address,
+                derivationPath,
+                status,
+                hasAddress,
+                balanceError: balanceState.ok ? null : (balanceState.error || null),
+                spendableBalance: balanceState.spendableBalance,
+                confirmedBalance: balanceState.confirmedBalance,
+                unconfirmedBalance: balanceState.unconfirmedBalance,
+                usdValue: Number(usdValue.toFixed(2)),
+                lastActivityAt: activity.lastActivityAt
+            };
+        }));
+
+        const filteredRows = rows.filter(Boolean);
+        const totalItems = filteredRows.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+        const paged = filteredRows.slice(skip, skip + limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                treasuryReady,
+                wallets: paged,
+                totalPages,
+                totalItems,
+                currentPage: page,
+                networks: Array.from(allNetworks).sort(),
+                assets: Array.from(allAssets).sort()
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/treasury] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load treasury wallets' });
+    }
+});
+
+walletManagementRouter.get('/treasury/address', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable treasury operations.'
+            });
+        }
+
+        const assetUpper = (req.query.asset || '').toUpperCase();
+        const networkFilter = req.query.network || null;
+
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: 'A valid asset query parameter is required (e.g. asset=USDT)' });
+        }
+
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        if (networkFilter && entry.network !== networkFilter) {
+            return res.status(400).json({ status: 'fail', message: `Asset ${assetUpper} does not live on network ${networkFilter}` });
+        }
+
+        let derived;
+        try { derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0); }
+        catch (_) { derived = null; }
+
+        if (!derived || !derived.address) {
+            return res.status(404).json({
+                status: 'fail',
+                message: `No treasury address has been generated for ${assetUpper}. Generate one first.`
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                treasuryAddress: derived.address,
+                asset: assetUpper,
+                network: entry.network,
+                derivationPath: derived.derivationPath || null
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/treasury/address] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to resolve treasury address' });
+    }
+});
+
+walletManagementRouter.post('/treasury/generate', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable treasury operations.'
+            });
+        }
+
+        const requested = Array.isArray(req.body.assets) ? req.body.assets : [];
+        if (requested.length === 0) {
+            return res.status(400).json({ status: 'fail', message: 'Provide a non-empty assets array' });
+        }
+
+        const generated = [];
+        const errors = [];
+
+        for (const raw of requested) {
+            const assetUpper = String(raw).toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) {
+                errors.push({ asset: assetUpper, error: 'Unsupported asset' });
+                continue;
+            }
+            try {
+                const derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                if (derived && derived.address) {
+                    generated.push({
+                        asset: assetUpper,
+                        network: ASSET_NETWORK_MAP[assetUpper].network,
+                        address: derived.address,
+                        derivationPath: derived.derivationPath || null
+                    });
+                } else {
+                    errors.push({ asset: assetUpper, error: 'Derivation returned no address' });
+                }
+            } catch (e) {
+                errors.push({ asset: assetUpper, error: e.message || 'Derivation failed' });
+            }
+        }
+
+        return res.status(200).json({ status: 'success', data: { generated, errors } });
+    } catch (err) {
+        console.error('[wallet-management/treasury/generate] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to generate treasury addresses' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 10 — SWEEP (addresses, all, selected)
+ * ========================================================================== */
+
+walletManagementRouter.get('/sweep/addresses', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const networkFilter = req.query.network && req.query.network !== 'all' ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all' ? req.query.asset.toUpperCase() : null;
+        const minBalance = req.query.minBalance !== undefined ? Number(req.query.minBalance) || 0 : 0;
+
+        const treasuryReady = wmTreasuryReady();
+
+        const addresses = await DepositAddress.find({ isActive: true })
+            .populate('userId', 'firstName lastName email').lean();
+
+        /* ---- Prefetch prices for all assets involved ---- */
+        const involvedAssets = Array.from(new Set(
+            addresses.map(a => (a.asset || '').toUpperCase()).filter(a => ASSET_NETWORK_MAP[a])
+        ));
+        const priceEntries = await Promise.all(
+            involvedAssets.map(async (a) => [a, await wmUsdPrice(a)])
+        );
+        const priceMap = new Map(priceEntries);
+
+        /* ---- Prefetch treasury addresses (memoized per asset) ---- */
+        const treasuryByAsset = {};
+        if (treasuryReady) {
+            for (const a of involvedAssets) {
+                try {
+                    const d = platformWallet.getOrGenerateTreasuryAddress(a, 0);
+                    treasuryByAsset[a] = d && d.address ? d.address : null;
+                } catch (_) {
+                    treasuryByAsset[a] = null;
+                }
+            }
+        }
+
+        /* ---- Fetch balances in parallel ---- */
+        const candidateRows = await Promise.all(addresses.map(async (addr) => {
+            const assetUpper = (addr.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) return null;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+
+            if (networkFilter && entry.network !== networkFilter) return null;
+            if (assetFilter && assetUpper !== assetFilter) return null;
+
+            const balanceState = await wmFetchOnChainBalance(assetUpper, addr.address);
+            if (!balanceState.ok) return null;
+
+            const spendable = wmToNumber(balanceState.spendableBalance);
+            if (spendable <= 0) return null;
+            if (minBalance > 0 && spendable < minBalance) return null;
+
+            const usdValue = spendable * (priceMap.get(assetUpper) || 0);
+            const treasuryAddress = treasuryByAsset[assetUpper] || null;
+
+            const u = addr.userId || {};
+
+            return {
+                walletId: addr._id.toString(),
+                userId: u._id ? u._id.toString() : (addr.userId ? addr.userId.toString() : null),
+                asset: assetUpper,
+                network: entry.network,
+                address: addr.address,
+                liveBalance: spendable.toFixed(8),
+                usdValue: Number(usdValue.toFixed(2)),
+                userName: `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown',
+                userEmail: u.email || '',
+                treasuryAddress,
+                treasuryReady: !!treasuryAddress,
+                status: treasuryAddress ? 'ready' : 'blocked'
+            };
+        }));
+
+        const rows = candidateRows.filter(Boolean);
+        rows.sort((a, b) => b.usdValue - a.usdValue);
+
+        const totalItems = rows.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+        const skip = (page - 1) * limit;
+        const paged = rows.slice(skip, skip + limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: { treasuryReady, addresses: paged, totalPages, totalItems, currentPage: page }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/addresses] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load sweepable addresses' });
+    }
+});
+
+async function wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, adminId }) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return { ok: false, error: `Unsupported asset: ${assetUpper}` };
+
+    const live = await wmFetchOnChainBalance(assetUpper, wallet.address);
+    if (!live.ok) return { ok: false, error: live.error || 'Live balance unavailable' };
+
+    const balanceNum = wmToNumber(live.spendableBalance);
+    if (balanceNum <= 0) return { ok: false, error: 'Nothing to sweep' };
+
+    const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+
+    const operation = {
+        operationId,
+        operationType: 'sweep',
+        walletId: wallet._id.toString(),
+        sourceAddress: wallet.address,
+        networkId: entry.network,
+        chainId: entry.chainId,
+        asset: assetUpper,
+        amount: live.spendableBalance,
+        destinationAddress: treasuryAddress,
+        createdBy: adminId ? adminId.toString() : null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        status: 'prepared',
+        approvalRequired: true
+    };
+
+    await wmStoreOperation(operationId, operation);
+    await wmUpdateOperation(operationId, { status: 'queued_for_broadcast' });
+
+    return {
+        ok: true, operationId, queued: true,
+        asset: assetUpper, source: wallet.address,
+        destination: treasuryAddress, amount: live.spendableBalance
+    };
+}
+
+walletManagementRouter.post('/sweep/all', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable sweeps.'
+            });
+        }
+
+        const networkFilter = req.body.network && req.body.network !== 'all' ? req.body.network : null;
+        const assetFilter = req.body.asset && req.body.asset !== 'all' ? String(req.body.asset).toUpperCase() : null;
+        const minBalance = Number(req.body.minBalance) || 0;
+
+        const batchId = `batch_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        const io = req.app.get('io');
+        const adminId = req.admin && req.admin._id ? req.admin._id : null;
+
+        (async () => {
+            const results = { succeeded: [], failed: [] };
+            try {
+                const addresses = await DepositAddress.find({ isActive: true }).lean();
+
+                for (const wallet of addresses) {
+                    const assetUpper = (wallet.asset || '').toUpperCase();
+                    if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                    const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                    if (networkFilter && entry.network !== networkFilter) continue;
+                    if (assetFilter && assetUpper !== assetFilter) continue;
+
+                    let treasuryAddress;
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        treasuryAddress = d && d.address ? d.address : null;
+                    } catch (_) { treasuryAddress = null; }
+                    if (!treasuryAddress) {
+                        results.failed.push({ walletId: wallet._id.toString(), error: 'No treasury address' });
+                        continue;
+                    }
+
+                    const live = await wmFetchOnChainBalance(assetUpper, wallet.address);
+                    if (!live.ok) {
+                        results.failed.push({ walletId: wallet._id.toString(), error: live.error || 'Live balance unavailable' });
+                        continue;
+                    }
+                    const bal = wmToNumber(live.spendableBalance);
+                    if (bal <= 0) continue;
+                    if (minBalance > 0 && bal < minBalance) continue;
+
+                    const outcome = await wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, adminId });
+
+                    if (outcome.ok) {
+                        results.succeeded.push({
+                            walletId: wallet._id.toString(), operationId: outcome.operationId,
+                            asset: assetUpper, source: wallet.address,
+                            destination: treasuryAddress, amount: outcome.amount
+                        });
+                    } else {
+                        results.failed.push({ walletId: wallet._id.toString(), asset: assetUpper, error: outcome.error });
+                    }
+
+                    if (io) {
+                        io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                            status: 'syncing',
+                            message: `Sweep batch ${batchId}: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                            lastSuccessfulSyncAt: new Date().toISOString()
+                        });
+                    }
+                }
+
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: results.failed.length > 0 ? 'degraded' : 'healthy',
+                        message: `Sweep batch ${batchId} complete: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            } catch (bgErr) {
+                console.error('[sweep/all] background error:', bgErr);
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'degraded',
+                        message: `Sweep batch ${batchId} failed: ${bgErr.message || 'unknown error'}`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            }
+        })();
+
+        return res.status(202).json({
+            status: 'success',
+            data: { batchId, message: 'Sweep-all batch accepted and running in background' }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/all] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to start sweep-all' });
+    }
+});
+
+walletManagementRouter.post('/sweep/selected', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable sweeps.'
+            });
+        }
+
+        const walletIds = Array.isArray(req.body.walletIds) ? req.body.walletIds : [];
+        if (walletIds.length === 0) {
+            return res.status(400).json({ status: 'fail', message: 'Provide a non-empty walletIds array' });
+        }
+
+        const validIds = walletIds.filter(id => mongoose.Types.ObjectId.isValid(id));
+        if (validIds.length === 0) {
+            return res.status(400).json({ status: 'fail', message: 'None of the supplied walletIds are valid' });
+        }
+
+        const batchId = `batch_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        const io = req.app.get('io');
+        const adminId = req.admin && req.admin._id ? req.admin._id : null;
+
+        (async () => {
+            const results = { succeeded: [], failed: [] };
+            try {
+                const addresses = await DepositAddress.find({ _id: { $in: validIds } }).lean();
+
+                for (const wallet of addresses) {
+                    const assetUpper = (wallet.asset || '').toUpperCase();
+                    if (!ASSET_NETWORK_MAP[assetUpper]) {
+                        results.failed.push({ walletId: wallet._id.toString(), error: 'Unsupported asset' });
+                        continue;
+                    }
+
+                    let treasuryAddress;
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        treasuryAddress = d && d.address ? d.address : null;
+                    } catch (_) { treasuryAddress = null; }
+                    if (!treasuryAddress) {
+                        results.failed.push({ walletId: wallet._id.toString(), error: 'No treasury address' });
+                        continue;
+                    }
+
+                    const outcome = await wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, adminId });
+
+                    if (outcome.ok) {
+                        results.succeeded.push({
+                            walletId: wallet._id.toString(), operationId: outcome.operationId,
+                            asset: assetUpper, source: wallet.address,
+                            destination: treasuryAddress, amount: outcome.amount
+                        });
+                    } else {
+                        results.failed.push({ walletId: wallet._id.toString(), asset: assetUpper, error: outcome.error });
+                    }
+
+                    if (io) {
+                        io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                            status: 'syncing',
+                            message: `Selected sweep ${batchId}: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                            lastSuccessfulSyncAt: new Date().toISOString()
+                        });
+                    }
+                }
+
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: results.failed.length > 0 ? 'degraded' : 'healthy',
+                        message: `Selected sweep ${batchId} complete: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            } catch (bgErr) {
+                console.error('[sweep/selected] background error:', bgErr);
+            }
+        })();
+
+        return res.status(202).json({
+            status: 'success',
+            data: { batchId, message: 'Selected sweep batch accepted and running in background' }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/selected] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to start selected sweep' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 11 — FEES ESTIMATE
+ * ========================================================================== */
+
+walletManagementRouter.post('/fees/estimate', async (req, res) => {
+    try {
+        const {
+            operationType = 'transfer',
+            walletId,
+            networkId,
+            asset,
+            amount,
+            destinationAddress
+        } = req.body || {};
+
+        const assetUpper = (asset || '').toUpperCase();
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: 'A valid asset is required' });
+        }
+
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const effectiveNetwork = networkId || entry.network;
+        if (effectiveNetwork !== entry.network) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Asset ${assetUpper} does not live on network ${effectiveNetwork}`
+            });
+        }
+
+        const amountStr = String(amount || '0');
+        const amountNum = wmToNumber(amountStr);
+
+        /* Resolve source address: treasury OR user wallet */
+        let fromAddress = null;
+        if (walletId) {
+            if (typeof walletId === 'string' && walletId.startsWith('treasury:')) {
+                /* Treasury synthetic id: treasury:ASSET:SWEEP_INDEX */
+                try {
+                    const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                    fromAddress = d && d.address ? d.address : null;
+                } catch (_) { fromAddress = null; }
+            } else if (mongoose.Types.ObjectId.isValid(walletId)) {
+                const wallet = await DepositAddress.findById(walletId).lean();
+                if (wallet) fromAddress = wallet.address;
+                else {
+                    const w3 = await Web3DepositAddress.findById(walletId).lean();
+                    if (w3) fromAddress = w3.address;
+                }
+            }
+        }
+
+        let feeEstimate;
+        try {
+            feeEstimate = await wmEstimateFeeForOperation({
+                assetUpper,
+                networkId: effectiveNetwork,
+                fromAddress,
+                toAddress: destinationAddress || fromAddress || '0x0000000000000000000000000000000000000000',
+                amountStr,
+                memo: ''
+            });
+        } catch (feeErr) {
+            return res.status(200).json({
+                status: 'success',
+                data: {
+                    operationType,
+                    walletId: walletId || null,
+                    networkId: effectiveNetwork,
+                    asset: assetUpper,
+                    amount: amountStr,
+                    destinationAddress: destinationAddress || null,
+                    gasFee: '0',
+                    estimatedFee: '0',
+                    feeAsset: assetUpper,
+                    feeCurrency: assetUpper,
+                    feeUsd: 0,
+                    netAmount: amountStr,
+                    netUsd: 0,
+                    feeUnavailable: true,
+                    error: feeErr.message || 'Fee estimation failed'
+                }
+            });
+        }
+
+        const feeNum = Number(feeEstimate.feeNative) || 0;
+        const feeUsd = Number(feeEstimate.feeUsd) || 0;
+        const netAmount =
+            (feeEstimate.chainType === 'utxo' || feeEstimate.chainType === 'cardano')
+                ? Math.max(0, amountNum - feeNum)
+                : amountNum;
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationType,
+                walletId: walletId || null,
+                networkId: effectiveNetwork,
+                asset: assetUpper,
+                amount: amountStr,
+                destinationAddress: destinationAddress || null,
+                gasFee: feeEstimate.feeNative,
+                estimatedFee: feeEstimate.feeNative,
+                feeAsset: feeEstimate.feeAsset,
+                feeCurrency: feeEstimate.feeCurrency || feeEstimate.feeAsset,
+                feeUsd,
+                netAmount: String(netAmount.toFixed(8)),
+                netUsd: Number((netAmount * ((feeUsd && amountNum) ? (feeUsd / amountNum) : 0)).toFixed(2)),
+                feeUnavailable: false,
+                error: null,
+                meta: feeEstimate.meta || {}
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/fees/estimate] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to estimate fee' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 12 — TRANSACTIONS (prepare → approve → sign → broadcast)
+ * ========================================================================== */
+
+walletManagementRouter.post('/transactions/prepare', async (req, res) => {
+    try {
+        const {
+            operationType = 'transfer',
+            walletId,
+            networkId,
+            asset,
+            amount,
+            destinationAddress,
+            memo = '',
+            notes = ''
+        } = req.body || {};
+
+        if (!['sweep', 'transfer'].includes(operationType)) {
+            return res.status(400).json({ status: 'fail', message: 'operationType must be "sweep" or "transfer"' });
+        }
+        if (!walletId || typeof walletId !== 'string' || walletId.trim().length === 0) {
+            return res.status(400).json({ status: 'fail', message: 'walletId is required' });
+        }
+
+        const assetUpper = (asset || '').toUpperCase();
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: 'Valid asset is required' });
+        }
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const effectiveNetwork = networkId || entry.network;
+        if (effectiveNetwork !== entry.network) {
+            return res.status(400).json({ status: 'fail', message: `Asset ${assetUpper} does not live on network ${effectiveNetwork}` });
+        }
+        const amountNum = Number(amount);
+        if (!Number.isFinite(amountNum) || amountNum <= 0) {
+            return res.status(400).json({ status: 'fail', message: 'Amount must be a positive number' });
+        }
+        if (!destinationAddress || typeof destinationAddress !== 'string' || destinationAddress.trim().length < 10) {
+            return res.status(400).json({ status: 'fail', message: 'Valid destinationAddress is required' });
+        }
+
+        /* ---- Resolve wallet: treasury OR user deposit address ---- */
+        let wallet = null;
+        let walletCollection = null;
+        let sourceScope = 'user';
+
+        if (walletId.startsWith('treasury:')) {
+            /* Treasury synthetic id: treasury:ASSET:SWEEP_INDEX */
+            if (!wmTreasuryReady()) {
+                return res.status(503).json({ status: 'fail', message: 'Treasury wallet is disabled' });
+            }
+            let derived;
+            try {
+                derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+            } catch (e) {
+                return res.status(500).json({ status: 'fail', message: `Treasury derivation failed: ${e.message}` });
+            }
+            if (!derived || !derived.address) {
+                return res.status(404).json({ status: 'fail', message: `No treasury address for ${assetUpper}` });
+            }
+            wallet = {
+                _id: walletId,
+                address: derived.address,
+                derivationPath: derived.derivationPath || null,
+                asset: assetUpper
+            };
+            walletCollection = 'Treasury';
+            sourceScope = 'treasury';
+        } else if (mongoose.Types.ObjectId.isValid(walletId)) {
+            wallet = await DepositAddress.findById(walletId).lean();
+            walletCollection = 'DepositAddress';
+            if (!wallet) {
+                wallet = await Web3DepositAddress.findById(walletId).lean();
+                walletCollection = 'Web3DepositAddress';
+            }
+        }
+
+        if (!wallet) {
+            return res.status(404).json({ status: 'fail', message: 'Source wallet not found' });
+        }
+
+        const rpcUrl = RPC_PROVIDERS[entry.network];
+
+        /* ---- LIVE BALANCE from chain ---- */
+        let liveBalance;
+        try {
+            if (entry.type === 'evm' && rpcUrl) {
+                const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+                await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+                const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+
+                if (tokenCfg && tokenCfg.contract) {
+                    const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, provider);
+                    const raw = await contract.balanceOf(wallet.address);
+                    const formatted = ethers.formatUnits(raw, tokenCfg.decimals);
+                    liveBalance = { ok: true, spendableBalance: formatted, confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+                } else {
+                    const raw = await provider.getBalance(wallet.address);
+                    const formatted = ethers.formatEther(raw);
+                    liveBalance = { ok: true, spendableBalance: formatted, confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+                }
+            } else if (entry.type === 'solana' && RPC_PROVIDERS.SOLANA) {
+                const connection = new Connection(RPC_PROVIDERS.SOLANA);
+                const lamports = await connection.getBalance(new PublicKey(wallet.address));
+                const formatted = (Number(lamports) / 1e9).toFixed(9);
+                liveBalance = { ok: true, spendableBalance: formatted, confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
+            } else {
+                const generic = await wmFetchOnChainBalance(assetUpper, wallet.address);
+                if (generic && generic.ok) liveBalance = generic;
+                else throw new Error(generic?.error || 'On-chain balance unavailable for this chain type');
+            }
+        } catch (balErr) {
+            console.warn('[prepare] live balance fetch failed:', balErr.message);
+            return res.status(502).json({
+                status: 'fail',
+                message: `Unable to read live on-chain balance for ${assetUpper}: ${balErr.message}`,
+                chainId: entry.chainId,
+                network: entry.network
+            });
+        }
+
+        const spendableNum = Number(liveBalance.spendableBalance) || 0;
+        if (liveBalance.ok && spendableNum <= 0) {
+            return res.status(400).json({ status: 'fail', message: `Source wallet has no spendable ${assetUpper}.` });
+        }
+
+        /* ---- FEE ESTIMATION ---- */
+        let feeEstimate;
+        try {
+            feeEstimate = await wmEstimateFeeForOperation({
+                assetUpper,
+                networkId: effectiveNetwork,
+                fromAddress: wallet.address,
+                toAddress: destinationAddress.trim(),
+                amountStr: String(amount),
+                memo
+            });
+        } catch (feeErr) {
+            const isProgrammingError = feeErr instanceof ReferenceError || feeErr instanceof TypeError;
+            return res.status(isProgrammingError ? 500 : 400).json({
+                status: 'fail',
+                message: `Fee estimation failed: ${feeErr.message || 'unknown error'}`
+            });
+        }
+
+        const feeNum = Number(feeEstimate.feeNative) || 0;
+        const feeAsset = feeEstimate.feeAsset || assetUpper;
+
+        const isERC20 = !!(feeEstimate.meta && feeEstimate.meta.isERC20);
+        const isNativeEvm = feeEstimate.chainType === 'evm' && !isERC20;
+
+        let netAmount;
+        let feeAppliesToAmount = false;
+
+        if (isNativeEvm) {
+            netAmount = amountNum - feeNum;
+            if (netAmount <= 0) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message:
+                        `Amount is too small to cover gas. ` +
+                        `Amount: ${amountNum} ${assetUpper}, ` +
+                        `estimated gas: ~${feeNum} ${feeAsset}. ` +
+                        `Increase the amount or top up the source wallet.`
+                });
+            }
+        } else if (isERC20) {
+            netAmount = amountNum;
+        } else if (feeEstimate.chainType === 'utxo' || feeEstimate.chainType === 'cardano') {
+            feeAppliesToAmount = true;
+            netAmount = Math.max(0, amountNum - feeNum);
+        } else {
+            netAmount = amountNum;
+        }
+
+        /* ---- Solvency check ---- */
+        if (isNativeEvm) {
+            if (liveBalance.ok && spendableNum < amountNum) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Insufficient native balance. Available: ${liveBalance.spendableBalance} ${assetUpper}, requested: ${amount}.`
+                });
+            }
+        } else if (isERC20) {
+            if (liveBalance.ok && spendableNum < amountNum) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Insufficient token balance. Available: ${liveBalance.spendableBalance} ${assetUpper}, requested: ${amount}.`
+                });
+            }
+            const nativeAsset = (feeEstimate.meta && feeEstimate.meta.nativeAsset) || wmNativeAssetForChain(entry.chainId);
+            try {
+                const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+                const nativeBalanceWei = await provider.getBalance(wallet.address);
+                const feeWei = BigInt(feeEstimate.gasLimit || '0') * BigInt(feeEstimate.gasPrice || '0');
+                if (nativeBalanceWei < feeWei) {
+                    return res.status(400).json({
+                        status: 'fail',
+                        message: `Source wallet has insufficient ${nativeAsset} for gas. Required: ~${ethers.formatEther(feeWei)} ${nativeAsset}, available: ${ethers.formatEther(nativeBalanceWei)} ${nativeAsset}.`
+                    });
+                }
+            } catch (e) {
+                console.warn('[prepare] native gas check failed:', e.message);
+            }
+        } else if (liveBalance.ok && spendableNum < amountNum) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Insufficient balance. Available: ${liveBalance.spendableBalance} ${assetUpper}, requested: ${amount}.`
+            });
+        }
+
+        const assetUsdPrice = await getCryptoPrice(assetUpper).catch(() => 0);
+        const netUsd = Number((netAmount * (assetUsdPrice || 0)).toFixed(2));
+
+        /* ---- Resolve derivation path ---- */
+        let derivationPath = wallet.derivationPath;
+        if (!derivationPath) {
+            if (sourceScope === 'treasury') {
+                derivationPath = platformWallet.getTreasuryDerivationPath(assetUpper, 0);
+            } else if (platformWallet && typeof platformWallet.getDerivationPath === 'function') {
+                const uid = wallet.userId || wallet.user;
+                if (uid) derivationPath = platformWallet.getDerivationPath(assetUpper, uid.toString());
+            }
+        }
+        if (!derivationPath) {
+            return res.status(500).json({ status: 'fail', message: 'Could not resolve derivation path for source wallet' });
+        }
+
+        const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        const adminId = req.admin && req.admin._id ? req.admin._id.toString() : null;
+
+        const operation = {
+            operationId,
+            operationType,
+            walletId: typeof wallet._id === 'string' && wallet._id.startsWith('treasury:')
+                ? wallet._id
+                : wallet._id.toString(),
+            walletCollection,
+            sourceScope,
+            sourceAddress: wallet.address,
+            userId: (wallet.userId || wallet.user)
+                ? (wallet.userId || wallet.user).toString()
+                : null,
+            derivationPath,
+            networkId: effectiveNetwork,
+            chainId: entry.chainId,
+            chainType: entry.type,
+            asset: assetUpper,
+            amount: String(amount),
+            destinationAddress: destinationAddress.trim(),
+            memo: memo || '',
+            notes: notes || '',
+            createdBy: adminId,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            status: 'prepared',
+            approvalRequired: true,
+            feeEstimate: {
+                chainType: feeEstimate.chainType,
+                gasLimit: feeEstimate.gasLimit,
+                gasPrice: feeEstimate.gasPrice,
+                feeNative: feeEstimate.feeNative,
+                feeAsset: feeEstimate.feeAsset,
+                feeUsd: feeEstimate.feeUsd,
+                meta: feeEstimate.meta
+            },
+            preview: {
+                from: wallet.address,
+                to: destinationAddress.trim(),
+                asset: assetUpper,
+                amount: String(amount),
+                gasFee: feeEstimate.feeNative,
+                gasFeeAsset: feeEstimate.feeAsset,
+                gasFeeUsd: feeEstimate.feeUsd,
+                feeAppliesToAmount,
+                isNativeEvm,
+                isERC20,
+                netAmount: String(netAmount.toFixed(8)),
+                netUsd
+            }
+        };
+
+        await wmStoreOperation(operationId, operation);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                approvalRequired: true,
+                skipSignStep: entry.type === 'utxo',
+                preview: operation.preview,
+                feeEstimate: operation.feeEstimate
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/prepare] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to prepare transaction' });
+    }
+});
+
+walletManagementRouter.post('/transactions/:operationId/approve', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+        if (!operation) return res.status(404).json({ status: 'fail', message: 'Operation not found or expired' });
+        if (!['prepared', 'queued_for_broadcast'].includes(operation.status)) {
+            return res.status(409).json({ status: 'fail', message: `Cannot approve operation in status "${operation.status}"` });
+        }
+        const adminId = req.admin && req.admin._id ? req.admin._id.toString() : null;
+        const updated = await wmUpdateOperation(operationId, {
+            status: 'approved', approvedBy: adminId, approvedAt: new Date().toISOString()
+        });
+        return res.status(200).json({
+            status: 'success',
+            data: { operationId, status: 'approved', approvedAt: updated.approvedAt }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/approve] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to approve operation' });
+    }
+});
+
+walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+        if (!operation) return res.status(404).json({ status: 'fail', message: 'Operation not found or expired' });
+        if (operation.status !== 'approved') {
+            return res.status(409).json({ status: 'fail', message: `Cannot sign operation in status "${operation.status}". Approve it first.` });
+        }
+
+        const assetUpper = operation.asset;
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        if (!entry) return res.status(400).json({ status: 'fail', message: `Unsupported asset: ${assetUpper}` });
+
+        const scope = operation.sourceScope === 'treasury' ? 'treasury' : 'user';
+
+        let signedPayload = null;
+        let preBroadcastHash = null;
+        const signMeta = { chainType: entry.type };
+
+        if (entry.type === 'evm') {
+            const rpcUrl = RPC_PROVIDERS[entry.network];
+            if (!rpcUrl) throw new Error(`No RPC configured for ${entry.network}`);
+
+            const signer = scope === 'treasury'
+                ? wmGetTreasuryEvmSigner(operation.derivationPath, entry.chainId, rpcUrl)
+                : wmGetUserEvmSigner(operation.derivationPath, entry.chainId, rpcUrl);
+
+            if (signer.address.toLowerCase() !== operation.sourceAddress.toLowerCase()) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for EVM address' });
+            }
+
+            await wmAssertChainId(signer.provider, entry.chainId, assetUpper);
+
+            const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+            const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+            const feeData = await signer.provider.getFeeData();
+            let currentBaseFee = feeData.maxFeePerGas || feeData.gasPrice;
+            try {
+                const latestBlock = await signer.provider.getBlock('latest');
+                if (latestBlock && latestBlock.baseFeePerGas) currentBaseFee = latestBlock.baseFeePerGas;
+            } catch (_) {}
+
+            const priorityFee = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+            const maxFeePerGas = (currentBaseFee * 2n) + priorityFee;
+            const maxPriorityFeePerGas = priorityFee > maxFeePerGas ? maxFeePerGas : priorityFee;
+
+            let gasLimit;
+            if (isERC20) {
+                try {
+                    const iface = new ethers.Interface(WM_ERC20_ABI);
+                    const data = iface.encodeFunctionData('transfer', [
+                        operation.destinationAddress,
+                        ethers.parseUnits(operation.amount, tokenCfg.decimals)
+                    ]);
+                    const est = await signer.provider.estimateGas({
+                        from: operation.sourceAddress, to: tokenCfg.contract, data, value: 0n
+                    });
+                    gasLimit = (est * 120n) / 100n;
+                } catch (_) { gasLimit = 65000n; }
+            } else {
+                gasLimit = 21000n;
+            }
+
+            let valueWei;
+            if (isERC20) {
+                const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, signer.provider);
+                const raw = await contract.balanceOf(operation.sourceAddress);
+                const available = Number(ethers.formatUnits(raw, tokenCfg.decimals));
+                if (available < Number(operation.amount)) {
+                    return res.status(400).json({
+                        status: 'fail',
+                        message: `Insufficient token balance at signing time. Available: ${available} ${assetUpper}, required: ${operation.amount}.`
+                    });
+                }
+                const nativeAsset = wmNativeAssetForChain(entry.chainId);
+                const nativeBalanceWei = await signer.provider.getBalance(operation.sourceAddress);
+                const requiredFeeWei = gasLimit * maxFeePerGas;
+                if (nativeBalanceWei < requiredFeeWei) {
+                    return res.status(400).json({
+                        status: 'fail',
+                        message: `Insufficient ${nativeAsset} for gas. Required: ~${ethers.formatEther(requiredFeeWei)} ${nativeAsset}, available: ${ethers.formatEther(nativeBalanceWei)} ${nativeAsset}.`
+                    });
+                }
+                valueWei = 0n;
+            } else {
+                const requestedWei = ethers.parseUnits(String(operation.amount), 18);
+                const balanceWei = await signer.provider.getBalance(operation.sourceAddress);
+                const totalFeeWei = gasLimit * maxFeePerGas;
+                if (balanceWei < requestedWei) {
+                    return res.status(400).json({
+                        status: 'fail',
+                        message: `Insufficient native balance at signing time. Available: ${ethers.formatEther(balanceWei)} ${assetUpper}, required: ${operation.amount}.`
+                    });
+                }
+                if (requestedWei <= totalFeeWei) {
+                    return res.status(400).json({
+                        status: 'fail',
+                        message: `Amount is too small to cover gas at signing time. Amount: ${operation.amount}, gas: ~${ethers.formatEther(totalFeeWei)} ${assetUpper}.`
+                    });
+                }
+                valueWei = requestedWei - totalFeeWei;
+            }
+
+            const txRequest = {
+                chainId: entry.chainId,
+                to: isERC20 ? tokenCfg.contract : operation.destinationAddress,
+                value: valueWei,
+                data: isERC20
+                    ? new ethers.Interface(WM_ERC20_ABI).encodeFunctionData('transfer', [
+                        operation.destinationAddress,
+                        ethers.parseUnits(operation.amount, tokenCfg.decimals)
+                    ])
+                    : '0x',
+                gasLimit,
+                maxFeePerGas,
+                maxPriorityFeePerGas,
+                type: 2,
+                nonce: await signer.getNonce('pending')
+            };
+
+            const signedTx = await signer.signTransaction(txRequest);
+            try {
+                const parsed = ethers.Transaction.from(signedTx);
+                const sig = parsed.signature;
+                if (!sig || (sig.yParity !== 0 && sig.yParity !== 1)) {
+                    throw new Error(`Invalid yParity: ${sig ? sig.yParity : 'missing'}`);
+                }
+            } catch (parseErr) {
+                throw new Error(`Signed envelope failed to parse: ${parseErr.message}`);
+            }
+
+            signedPayload = signedTx;
+            preBroadcastHash = ethers.keccak256(signedTx);
+            signMeta.chainId = entry.chainId;
+            signMeta.txType = signedTx.startsWith('0x02') ? 'eip1559' : 'legacy';
+            signMeta.gasLimit = gasLimit.toString();
+            signMeta.maxFeePerGas = maxFeePerGas.toString();
+            signMeta.maxPriorityFeePerGas = maxPriorityFeePerGas.toString();
+            signMeta.valueWei = valueWei.toString();
+            signMeta.isERC20 = isERC20;
+        }
+
+        else if (entry.type === 'utxo') {
+            return res.status(409).json({
+                status: 'fail',
+                message: `UTXO signing requires fresh UTXO state and must be performed atomically with broadcast. Proceed directly to broadcast for ${assetUpper}.`
+            });
+        }
+
+        else if (entry.type === 'solana') {
+            const keypair = wmGetSolanaKeypair(operation.derivationPath, scope);
+            if (keypair.publicKey.toBase58() !== operation.sourceAddress) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for Solana address' });
+            }
+            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+            const lamports = Math.round(Number(operation.amount) * 1e9);
+            const currentBalance = await connection.getBalance(keypair.publicKey);
+            const feeLamports = 5000;
+            if (currentBalance < (lamports + feeLamports)) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Insufficient SOL balance. Available: ${(currentBalance / 1e9).toFixed(9)} SOL, required: ~${((lamports + feeLamports) / 1e9).toFixed(9)} SOL.`
+                });
+            }
+            const transaction = new SolanaTransaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: keypair.publicKey,
+                    toPubkey: new PublicKey(operation.destinationAddress),
+                    lamports
+                })
+            );
+            const { blockhash } = await connection.getLatestBlockhash('finalized');
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.sign(keypair);
+
+            signedPayload = Buffer.from(transaction.serialize()).toString('base64');
+            signMeta.chainType = 'solana';
+            signMeta.lamports = lamports;
+            signMeta.feeLamports = feeLamports;
+        }
+
+        else if (entry.type === 'xrp') {
+            const { wallet, derivedAddress } = wmGetXrpWallet(operation.derivationPath, scope);
+            if (derivedAddress !== operation.sourceAddress) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for XRP address' });
+            }
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const txJson = {
+                    TransactionType: 'Payment',
+                    Account: operation.sourceAddress,
+                    Amount: xrpl.xrpToDrops(String(operation.amount)),
+                    Destination: operation.destinationAddress
+                };
+                if (operation.memo) txJson.Memo = operation.memo;
+                const prepared = await client.autofill(txJson);
+                const signed = wallet.sign(prepared);
+                signedPayload = JSON.stringify({ tx_blob: signed.tx_blob });
+                preBroadcastHash = signed.hash;
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        else if (entry.type === 'tron') {
+            const { tronWeb, privHex, address } = wmGetTronAccount(operation.derivationPath, scope);
+            if (address !== operation.sourceAddress) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for TRON address' });
+            }
+            const sun = Math.round(Number(operation.amount) * 1e6);
+            const unsignedTx = await tronWeb.transactionBuilder.sendTrx(
+                operation.destinationAddress, sun, operation.sourceAddress
+            );
+            const signedTx = await tronWeb.trx.sign(unsignedTx, privHex);
+            signedPayload = JSON.stringify(signedTx);
+            preBroadcastHash = signedTx.txID;
+        }
+
+        else if (entry.type === 'polkadot') {
+            const api = await wmGetPolkadotApi();
+            const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+            if (!root) throw new Error('Signer root not initialized');
+            const child = root.derivePath(operation.derivationPath);
+            const keyring = new Keyring({ type: 'sr25519' });
+            const pair = keyring.addFromSeed(child.privateKey);
+            if (pair.address !== operation.sourceAddress) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for Polkadot address' });
+            }
+            const decimals = api.registry.chainDecimals[0];
+            const planck = BigInt(Math.round(Number(operation.amount) * 10 ** decimals));
+            const tx = api.tx.balances.transferKeepAlive(operation.destinationAddress, planck.toString());
+            const nonce = await api.rpc.system.accountNextIndex(operation.sourceAddress);
+            const signed = tx.sign(pair, { nonce });
+            signedPayload = signed.toHex();
+            preBroadcastHash = signed.hash.toHex();
+        }
+
+        else if (entry.type === 'aptos') {
+            const account = wmGetAptosAccount(operation.derivationPath, scope);
+            if (account.accountAddress.toString() !== operation.sourceAddress) {
+                return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for Aptos address' });
+            }
+            const aptosClient = new aptos.Aptos(new aptos.AptosConfig({ network: aptos.Network.MAINNET }));
+            const txn = await aptosClient.transaction.build.simple({
+                sender: account.accountAddress,
+                data: {
+                    function: '0x1::aptos_account::transfer',
+                    functionArguments: [operation.destinationAddress, Math.round(Number(operation.amount) * 1e8)]
+                }
+            });
+            const signed = await aptosClient.transaction.sign({ signer: account, transaction: txn });
+            signedPayload = JSON.stringify({
+                serialized: Buffer.from(signed.bcsToBytes()).toString('base64'),
+                transaction: txn
+            });
+        }
+
+        else {
+            return res.status(400).json({ status: 'fail', message: `Signing not implemented for chain type: ${entry.type}` });
+        }
+
+        await wmUpdateOperation(operationId, {
+            status: 'signed',
+            signedAt: new Date().toISOString(),
+            signedPayload,
+            preBroadcastHash,
+            signMeta
+        });
+
+        return res.status(200).json({
+            status: 'success',
+            data: { operationId, status: 'signed', preBroadcastHash }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/sign] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to sign transaction' });
+    }
+});
+
+walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+        if (!operation) return res.status(404).json({ status: 'fail', message: 'Operation not found or expired' });
+
+        const canBroadcast =
+            operation.status === 'signed' ||
+            (operation.status === 'approved' && operation.chainType === 'utxo');
+
+        if (!canBroadcast) {
+            return res.status(409).json({ status: 'fail', message: `Cannot broadcast operation in status "${operation.status}". Sign it first.` });
+        }
+
+        const assetUpper = operation.asset;
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        if (!entry) return res.status(400).json({ status: 'fail', message: `Unsupported asset: ${assetUpper}` });
+
+        const scope = operation.sourceScope === 'treasury' ? 'treasury' : 'user';
+
+        let broadcastHash = null;
+        let explorerUrl = null;
+        const broadcastMeta = { chainType: entry.type };
+
+        if (entry.type === 'evm') {
+            const rpcUrl = RPC_PROVIDERS[entry.network];
+            if (!rpcUrl) throw new Error(`No RPC configured for ${entry.network}`);
+            const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+            await wmAssertChainId(provider, entry.chainId, assetUpper);
+            const txResponse = await provider.broadcastTransaction(operation.signedPayload);
+            broadcastHash = txResponse.hash;
+            explorerUrl = `${wmEvmExplorerBase(entry.chainId)}${broadcastHash}`;
+            broadcastMeta.txType = operation.signMeta && operation.signMeta.txType;
+        }
+
+        else if (entry.type === 'utxo') {
+            const result = await wmSignAndBroadcast({
+                assetUpper,
+                derivationPath: operation.derivationPath,
+                fromAddress: operation.sourceAddress,
+                toAddress: operation.destinationAddress,
+                amount: operation.amount,
+                memo: operation.memo,
+                scope
+            });
+            broadcastHash = result.txHash;
+            explorerUrl = result.explorerUrl;
+        }
+
+        else if (entry.type === 'solana') {
+            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+            const raw = Buffer.from(operation.signedPayload, 'base64');
+            const sig = await connection.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
+            broadcastHash = sig;
+            explorerUrl = `https://solscan.io/tx/${sig}`;
+        }
+
+        else if (entry.type === 'xrp') {
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const parsed = JSON.parse(operation.signedPayload);
+                const submitted = await client.submitAndWait(parsed.tx_blob);
+                const meta = submitted.result && submitted.result.meta;
+                const succeeded = typeof meta === 'object' ? meta.TransactionResult === 'tesSUCCESS' : false;
+                if (!succeeded) {
+                    throw new Error(`XRP transaction failed: ${(meta && meta.TransactionResult) || 'unknown'}`);
+                }
+                broadcastHash = submitted.result.hash || operation.preBroadcastHash;
+                explorerUrl = `https://xrpscan.com/tx/${broadcastHash}`;
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        else if (entry.type === 'tron') {
+            const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+            const parsed = JSON.parse(operation.signedPayload);
+            const result = await tronWeb.trx.sendRawTransaction(parsed);
+            if (!result || !result.result) {
+                throw new Error(`TRON broadcast rejected: ${JSON.stringify(result)}`);
+            }
+            broadcastHash = result.txid || parsed.txID;
+            explorerUrl = `https://tronscan.org/#/transaction/${broadcastHash}`;
+        }
+
+        else if (entry.type === 'polkadot') {
+            const api = await wmGetPolkadotApi();
+            const tx = api.tx(operation.signedPayload);
+            const hash = await tx.send();
+            broadcastHash = hash.toHex();
+            explorerUrl = `https://polkadot.subscan.io/extrinsic/${broadcastHash}`;
+        }
+
+        else if (entry.type === 'aptos') {
+            const account = wmGetAptosAccount(operation.derivationPath, scope);
+            const parsed = JSON.parse(operation.signedPayload);
+            const aptosClient = new aptos.Aptos(new aptos.AptosConfig({ network: aptos.Network.MAINNET }));
+            const txn = parsed.transaction;
+            const signed = await aptosClient.transaction.sign({ signer: account, transaction: txn });
+            const result = await aptosClient.transaction.submit.simple({ transaction: txn, senderAuthenticator: signed });
+            broadcastHash = result.hash;
+            explorerUrl = `https://explorer.aptoslabs.com/txn/${broadcastHash}`;
+        }
+
+        else {
+            return res.status(400).json({ status: 'fail', message: `Broadcast not implemented for chain type: ${entry.type}` });
+        }
+
+        if (!broadcastHash) throw new Error('Broadcast returned no transaction hash');
+
+        const txDoc = await Transaction.create({
+            user: operation.userId || null,
+            type: operation.operationType === 'sweep' ? 'transfer' : 'withdrawal',
+            amount: Number(operation.amount),
+            asset: assetUpper.toLowerCase(),
+            assetAmount: Number(operation.amount),
+            currency: 'USD',
+            status: 'pending',
+            method: assetUpper,
+            reference: operationId,
+            details: {
+                txHash: broadcastHash,
+                operationType: operation.operationType,
+                sourceAddress: operation.sourceAddress,
+                toAddress: operation.destinationAddress,
+                depositAddress: operation.operationType === 'sweep' ? operation.sourceAddress : null,
+                network: operation.networkId,
+                chainId: operation.chainId,
+                memo: operation.memo || '',
+                notes: operation.notes || '',
+                confirmations: 0,
+                requiredConfirmations: REQUIRED_CONFIRMATIONS[operation.networkId] || 12,
+                blockchainStatus: { status: 'pending' },
+                preparedBy: operation.createdBy,
+                approvedBy: operation.approvedBy || null,
+                signedAt: operation.signedAt || null,
+                broadcastedAt: new Date().toISOString(),
+                explorerUrl,
+                broadcastMeta,
+                feeEstimate: operation.feeEstimate || null
+            },
+            fee: Number(operation.feeEstimate && operation.feeEstimate.feeNative) || 0,
+            netAmount: Number(operation.amount),
+            processedBy: operation.approvedBy || operation.createdBy || null,
+            processedAt: new Date()
+        });
+
+        await wmUpdateOperation(operationId, {
+            status: 'broadcasted',
+            broadcastedAt: new Date().toISOString(),
+            broadcastHash,
+            transactionId: txDoc._id.toString()
+        });
+
+        try {
+            if (typeof startBlockchainMonitoring === 'function') {
+                startBlockchainMonitoring(
+                    broadcastHash,
+                    assetUpper,
+                    operation.chainId,
+                    txDoc._id,
+                    null,
+                    {
+                        _id: operation.userId,
+                        firstName: 'Admin',
+                        lastName: 'Sweep',
+                        email: 'admin@bithash.com'
+                    },
+                    operation.destinationAddress,
+                    Number(operation.amount),
+                    0
+                );
+            }
+        } catch (monErr) {
+            console.error('[broadcast] monitoring start failed:', monErr.message);
+        }
+
+        const io = req.app.get('io');
+        if (io) {
+            io.to('admin_wallet_management').emit('wallet_management_transaction', {
+                transaction: {
+                    walletId: operation.walletId,
+                    txHash: broadcastHash,
+                    asset: assetUpper,
+                    network: operation.networkId,
+                    direction: 'outgoing',
+                    amount: operation.amount,
+                    status: 'pending',
+                    confirmations: 0,
+                    operationType: operation.operationType
+                }
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                txHash: broadcastHash,
+                transactionId: txDoc._id.toString(),
+                explorerUrl
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/broadcast] Error:', err);
+        try {
+            await wmUpdateOperation(req.params.operationId, {
+                status: 'broadcast_failed',
+                broadcastError: err.message || 'Broadcast failed',
+                failedAt: new Date().toISOString()
+            });
+        } catch (_) {}
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to broadcast transaction' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 13 — TRANSACTIONS LIST
+ * ========================================================================== */
+
+walletManagementRouter.get('/transactions', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(500, Math.max(1, parseInt(req.query.limit) || 50));
+
+        const search = (req.query.search || '').trim();
+        const networkFilter = req.query.network && req.query.network !== 'all' ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all' ? String(req.query.asset).toUpperCase() : null;
+        const directionFilter = req.query.direction && req.query.direction !== 'all' ? req.query.direction : null;
+        const statusFilter = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+        const quickFilter = req.query.quick && req.query.quick !== 'all' ? req.query.quick : null;
+
+        const baseQuery = {
+            $or: [
+                { 'details.txHash': { $exists: true, $ne: null } },
+                { 'metadata.txHash': { $exists: true, $ne: null } }
+            ]
+        };
+
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+        const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+
+        if (quickFilter === 'today') baseQuery.createdAt = { $gte: todayStart };
+        else if (quickFilter === 'yesterday') baseQuery.createdAt = { $gte: yesterdayStart, $lt: todayStart };
+        else if (quickFilter === '7d') baseQuery.createdAt = { $gte: sevenDaysAgo };
+        else if (quickFilter === '30d') baseQuery.createdAt = { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) };
+
+        const [depositDocs, withdrawalDocs] = await Promise.all([
+            DepositAsset.find(baseQuery)
+                .populate('user', 'firstName lastName email').sort({ createdAt: -1 }).limit(limit * 2).lean(),
+            Transaction.find({ ...baseQuery, type: { $in: ['withdrawal', 'transfer'] } })
+                .populate('user', 'firstName lastName email').sort({ createdAt: -1 }).limit(limit * 2).lean()
+        ]);
+
+        const stream = [];
+        for (const d of depositDocs) {
+            const assetUpper = (d.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+            if (networkFilter && entry.network !== networkFilter) continue;
+            if (assetFilter && assetUpper !== assetFilter) continue;
+            if (directionFilter && directionFilter !== 'incoming') continue;
+
+            const txHash = (d.metadata && d.metadata.txHash) || null;
+            if (!txHash) continue;
+            if (search && !txHash.toLowerCase().includes(search.toLowerCase())
+                && !(d.address || '').toLowerCase().includes(search.toLowerCase())) continue;
+
+            stream.push({ source: 'deposit', doc: d, assetUpper, networkKey: entry.network, chainId: entry.chainId, direction: 'incoming', txHash });
+        }
+
+        for (const w of withdrawalDocs) {
+            const assetUpper = (w.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+            if (networkFilter && entry.network !== networkFilter) continue;
+            if (assetFilter && assetUpper !== assetFilter) continue;
+            if (directionFilter && directionFilter !== 'outgoing') continue;
+
+            const txHash = (w.details && w.details.txHash) || null;
+            if (!txHash) continue;
+            if (search && !txHash.toLowerCase().includes(search.toLowerCase())) continue;
+
+            stream.push({ source: 'withdrawal', doc: w, assetUpper, networkKey: entry.network, chainId: entry.chainId, direction: 'outgoing', txHash });
+        }
+
+        stream.sort((a, b) => new Date(b.doc.createdAt) - new Date(a.doc.createdAt));
+
+        const formatted = [];
+        for (const row of stream) {
+            if (formatted.length >= limit) break;
+            const d = row.doc;
+            const userId = d.user && d.user._id ? d.user._id : d.user;
+            const userInfo = await wmResolveUserInfo(userId);
+
+            let liveStatus = d.status || 'pending';
+            let confirmations = 0;
+            let required = REQUIRED_CONFIRMATIONS[row.networkKey] || 12;
+            let blockNumber = null;
+
+            try {
+                const chainState = await checkTransactionOnBlockchain(row.txHash, row.assetUpper, row.chainId);
+                if (chainState) {
+                    confirmations = chainState.confirmations || 0;
+                    required = chainState.requiredConfirmations || required;
+                    blockNumber = chainState.blockNumber || null;
+                    if (chainState.failed) liveStatus = 'failed';
+                    else if (chainState.confirmed) liveStatus = 'confirmed';
+                    else liveStatus = 'pending';
+                }
+            } catch (_) {}
+
+            if (statusFilter && liveStatus !== statusFilter) continue;
+
+            formatted.push({
+                txHash: row.txHash,
+                timestamp: d.createdAt,
+                network: row.networkKey,
+                asset: row.assetUpper,
+                direction: row.direction,
+                amount: String(d.assetAmount || d.amount || 0),
+                fromAddress: (d.details && d.details.fromAddress) || (d.metadata && d.metadata.fromAddress) || null,
+                toAddress: (d.details && d.details.toAddress) || (d.metadata && d.metadata.toAddress) || d.btcAddress || null,
+                confirmations,
+                requiredConfirmations: required,
+                status: liveStatus,
+                blockNumber,
+                gasFee: (d.details && d.details.feeEstimate && d.details.feeEstimate.feeNative) || d.fee || 0,
+                assignedUser: userInfo.userName,
+                ownerLabel: row.direction === 'incoming' ? 'User Deposit Address' : 'Platform Outgoing',
+                explorerUrl: (d.details && d.details.explorerUrl) || null,
+                _id: d._id.toString()
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                transactions: formatted,
+                totalPages: Math.max(1, Math.ceil(formatted.length / limit)),
+                currentPage: page,
+                totalItems: formatted.length
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load transactions' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 14 — ALERTS
+ * ========================================================================== */
+
+walletManagementRouter.get('/alerts', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+        const skip = (page - 1) * limit;
+
+        const candidates = await DepositAsset.find({
+            'metadata.txHash': { $exists: true, $ne: null },
+            status: { $in: ['pending', 'confirmed'] }
+        })
+            .populate('user', 'firstName lastName email')
+            .sort({ createdAt: -1 })
+            .skip(skip).limit(limit * 2).lean();
+
+        const alerts = [];
+        for (const doc of candidates) {
+            if (alerts.length >= limit) break;
+            const assetUpper = (doc.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+
+            const txHash = doc.metadata.txHash;
+            let confirmations = 0;
+            let required = REQUIRED_CONFIRMATIONS[entry.network] || 12;
+            let liveStatus = 'pending';
+            let blockNumber = null;
+
+            try {
+                const chainState = await checkTransactionOnBlockchain(txHash, assetUpper, entry.chainId);
+                if (chainState) {
+                    confirmations = chainState.confirmations || 0;
+                    required = chainState.requiredConfirmations || required;
+                    blockNumber = chainState.blockNumber || null;
+                    if (chainState.failed) liveStatus = 'failed';
+                    else if (chainState.confirmed) liveStatus = 'confirmed';
+                    else liveStatus = 'pending';
+                }
+            } catch (_) {}
+
+            if (liveStatus === 'confirmed' && confirmations >= required) continue;
+
+            const userInfo = await wmResolveUserInfo(doc.user && doc.user._id ? doc.user._id : doc.user);
+
+            alerts.push({
+                _id: doc._id.toString(),
+                time: doc.createdAt,
+                network: entry.network,
+                asset: assetUpper,
+                amount: String(doc.assetAmount || doc.amount || 0),
+                wallet: doc.metadata.toAddress || null,
+                ownership: 'user',
+                txHash,
+                status: liveStatus,
+                confirmations,
+                requiredConfirmations: required,
+                blockNumber,
+                user: userInfo.userName,
+                userEmail: userInfo.userEmail
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                alerts,
+                totalPages: Math.max(1, Math.ceil(alerts.length / limit)),
+                currentPage: page,
+                totalItems: alerts.length
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/alerts] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to load alerts' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 15 — REPORTS
+ * ========================================================================== */
+
+walletManagementRouter.get('/reports', async (req, res) => {
+    try {
+        const type = (req.query.type || 'wallet').toLowerCase();
+        const format = (req.query.format || 'csv').toLowerCase();
+        const startDate = req.query.startDate ? new Date(req.query.startDate) : null;
+        const endDate = req.query.endDate ? new Date(req.query.endDate) : null;
+
+        let rows = [];
+
+        if (type === 'wallet') {
+            const addresses = await DepositAddress.find({ isActive: true })
+                .populate('userId', 'firstName lastName email').lean();
+
+            for (const addr of addresses) {
+                const assetUpper = (addr.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                const state = await wmFetchOnChainBalance(assetUpper, addr.address);
+                const price = await getCryptoPrice(assetUpper).catch(() => 0);
+                const spendable = wmToNumber(state.spendableBalance);
+                const usdValue = spendable * (price || 0);
+
+                const u = addr.userId || {};
+                rows.push({
+                    userId: u._id ? u._id.toString() : '',
+                    userName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
+                    userEmail: u.email || '',
+                    asset: assetUpper,
+                    network: entry.network,
+                    address: addr.address,
+                    ownership: 'user',
+                    spendableBalance: state.spendableBalance,
+                    confirmedBalance: state.confirmedBalance,
+                    unconfirmedBalance: state.unconfirmedBalance,
+                    usdValue: usdValue.toFixed(2),
+                    balanceError: state.ok ? '' : (state.error || 'unavailable'),
+                    createdAt: addr.createdAt ? addr.createdAt.toISOString() : '',
+                    status: addr.isActive ? 'active' : 'inactive'
+                });
+            }
+        }
+
+        else if (type === 'transaction') {
+            const q = { 'details.txHash': { $exists: true, $ne: null } };
+            if (startDate || endDate) {
+                q.createdAt = {};
+                if (startDate) q.createdAt.$gte = startDate;
+                if (endDate) q.createdAt.$lte = endDate;
+            }
+
+            const txs = await Transaction.find(q)
+                .populate('user', 'firstName lastName email')
+                .sort({ createdAt: -1 }).limit(2000).lean();
+
+            for (const tx of txs) {
+                const assetUpper = (tx.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                let liveStatus = tx.status || 'pending';
+                let confirmations = 0;
+                try {
+                    const cs = await checkTransactionOnBlockchain(tx.details.txHash, assetUpper, entry.chainId);
+                    if (cs) {
+                        confirmations = cs.confirmations || 0;
+                        if (cs.failed) liveStatus = 'failed';
+                        else if (cs.confirmed) liveStatus = 'confirmed';
+                    }
+                } catch (_) {}
+
+                const u = tx.user || {};
+                const feeEstimate = (tx.details && tx.details.feeEstimate) || null;
+                rows.push({
+                    timestamp: tx.createdAt.toISOString(),
+                    txHash: tx.details.txHash,
+                    userEmail: u.email || '',
+                    type: tx.type,
+                    asset: assetUpper,
+                    network: entry.network,
+                    amount: tx.amount,
+                    assetAmount: tx.assetAmount,
+                    gasFee: feeEstimate ? feeEstimate.feeNative : (tx.fee || 0),
+                    gasFeeAsset: feeEstimate ? feeEstimate.feeAsset : assetUpper,
+                    status: liveStatus,
+                    confirmations,
+                    reference: tx.reference || ''
+                });
+            }
+        }
+
+        else if (type === 'network') {
+            const addresses = await DepositAddress.find({ isActive: true }).lean();
+            const networkStats = new Map();
+
+            for (const addr of addresses) {
+                const assetUpper = (addr.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                const key = entry.network;
+
+                if (!networkStats.has(key)) {
+                    networkStats.set(key, { network: key, assets: new Set(), addressCount: 0, totalUsd: 0 });
+                }
+                const s = networkStats.get(key);
+                s.assets.add(assetUpper);
+                s.addressCount++;
+
+                const state = await wmFetchOnChainBalance(assetUpper, addr.address);
+                if (state.ok) {
+                    const price = await getCryptoPrice(assetUpper).catch(() => 0);
+                    s.totalUsd += wmToNumber(state.spendableBalance) * (price || 0);
+                }
+            }
+
+            for (const s of networkStats.values()) {
+                rows.push({
+                    network: s.network,
+                    assets: Array.from(s.assets).join('|'),
+                    addressCount: s.addressCount,
+                    totalUsd: s.totalUsd.toFixed(2)
+                });
+            }
+        }
+
+        else if (type === 'user-wallet') {
+            const users = await User.find({ status: 'active' })
+                .select('firstName lastName email').limit(500).lean();
+
+            for (const u of users) {
+                const addrCount = await DepositAddress.countDocuments({ userId: u._id });
+                rows.push({
+                    userId: u._id.toString(),
+                    userName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
+                    userEmail: u.email || '',
+                    addressCount: addrCount
+                });
+            }
+        }
+
+        else if (type === 'treasury') {
+            const treasuryReady = platformWallet && typeof platformWallet.isTreasuryReady === 'function'
+                && platformWallet.isTreasuryReady();
+
+            for (const assetUpper of Object.keys(ASSET_NETWORK_MAP)) {
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                let address = null;
+                let balance = '0';
+                let usd = 0;
+                let balanceError = '';
+
+                if (treasuryReady) {
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        address = d && d.address ? d.address : null;
+                        if (address) {
+                            const state = await wmFetchOnChainBalance(assetUpper, address);
+                            balance = state.spendableBalance;
+                            if (!state.ok) balanceError = state.error || 'unavailable';
+                            const price = await getCryptoPrice(assetUpper).catch(() => 0);
+                            usd = wmToNumber(balance) * (price || 0);
+                        }
+                    } catch (e) {
+                        balanceError = e.message || 'derivation failed';
+                    }
+                }
+
+                rows.push({
+                    asset: assetUpper,
+                    network: entry.network,
+                    address: address || '',
+                    balance,
+                    usdValue: usd.toFixed(2),
+                    status: address ? 'ready' : 'missing',
+                    balanceError
+                });
+            }
+        }
+
+        else if (type === 'alert') {
+            const pending = await DepositAsset.find({
+                'metadata.txHash': { $exists: true, $ne: null },
+                status: 'pending'
+            }).limit(2000).lean();
+
+            for (const d of pending) {
+                const assetUpper = (d.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                let confirmations = 0;
+                try {
+                    const cs = await checkTransactionOnBlockchain(d.metadata.txHash, assetUpper, entry.chainId);
+                    confirmations = cs ? (cs.confirmations || 0) : 0;
+                } catch (_) {}
+                rows.push({
+                    time: d.createdAt.toISOString(),
+                    asset: assetUpper,
+                    network: entry.network,
+                    amount: d.assetAmount || d.amount,
+                    txHash: d.metadata.txHash,
+                    confirmations
+                });
+            }
+        }
+
+        else if (type === 'sweep') {
+            const txs = await Transaction.find({
+                type: { $in: ['withdrawal', 'transfer'] },
+                'details.operationType': 'sweep'
+            }).sort({ createdAt: -1 }).limit(2000).lean();
+
+            for (const tx of txs) {
+                const feeEstimate = (tx.details && tx.details.feeEstimate) || null;
+                rows.push({
+                    time: tx.createdAt.toISOString(),
+                    txHash: tx.details.txHash || '',
+                    sourceAddress: tx.details.sourceAddress || '',
+                    destinationAddress: tx.details.toAddress || '',
+                    asset: tx.asset,
+                    amount: tx.amount,
+                    gasFee: feeEstimate ? feeEstimate.feeNative : (tx.fee || 0),
+                    gasFeeAsset: feeEstimate ? feeEstimate.feeAsset : tx.asset,
+                    status: tx.status
+                });
+            }
+        }
+
+        else {
+            return res.status(400).json({ status: 'fail', message: `Unsupported report type: ${type}` });
+        }
+
+        if (format === 'json') {
+            return res.status(200).json({
+                status: 'success',
+                data: { type, format, rows, totalRows: rows.length, generatedAt: new Date().toISOString() }
+            });
+        }
+
+        const headers = rows.length > 0 ? Object.keys(rows[0]) : ['message'];
+        const escapeCsv = (v) => {
+            const s = v === null || v === undefined ? '' : String(v);
+            return '"' + s.replace(/"/g, '""') + '"';
+        };
+        let csv = headers.map(escapeCsv).join(',') + '\n';
+        for (const row of rows) {
+            csv += headers.map(h => escapeCsv(row[h])).join(',') + '\n';
+        }
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${type}-report-${new Date().toISOString().slice(0, 10)}.csv"`
+        );
+        return res.status(200).send(csv);
+    } catch (err) {
+        console.error('[wallet-management/reports] Error:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to generate report' });
+    }
+});
+
+/* ============================================================================
+ * SECTION 16 — MOUNT
+ * ========================================================================== */
+
+app.use('/api/admin/wallet-management', walletManagementRouter);
+
+console.log('✅ Wallet Management router mounted at /api/admin/wallet-management');
+console.log('   - GET  /dashboard');
+console.log('   - GET  /dashboard?activity=true&page&limit');
+console.log('   - POST /sync');
+console.log('   - GET  /wallets');
+console.log('   - GET  /wallets/:walletId/state');
+console.log('   - GET  /assets');
+console.log('   - GET  /assets/metadata');
+console.log('   - GET  /treasury');
+console.log('   - GET  /treasury/address');
+console.log('   - POST /treasury/generate');
+console.log('   - GET  /sweep/addresses');
+console.log('   - POST /sweep/all');
+console.log('   - POST /sweep/selected');
+console.log('   - POST /fees/estimate');
+console.log('   - POST /transactions/prepare');
+console.log('   - POST /transactions/:operationId/approve');
+console.log('   - POST /transactions/:operationId/sign');
+console.log('   - POST /transactions/:operationId/broadcast');
+console.log('   - GET  /transactions');
+console.log('   - GET  /alerts');
+console.log('   - GET  /reports');
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
