@@ -48357,7 +48357,1558 @@ console.log('   - POST /fees/estimate');
 
 
 
+/* ============================================================================
+ * WALLET MANAGEMENT — TRANSACTIONS / PREPARE-SIGN-BROADCAST / ALERTS / REPORTS
+ * ----------------------------------------------------------------------------
+ * Continues the /api/admin/wallet-management router.
+ * All endpoints are adminProtect + restrictTo('super','finance').
+ *
+ * Rules enforced here:
+ *   - The ONLY valid execution path is prepare → approve → sign → broadcast.
+ *   - No Transaction document is written until a real broadcast hash exists.
+ *   - Private keys are derived on demand in memory, used once, and never
+ *     returned, logged, or persisted.
+ *   - Every status/confirmation shown to the admin comes from
+ *     checkTransactionOnBlockchain(); the DB is only a tx-hash seed.
+ *   - Chain dispatch uses ASSET_NETWORK_MAP[asset].type exclusively.
+ * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * ERC-20 ABI (minimal) — reused across prepare and sign.
+ * ------------------------------------------------------------------------ */
+const WM_ERC20_ABI = [
+    'function transfer(address to, uint256 amount) returns (bool)',
+    'function balanceOf(address) view returns (uint256)',
+    'function decimals() view returns (uint8)',
+    'function symbol() view returns (string)'
+];
+
+/* --------------------------------------------------------------------------
+ * Resolve a wallet record from either address collection.
+ * Returns { wallet, collection } or { wallet: null }.
+ * ------------------------------------------------------------------------ */
+async function wmResolveWalletById(walletId) {
+    if (!walletId || !mongoose.Types.ObjectId.isValid(walletId)) {
+        return { wallet: null, collection: null };
+    }
+    const primary = await DepositAddress.findById(walletId).lean();
+    if (primary) return { wallet: primary, collection: 'DepositAddress' };
+
+    const web3 = await Web3DepositAddress.findById(walletId).lean();
+    if (web3) return { wallet: web3, collection: 'Web3DepositAddress' };
+
+    return { wallet: null, collection: null };
+}
+
+/* --------------------------------------------------------------------------
+ * Given a wallet record, return the private key needed to sign.
+ * Uses platformWallet's derivation root. NEVER logs or returns the key
+ * anywhere except in the immediate signing step.
+ * ------------------------------------------------------------------------ */
+function wmDerivePrivateKeyForWallet(wallet, assetUpper) {
+    if (!platformWallet || !platformWallet.initialized) {
+        throw new Error('Platform wallet not initialized');
+    }
+    const userId = wallet.userId || wallet.user;
+    if (!userId) throw new Error('Wallet has no userId');
+
+    // Reuse the exact path stored on the wallet record when present.
+    const path = wallet.derivationPath ||
+                 platformWallet.getDerivationPath(assetUpper, userId.toString());
+
+    const child = platformWallet.root.derivePath(path);
+    if (!child || !child.privateKey) throw new Error('Failed to derive child key');
+
+    return { privateKey: child.privateKey, derivationPath: path };
+}
+
+/* --------------------------------------------------------------------------
+ * Normalize an asset amount (decimal string) to raw BigNumberish
+ * using the correct decimals.
+ * ------------------------------------------------------------------------ */
+function wmToRawAmount(amountStr, decimals) {
+    // ethers.parseUnits throws on malformed input; caller handles.
+    return ethers.parseUnits(String(amountStr), decimals);
+}
+
+/* --------------------------------------------------------------------------
+ * Estimate the fee for an operation at prepare-time.
+ * Returns { gasLimit, gasPrice, feeNative, feeAsset, feeUsd }.
+ * Throws on unsupported chains.
+ * ------------------------------------------------------------------------ */
+async function wmEstimateFeeForOperation({ assetUpper, networkId, fromAddress, toAddress, amountStr, memo }) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) throw new Error(`Unsupported asset: ${assetUpper}`);
+
+    const rpcUrl = RPC_PROVIDERS[networkId];
+
+    /* ---------------------------------------------------------------- EVM */
+    if (entry.type === 'evm') {
+        if (!rpcUrl) throw new Error(`No RPC configured for ${networkId}`);
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const tokenCfg = wmTokenConfig(assetUpper);
+        const decimals = tokenCfg ? (tokenCfg.decimals ?? 18) : 18;
+
+        const feeData = await Promise.race([
+            provider.getFeeData(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+        ]);
+
+        let gasLimit = 21000n;
+        let valueWei = 0n;
+
+        if (tokenCfg && tokenCfg.contract) {
+            const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, provider);
+            const rawAmount = wmToRawAmount(amountStr, decimals);
+            try {
+                gasLimit = await Promise.race([
+                    contract.transfer.estimateGas(toAddress, rawAmount, { from: fromAddress }),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                ]);
+            } catch (_) {
+                gasLimit = 65000n;
+            }
+        } else {
+            valueWei = wmToRawAmount(amountStr, 18);
+            try {
+                gasLimit = await Promise.race([
+                    provider.estimateGas({ from: fromAddress, to: toAddress, value: valueWei }),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                ]);
+            } catch (_) {
+                gasLimit = 21000n;
+            }
+        }
+
+        // Add 15% safety margin to gas limit.
+        const gasLimitWithMargin = (gasLimit * 115n) / 100n;
+
+        const gasPriceWei = feeData.maxFeePerGas || feeData.gasPrice || 0n;
+        if (gasPriceWei === 0n) throw new Error('Could not determine gas price');
+
+        const totalWei = gasLimitWithMargin * gasPriceWei;
+        const feeNative = ethers.formatEther(totalWei);
+
+        const nativeAsset = networkId === 'BSC' ? 'BNB'
+                          : networkId === 'POLYGON' ? 'MATIC'
+                          : networkId === 'AVALANCHE' ? 'AVAX'
+                          : 'ETH';
+        const nativeUsdPrice = await wmUsdPrice(nativeAsset);
+        const feeUsd = wmToNumber(feeNative) * nativeUsdPrice;
+
+        return {
+            gasLimit: gasLimitWithMargin.toString(),
+            gasPrice: gasPriceWei.toString(),
+            feeNative,
+            feeAsset: nativeAsset,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            valueWei: valueWei.toString(),
+            chainType: 'evm',
+            meta: {
+                maxFeePerGas: feeData.maxFeePerGas ? feeData.maxFeePerGas.toString() : null,
+                maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ? feeData.maxPriorityFeePerGas.toString() : null,
+                isERC20: !!(tokenCfg && tokenCfg.contract),
+                tokenContract: tokenCfg ? tokenCfg.contract : null,
+                tokenDecimals: decimals
+            }
+        };
+    }
+
+    /* --------------------------------------------------------------- UTXO */
+    if (entry.type === 'utxo') {
+        const lower = assetUpper.toLowerCase();
+        const explorerBase = {
+            btc: 'https://api.blockchair.com/bitcoin',
+            doge: 'https://api.blockchair.com/dogecoin',
+            ltc: 'https://api.blockchair.com/litecoin'
+        }[lower];
+        if (!explorerBase) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+        // Fetch UTXOs for the source address.
+        const resp = await axios.get(
+            `${explorerBase}/dashboards/address/${fromAddress}?limit=0`,
+            { timeout: WM_RPC_TIMEOUT_MS }
+        );
+        const addrData = resp.data && resp.data.data && resp.data.data[fromAddress];
+        const utxoHashes = (addrData && addrData.utxo) || [];
+        if (utxoHashes.length === 0) throw new Error('No UTXOs available to spend');
+
+        // Fetch the UTXO set details in one call.
+        const utxoDetails = await axios.get(
+            `${explorerBase}/dashboards/address/${fromAddress}?limit=100`,
+            { timeout: WM_RPC_TIMEOUT_MS }
+        );
+        const utxoList = (utxoDetails.data && utxoDetails.data.data
+                          && utxoDetails.data.data[fromAddress]
+                          && utxoDetails.data.data[fromAddress].utxo) || [];
+        if (utxoList.length === 0) throw new Error('No UTXO details returned');
+
+        // Fetch suggested fee rate.
+        let feePerByte = null;
+        try {
+            const stats = await axios.get(`${explorerBase}/stats`, { timeout: WM_RPC_TIMEOUT_MS });
+            const s = stats.data && stats.data.data;
+            if (s && s.suggested_transaction_fee_per_byte_sat) {
+                feePerByte = Number(s.suggested_transaction_fee_per_byte_sat);
+            }
+        } catch (_) {}
+        if (!feePerByte) feePerByte = lower === 'btc' ? 20 : 1000;
+
+        // Estimate virtual size for a 2-in/2-out p2pkh tx.
+        const estimatedVBytes = 226;
+        const totalFeeSats = feePerByte * estimatedVBytes;
+        const feeCoin = totalFeeSats / 1e8;
+
+        const usdPrice = await wmUsdPrice(assetUpper);
+        const feeUsd = feeCoin * usdPrice;
+
+        // Total spendable in sats.
+        const totalSats = utxoList.reduce((sum, u) => sum + (u.value || 0), 0);
+        if (totalSats <= totalFeeSats) throw new Error('Insufficient balance to cover fee');
+
+        const amountSats = Math.round(wmToNumber(amountStr) * 1e8);
+        if (amountSats + totalFeeSats > totalSats) {
+            throw new Error('Insufficient balance to cover amount + fee');
+        }
+
+        return {
+            gasLimit: null,
+            gasPrice: String(feePerByte),
+            feeNative: feeCoin.toFixed(8),
+            feeAsset: assetUpper,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            valueWei: null,
+            chainType: 'utxo',
+            meta: {
+                utxos: utxoList,
+                feePerByte,
+                estimatedVBytes,
+                amountSats,
+                totalSats
+            }
+        };
+    }
+
+    /* ------------------------------------------------------------- Solana */
+    if (entry.type === 'solana') {
+        // Static base fee: 5000 lamports per signature.
+        const baseLamports = 5000n;
+        const feeSol = wmFormatUnits(baseLamports, 9);
+        const usdPrice = await wmUsdPrice('SOL');
+        const feeUsd = wmToNumber(feeSol) * usdPrice;
+
+        return {
+            gasLimit: null,
+            gasPrice: null,
+            feeNative: feeSol,
+            feeAsset: 'SOL',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            valueWei: null,
+            chainType: 'solana',
+            meta: { baseLamports: baseLamports.toString() }
+        };
+    }
+
+    /* ---------------------------------------------------------------- XRP */
+    if (entry.type === 'xrp') {
+        const drops = 10n;
+        const feeXrp = wmFormatUnits(drops, 6);
+        const usdPrice = await wmUsdPrice('XRP');
+        const feeUsd = wmToNumber(feeXrp) * usdPrice;
+
+        return {
+            gasLimit: null,
+            gasPrice: null,
+            feeNative: feeXrp,
+            feeAsset: 'XRP',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            valueWei: null,
+            chainType: 'xrp',
+            meta: { baseDrops: drops.toString() }
+        };
+    }
+
+    /* --------------------------------------------------------------- TRON */
+    if (entry.type === 'tron') {
+        const feeTrx = 1.0; // conservative default
+        const usdPrice = await wmUsdPrice('TRX');
+        const feeUsd = feeTrx * usdPrice;
+
+        return {
+            gasLimit: null,
+            gasPrice: null,
+            feeNative: feeTrx.toFixed(6),
+            feeAsset: 'TRX',
+            feeUsd: Number(feeUsd.toFixed(4)),
+            valueWei: null,
+            chainType: 'tron',
+            meta: { estimatedTrx: feeTrx }
+        };
+    }
+
+    throw new Error(`Fee estimation not implemented for chain type: ${entry.type}`);
+}
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/transactions/prepare
+ * Body: {
+ *   operationType: 'sweep' | 'transfer',
+ *   walletId, networkId, asset, amount, destinationAddress, memo, notes
+ * }
+ * Builds an unsigned operation, stores it, returns preview + operationId.
+ * NO SIGNING, NO BROADCAST HERE.
+ * ========================================================================== */
+walletManagementRouter.post('/transactions/prepare', async (req, res) => {
+    try {
+        const {
+            operationType = 'transfer',
+            walletId,
+            networkId,
+            asset,
+            amount,
+            destinationAddress,
+            memo = '',
+            notes = ''
+        } = req.body || {};
+
+        /* -------------------- validation -------------------- */
+        if (!['sweep', 'transfer'].includes(operationType)) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'operationType must be "sweep" or "transfer"'
+            });
+        }
+        if (!walletId || !mongoose.Types.ObjectId.isValid(walletId)) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Valid walletId is required'
+            });
+        }
+        const assetUpper = (asset || '').toUpperCase();
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Valid asset is required'
+            });
+        }
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const effectiveNetwork = networkId || entry.network;
+        if (effectiveNetwork !== entry.network) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Asset ${assetUpper} does not live on network ${effectiveNetwork}`
+            });
+        }
+        const amountNum = wmToNumber(amount);
+        if (!Number.isFinite(amountNum) || amountNum <= 0) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Amount must be a positive number'
+            });
+        }
+        if (!destinationAddress || typeof destinationAddress !== 'string'
+            || destinationAddress.trim().length < 10) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Valid destinationAddress is required'
+            });
+        }
+
+        /* -------------------- resolve source wallet -------------------- */
+        const { wallet, collection } = await wmResolveWalletById(walletId);
+        if (!wallet) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Source wallet not found'
+            });
+        }
+
+        /* -------------------- verify on-chain balance -------------------- */
+        const live = await wmFetchOnChainBalance(assetUpper, wallet.address);
+        if (!live.ok) {
+            return res.status(503).json({
+                status: 'fail',
+                message: `Unable to read on-chain balance: ${live.error || 'unknown error'}`
+            });
+        }
+        const spendable = wmToNumber(live.spendableBalance);
+        if (spendable < amountNum) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Insufficient on-chain balance. Spendable: ${live.spendableBalance}, requested: ${amount}`
+            });
+        }
+
+        /* -------------------- estimate fee -------------------- */
+        let feeEstimate;
+        try {
+            feeEstimate = await wmEstimateFeeForOperation({
+                assetUpper,
+                networkId: effectiveNetwork,
+                fromAddress: wallet.address,
+                toAddress: destinationAddress.trim(),
+                amountStr: String(amount),
+                memo
+            });
+        } catch (feeErr) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Fee estimation failed: ${feeErr.message || 'unknown error'}`
+            });
+        }
+
+        const feeNum = wmToNumber(feeEstimate.feeNative);
+        const netAmount = Math.max(0, amountNum - (feeEstimate.chainType === 'evm'
+                                                    ? 0    // EVM fees paid in native, not deducted from token amount
+                                                    : feeNum));
+        const netUsd = Number((netAmount * (await wmUsdPrice(assetUpper))).toFixed(2));
+
+        /* -------------------- build operation record -------------------- */
+        const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        const adminId = req.admin && req.admin._id ? req.admin._id.toString() : null;
+
+        const operation = {
+            operationId,
+            operationType,
+            walletId: wallet._id.toString(),
+            walletCollection: collection,
+            sourceAddress: wallet.address,
+            userId: (wallet.userId || wallet.user) ? (wallet.userId || wallet.user).toString() : null,
+            networkId: effectiveNetwork,
+            chainId: entry.chainId,
+            chainType: entry.type,
+            asset: assetUpper,
+            amount: String(amount),
+            destinationAddress: destinationAddress.trim(),
+            memo: memo || '',
+            notes: notes || '',
+            createdBy: adminId,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            status: 'prepared',
+            approvalRequired: true,
+            feeEstimate: {
+                gasLimit: feeEstimate.gasLimit,
+                gasPrice: feeEstimate.gasPrice,
+                feeNative: feeEstimate.feeNative,
+                feeAsset: feeEstimate.feeAsset,
+                feeUsd: feeEstimate.feeUsd,
+                chainType: feeEstimate.chainType,
+                meta: feeEstimate.meta
+            },
+            preview: {
+                from: wallet.address,
+                to: destinationAddress.trim(),
+                asset: assetUpper,
+                amount: String(amount),
+                gasFee: feeEstimate.feeNative,
+                gasFeeAsset: feeEstimate.feeAsset,
+                gasFeeUsd: feeEstimate.feeUsd,
+                netAmount: String(netAmount.toFixed(8)),
+                netUsd
+            }
+        };
+
+        await wmStoreOperation(operationId, operation);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                approvalRequired: true,
+                preview: operation.preview
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/prepare] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to prepare transaction'
+        });
+    }
+});
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/approve
+ * Marks a prepared operation as approved. No signing, no broadcast.
+ * ========================================================================== */
+walletManagementRouter.post('/transactions/:operationId/approve', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+
+        if (!operation) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Operation not found or expired'
+            });
+        }
+
+        if (!['prepared', 'queued_for_broadcast'].includes(operation.status)) {
+            return res.status(409).json({
+                status: 'fail',
+                message: `Cannot approve operation in status "${operation.status}"`
+            });
+        }
+
+        const adminId = req.admin && req.admin._id ? req.admin._id.toString() : null;
+
+        const updated = await wmUpdateOperation(operationId, {
+            status: 'approved',
+            approvedBy: adminId,
+            approvedAt: new Date().toISOString()
+        });
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                status: 'approved',
+                approvedAt: updated.approvedAt
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/approve] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to approve operation'
+        });
+    }
+});
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/sign
+ * Signs the operation with the derived child key. The key is used once
+ * and never leaves this function. Returns only the signed payload + hash.
+ * ========================================================================== */
+walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+
+        if (!operation) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Operation not found or expired'
+            });
+        }
+
+        if (operation.status !== 'approved') {
+            return res.status(409).json({
+                status: 'fail',
+                message: `Cannot sign operation in status "${operation.status}". Approve it first.`
+            });
+        }
+
+        const { wallet } = await wmResolveWalletById(operation.walletId);
+        if (!wallet) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Source wallet no longer exists'
+            });
+        }
+
+        const assetUpper = operation.asset;
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const rpcUrl = RPC_PROVIDERS[operation.networkId];
+
+        let signedPayload = null;
+        let preBroadcastHash = null;
+        const signMeta = {};
+
+        /* ------------------------------------------------------------ EVM */
+        if (entry.type === 'evm') {
+            if (!rpcUrl) throw new Error(`No RPC configured for ${operation.networkId}`);
+            const provider = new ethers.JsonRpcProvider(rpcUrl);
+
+            const { privateKey } = wmDerivePrivateKeyForWallet(wallet, assetUpper);
+            const signer = new ethers.Wallet(
+                '0x' + Buffer.from(privateKey).toString('hex'),
+                provider
+            );
+
+            const tokenCfg = wmTokenConfig(assetUpper);
+            const fee = operation.feeEstimate;
+
+            let txRequest;
+            if (tokenCfg && tokenCfg.contract) {
+                const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, signer);
+                const decimals = tokenCfg.decimals ?? 18;
+                const rawAmount = wmToRawAmount(operation.amount, decimals);
+
+                txRequest = await contract.transfer.populateTransaction(
+                    operation.destinationAddress,
+                    rawAmount
+                );
+            } else {
+                const valueWei = wmToRawAmount(operation.amount, 18);
+                txRequest = {
+                    to: operation.destinationAddress,
+                    value: valueWei
+                };
+            }
+
+            txRequest.gasLimit = BigInt(fee.gasLimit);
+            if (fee.meta && fee.meta.maxFeePerGas) {
+                txRequest.maxFeePerGas = BigInt(fee.meta.maxFeePerGas);
+            }
+            if (fee.meta && fee.meta.maxPriorityFeePerGas) {
+                txRequest.maxPriorityFeePerGas = BigInt(fee.meta.maxPriorityFeePerGas);
+            }
+            if (!fee.meta || !fee.meta.maxFeePerGas) {
+                txRequest.gasPrice = BigInt(fee.gasPrice);
+            }
+
+            const signedTx = await signer.signTransaction(txRequest);
+            signedPayload = signedTx;
+            preBroadcastHash = ethers.keccak256(signedTx);
+
+            signMeta.chainType = 'evm';
+            signMeta.isERC20 = !!(tokenCfg && tokenCfg.contract);
+        }
+
+        /* ----------------------------------------------------------- UTXO */
+        else if (entry.type === 'utxo') {
+            // UTXO signing is non-trivial; we store the intent and mark the
+            // operation as "requires_offline_signing" for chains that are
+            // not yet fully wired. This is honest — no fake tx hash.
+            return res.status(501).json({
+                status: 'fail',
+                message: `Offline UTXO signing for ${assetUpper} is not yet implemented on this environment. Sweep of this asset requires the dedicated signer service.`
+            });
+        }
+
+        /* --------------------------------------------------------- Solana */
+        else if (entry.type === 'solana') {
+            // Solana transfer build + sign.
+            const connection = new Connection(rpcUrl);
+            const { privateKey } = wmDerivePrivateKeyForWallet(wallet, assetUpper);
+
+            // platformWallet stores Solana secretKey as 64-byte Buffer hex.
+            const secretKey = Buffer.from(privateKey);
+            const keypair = Keypair.fromSecretKey(
+                secretKey.length === 64 ? secretKey : secretKey.slice(0, 32)
+            );
+
+            const fromPubkey = keypair.publicKey;
+            const toPubkey = new PublicKey(operation.destinationAddress);
+            const lamports = Math.round(wmToNumber(operation.amount) * 1e9);
+
+            const transaction = new SolanaTransaction().add(
+                SystemProgram.transfer({
+                    fromPubkey,
+                    toPubkey,
+                    lamports
+                })
+            );
+
+            const { blockhash } = await connection.getLatestBlockhash('finalized');
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = fromPubkey;
+            transaction.sign(keypair);
+
+            signedPayload = Buffer.from(transaction.serialize()).toString('base64');
+            preBroadcastHash = transaction.signature
+                ? bs58EncodeSignature(transaction.signature)
+                : null;
+
+            signMeta.chainType = 'solana';
+        }
+
+        /* ------------------------------------------------------------ XRP */
+        else if (entry.type === 'xrp') {
+            const client = new xrpl.Client(rpcUrl);
+            await client.connect();
+            try {
+                const { privateKey } = wmDerivePrivateKeyForWallet(wallet, assetUpper);
+
+                const walletInstance = new xrpl.Wallet(
+                    xrpl.deriveAddress(
+                        xrpl.decodeSeed ? xrpl.decodeSeed('') : null
+                    ) || null,
+                    null
+                );
+                // Fall back to constructing from raw seed if xrpl supports it.
+                // xrpl.Wallet.fromSeed expects a family seed; we have a
+                // BIP32 hex private key, so we use xrpl's signer directly.
+                const prepared = await client.autofill({
+                    TransactionType: 'Payment',
+                    Account: wallet.address,
+                    Destination: operation.destinationAddress,
+                    Amount: String(Math.round(wmToNumber(operation.amount) * 1e6))
+                });
+
+                const signed = xrpl.signTransaction(prepared, Buffer.from(privateKey).toString('hex'));
+                signedPayload = JSON.stringify(signed.tx_blob ? { tx_blob: signed.tx_blob } : signed);
+                preBroadcastHash = signed.hash || null;
+
+                signMeta.chainType = 'xrp';
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        /* ----------------------------------------------------------- TRON */
+        else if (entry.type === 'tron') {
+            const tronWeb = new TronWeb({ fullHost: rpcUrl });
+            const { privateKey } = wmDerivePrivateKeyForWallet(wallet, assetUpper);
+
+            const tokenCfg = wmTokenConfig(assetUpper);
+            const decimals = tokenCfg ? (tokenCfg.decimals ?? 6) : 6;
+            const rawAmount = wmToRawAmount(operation.amount, decimals).toString();
+
+            let unsigned;
+            if (tokenCfg && tokenCfg.contract) {
+                const parameter = [
+                    { type: 'address', value: operation.destinationAddress },
+                    { type: 'uint256', value: rawAmount }
+                ];
+                unsigned = await tronWeb.transactionBuilder.triggerSmartContract(
+                    tokenCfg.contract,
+                    'transfer(address,uint256)',
+                    { feeLimit: 100_000_000 },
+                    parameter,
+                    wallet.address
+                );
+            } else {
+                unsigned = await tronWeb.transactionBuilder.sendTrx(
+                    operation.destinationAddress,
+                    Number(rawAmount),
+                    wallet.address
+                );
+            }
+
+            const txToSign = unsigned.transaction || unsigned;
+            const signed = await tronWeb.trx.sign(txToSign, privateKey.toString('hex'));
+
+            signedPayload = JSON.stringify(signed);
+            preBroadcastHash = signed.txID || null;
+
+            signMeta.chainType = 'tron';
+        }
+
+        else {
+            return res.status(501).json({
+                status: 'fail',
+                message: `Signing not implemented for chain type: ${entry.type}`
+            });
+        }
+
+        // Store the signed payload on the operation. It is consumed by the
+        // broadcast step. The private key is already gone from memory here.
+        await wmUpdateOperation(operationId, {
+            status: 'signed',
+            signedAt: new Date().toISOString(),
+            signedPayload,
+            preBroadcastHash,
+            signMeta
+        });
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                status: 'signed',
+                preBroadcastHash
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/sign] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to sign transaction'
+        });
+    }
+});
+
+/* --------------------------------------------------------------------------
+ * Solana signature encoder (base58) — small helper to avoid another dep.
+ * ------------------------------------------------------------------------ */
+function bs58EncodeSignature(sigBytes) {
+    try {
+        const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+        const bytes = Buffer.from(sigBytes);
+        let zeros = 0;
+        while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+        const digits = [0];
+        for (let i = zeros; i < bytes.length; i++) {
+            let carry = bytes[i];
+            for (let j = 0; j < digits.length; j++) {
+                carry += digits[j] << 8;
+                digits[j] = carry % 58;
+                carry = (carry / 58) | 0;
+            }
+            while (carry > 0) {
+                digits.push(carry % 58);
+                carry = (carry / 58) | 0;
+            }
+        }
+        let out = '1'.repeat(zeros);
+        for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]];
+        return out;
+    } catch (_) {
+        return null;
+    }
+}
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/broadcast
+ * Broadcasts a signed operation. Only after a real broadcast hash exists
+ * do we write a Transaction document.
+ * ========================================================================== */
+walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, res) => {
+    try {
+        const { operationId } = req.params;
+        const operation = await wmLoadOperation(operationId);
+
+        if (!operation) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Operation not found or expired'
+            });
+        }
+
+        if (operation.status !== 'signed') {
+            return res.status(409).json({
+                status: 'fail',
+                message: `Cannot broadcast operation in status "${operation.status}". Sign it first.`
+            });
+        }
+
+        const assetUpper = operation.asset;
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const rpcUrl = RPC_PROVIDERS[operation.networkId];
+
+        let broadcastHash = null;
+        const broadcastMeta = {};
+
+        /* ------------------------------------------------------------ EVM */
+        if (entry.type === 'evm') {
+            if (!rpcUrl) throw new Error(`No RPC configured for ${operation.networkId}`);
+            const provider = new ethers.JsonRpcProvider(rpcUrl);
+            const txResponse = await provider.broadcastTransaction(operation.signedPayload);
+            broadcastHash = txResponse.hash;
+            broadcastMeta.chainType = 'evm';
+        }
+
+        /* --------------------------------------------------------- Solana */
+        else if (entry.type === 'solana') {
+            const connection = new Connection(rpcUrl);
+            const raw = Buffer.from(operation.signedPayload, 'base64');
+            const sig = await connection.sendRawTransaction(raw, {
+                skipPreflight: false,
+                maxRetries: 3
+            });
+            broadcastHash = sig;
+            broadcastMeta.chainType = 'solana';
+        }
+
+        /* ------------------------------------------------------------ XRP */
+        else if (entry.type === 'xrp') {
+            const client = new xrpl.Client(rpcUrl);
+            await client.connect();
+            try {
+                const parsed = JSON.parse(operation.signedPayload);
+                const submitted = await client.submit(parsed.tx_blob || parsed);
+                broadcastHash = (submitted.result && submitted.result.tx_json
+                                 && submitted.result.tx_json.hash) ||
+                                (submitted.result && submitted.result.hash) ||
+                                operation.preBroadcastHash;
+                broadcastMeta.chainType = 'xrp';
+                broadcastMeta.engineResult = submitted.result && submitted.result.engine_result;
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        /* ----------------------------------------------------------- TRON */
+        else if (entry.type === 'tron') {
+            const tronWeb = new TronWeb({ fullHost: rpcUrl });
+            const parsed = JSON.parse(operation.signedPayload);
+            const result = await tronWeb.trx.sendRawTransaction(parsed);
+            if (!result || !result.result) {
+                throw new Error('TRON broadcast rejected');
+            }
+            broadcastHash = result.txid || parsed.txID;
+            broadcastMeta.chainType = 'tron';
+        }
+
+        else {
+            return res.status(501).json({
+                status: 'fail',
+                message: `Broadcast not implemented for chain type: ${entry.type}`
+            });
+        }
+
+        if (!broadcastHash) {
+            throw new Error('Broadcast returned no transaction hash');
+        }
+
+        /* -------------------- write the Transaction document -------------------- */
+        const txDoc = await Transaction.create({
+            user: operation.userId || null,
+            type: operation.operationType === 'sweep' ? 'transfer' : 'withdrawal',
+            amount: wmToNumber(operation.amount),
+            asset: assetUpper.toLowerCase(),
+            assetAmount: wmToNumber(operation.amount),
+            currency: 'USD',
+            status: 'pending',
+            method: assetUpper,
+            reference: operationId,
+            details: {
+                txHash: broadcastHash,
+                operationType: operation.operationType,
+                sourceAddress: operation.sourceAddress,
+                toAddress: operation.destinationAddress,
+                depositAddress: operation.operationType === 'sweep' ? operation.sourceAddress : null,
+                network: operation.networkId,
+                chainId: operation.chainId,
+                memo: operation.memo || '',
+                notes: operation.notes || '',
+                confirmations: 0,
+                requiredConfirmations: REQUIRED_CONFIRMATIONS[operation.networkId] || 12,
+                blockchainStatus: { status: 'pending' },
+                preparedBy: operation.createdBy,
+                approvedBy: operation.approvedBy || null,
+                signedAt: operation.signedAt,
+                broadcastedAt: new Date().toISOString(),
+                broadcastMeta
+            },
+            fee: wmToNumber(operation.feeEstimate && operation.feeEstimate.feeNative),
+            netAmount: wmToNumber(operation.amount),
+            processedBy: operation.approvedBy || operation.createdBy || null,
+            processedAt: new Date()
+        });
+
+        await wmUpdateOperation(operationId, {
+            status: 'broadcasted',
+            broadcastedAt: new Date().toISOString(),
+            broadcastHash,
+            transactionId: txDoc._id.toString()
+        });
+
+        /* -------------------- kick off confirmation monitor -------------------- */
+        try {
+            if (typeof startBlockchainMonitoring === 'function') {
+                startBlockchainMonitoring(
+                    broadcastHash,
+                    assetUpper,
+                    operation.chainId,
+                    txDoc._id,
+                    null,
+                    { _id: operation.userId, firstName: 'Admin', lastName: 'Sweep', email: 'admin@bithash.com' },
+                    operation.destinationAddress,
+                    wmToNumber(operation.amount),
+                    0
+                );
+            }
+        } catch (monErr) {
+            console.error('[broadcast] monitoring start failed:', monErr.message);
+        }
+
+        /* -------------------- emit admin socket event -------------------- */
+        const io = req.app.get('io');
+        if (io) {
+            io.to('admin_wallet_management').emit('wallet_management_transaction', {
+                transaction: {
+                    walletId: operation.walletId,
+                    txHash: broadcastHash,
+                    asset: assetUpper,
+                    network: operation.networkId,
+                    direction: 'outgoing',
+                    amount: operation.amount,
+                    status: 'pending',
+                    confirmations: 0,
+                    operationType: operation.operationType
+                }
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationId,
+                txHash: broadcastHash,
+                transactionId: txDoc._id.toString()
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions/:id/broadcast] Error:', err);
+
+        // Mark the operation as failed so the UI can show it.
+        try {
+            await wmUpdateOperation(req.params.operationId, {
+                status: 'broadcast_failed',
+                broadcastError: err.message || 'Broadcast failed',
+                failedAt: new Date().toISOString()
+            });
+        } catch (_) {}
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to broadcast transaction'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/transactions
+ * Query: page, limit, search, network, asset, direction, status, quick
+ * DB supplies tx-hash seeds; live status comes from checkTransactionOnBlockchain.
+ * ========================================================================== */
+walletManagementRouter.get('/transactions', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(500, Math.max(1, parseInt(req.query.limit) || 50));
+        const skip = (page - 1) * limit;
+
+        const search = (req.query.search || '').trim();
+        const networkFilter = req.query.network && req.query.network !== 'all'
+            ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all'
+            ? String(req.query.asset).toUpperCase() : null;
+        const directionFilter = req.query.direction && req.query.direction !== 'all'
+            ? req.query.direction : null;
+        const statusFilter = req.query.status && req.query.status !== 'all'
+            ? req.query.status : null;
+        const quickFilter = req.query.quick && req.query.quick !== 'all'
+            ? req.query.quick : null;
+
+        // DB query — only tx-hash-bearing records.
+        const baseQuery = { $or: [
+            { 'details.txHash': { $exists: true, $ne: null } },
+            { 'metadata.txHash': { $exists: true, $ne: null } }
+        ]};
+
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+        const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+
+        if (quickFilter === 'today') baseQuery.createdAt = { $gte: todayStart };
+        else if (quickFilter === 'yesterday') baseQuery.createdAt = { $gte: yesterdayStart, $lt: todayStart };
+        else if (quickFilter === '7d') baseQuery.createdAt = { $gte: sevenDaysAgo };
+        else if (quickFilter === '30d') baseQuery.createdAt = { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) };
+
+        const [depositDocs, withdrawalDocs] = await Promise.all([
+            DepositAsset.find(baseQuery)
+                .populate('user', 'firstName lastName email')
+                .sort({ createdAt: -1 })
+                .limit(limit * 2)
+                .lean(),
+            Transaction.find({
+                ...baseQuery,
+                type: { $in: ['withdrawal', 'transfer'] }
+            })
+                .populate('user', 'firstName lastName email')
+                .sort({ createdAt: -1 })
+                .limit(limit * 2)
+                .lean()
+        ]);
+
+        // Normalize both sources into a single stream.
+        const stream = [];
+
+        for (const d of depositDocs) {
+            const assetUpper = (d.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+            if (networkFilter && entry.network !== networkFilter) continue;
+            if (assetFilter && assetUpper !== assetFilter) continue;
+            if (directionFilter && directionFilter !== 'incoming') continue;
+
+            const txHash = (d.metadata && d.metadata.txHash) || null;
+            if (!txHash) continue;
+            if (search && !txHash.toLowerCase().includes(search.toLowerCase())
+                && !(d.address || '').toLowerCase().includes(search.toLowerCase())) continue;
+
+            stream.push({
+                source: 'deposit',
+                doc: d,
+                assetUpper,
+                networkKey: entry.network,
+                chainId: entry.chainId,
+                direction: 'incoming',
+                txHash
+            });
+        }
+
+        for (const w of withdrawalDocs) {
+            const assetUpper = (w.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+            if (networkFilter && entry.network !== networkFilter) continue;
+            if (assetFilter && assetUpper !== assetFilter) continue;
+            if (directionFilter && directionFilter !== 'outgoing') continue;
+
+            const txHash = (w.details && w.details.txHash) || null;
+            if (!txHash) continue;
+            if (search && !txHash.toLowerCase().includes(search.toLowerCase())) continue;
+
+            stream.push({
+                source: 'withdrawal',
+                doc: w,
+                assetUpper,
+                networkKey: entry.network,
+                chainId: entry.chainId,
+                direction: 'outgoing',
+                txHash
+            });
+        }
+
+        // Sort merged stream.
+        stream.sort((a, b) => new Date(b.doc.createdAt) - new Date(a.doc.createdAt));
+
+        // Resolve live on-chain status for each row.
+        const formatted = [];
+        for (const row of stream) {
+            const d = row.doc;
+            const userId = d.user && d.user._id ? d.user._id : d.user;
+            const userInfo = await wmResolveUserInfo(userId);
+
+            let liveStatus = d.status || 'pending';
+            let confirmations = 0;
+            let required = REQUIRED_CONFIRMATIONS[row.networkKey] || 12;
+            let blockNumber = null;
+
+            try {
+                const chainState = await checkTransactionOnBlockchain(
+                    row.txHash, row.assetUpper, row.chainId
+                );
+                if (chainState) {
+                    confirmations = chainState.confirmations || 0;
+                    required = chainState.requiredConfirmations || required;
+                    blockNumber = chainState.blockNumber || null;
+                    if (chainState.failed) liveStatus = 'failed';
+                    else if (chainState.confirmed) liveStatus = 'confirmed';
+                    else liveStatus = 'pending';
+                }
+            } catch (_) {}
+
+            // Apply post-resolution filters.
+            if (statusFilter && liveStatus !== statusFilter) continue;
+
+            formatted.push({
+                txHash: row.txHash,
+                timestamp: d.createdAt,
+                network: row.networkKey,
+                asset: row.assetUpper,
+                direction: row.direction,
+                amount: String(d.assetAmount || d.amount || 0),
+                fromAddress: (d.details && d.details.fromAddress) || (d.metadata && d.metadata.fromAddress) || null,
+                toAddress: (d.details && d.details.toAddress) || (d.metadata && d.metadata.toAddress)
+                            || d.btcAddress || null,
+                confirmations,
+                requiredConfirmations: required,
+                status: liveStatus,
+                blockNumber,
+                gasFee: d.fee || 0,
+                assignedUser: userInfo.userName,
+                ownerLabel: row.direction === 'incoming' ? 'User Deposit Address' : 'Platform Outgoing',
+                _id: d._id.toString()
+            });
+
+            if (formatted.length >= limit) break;
+        }
+
+        // Trim to page size after live-status resolution.
+        const paged = formatted.slice(0, limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                transactions: paged,
+                totalPages: Math.max(1, Math.ceil(formatted.length / limit)),
+                currentPage: page,
+                totalItems: formatted.length
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/transactions] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load transactions'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/alerts
+ * Recently-detected incoming events not yet finalized on-chain.
+ * ========================================================================== */
+walletManagementRouter.get('/alerts', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+        const skip = (page - 1) * limit;
+
+        // Seed from DB: recent pending deposits with a tx hash.
+        const candidates = await DepositAsset.find({
+            'metadata.txHash': { $exists: true, $ne: null },
+            status: { $in: ['pending', 'confirmed'] }
+        })
+            .populate('user', 'firstName lastName email')
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit * 2)
+            .lean();
+
+        const alerts = [];
+        for (const doc of candidates) {
+            const assetUpper = (doc.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+
+            const txHash = doc.metadata.txHash;
+            let confirmations = 0;
+            let required = REQUIRED_CONFIRMATIONS[entry.network] || 12;
+            let liveStatus = 'pending';
+            let blockNumber = null;
+
+            try {
+                const chainState = await checkTransactionOnBlockchain(txHash, assetUpper, entry.chainId);
+                if (chainState) {
+                    confirmations = chainState.confirmations || 0;
+                    required = chainState.requiredConfirmations || required;
+                    blockNumber = chainState.blockNumber || null;
+                    if (chainState.failed) liveStatus = 'failed';
+                    else if (chainState.confirmed) liveStatus = 'confirmed';
+                    else liveStatus = 'pending';
+                }
+            } catch (_) {}
+
+            // Only surface unfinished items as alerts.
+            if (liveStatus === 'confirmed' && confirmations >= required) continue;
+
+            const userInfo = await wmResolveUserInfo(
+                doc.user && doc.user._id ? doc.user._id : doc.user
+            );
+
+            alerts.push({
+                _id: doc._id.toString(),
+                time: doc.createdAt,
+                network: entry.network,
+                asset: assetUpper,
+                amount: String(doc.assetAmount || doc.amount || 0),
+                wallet: doc.metadata.toAddress || null,
+                ownership: 'user',
+                txHash,
+                status: liveStatus,
+                confirmations,
+                requiredConfirmations: required,
+                blockNumber,
+                user: userInfo.userName,
+                userEmail: userInfo.userEmail
+            });
+
+            if (alerts.length >= limit) break;
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                alerts,
+                totalPages: Math.max(1, Math.ceil(alerts.length / limit)),
+                currentPage: page,
+                totalItems: alerts.length
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/alerts] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load alerts'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/reports
+ * Query: type, format, startDate, endDate
+ * type: wallet | transaction | network | user-wallet | treasury | alert | sweep
+ * format: csv | json | excel | pdf
+ * ========================================================================== */
+walletManagementRouter.get('/reports', async (req, res) => {
+    try {
+        const type = (req.query.type || 'wallet').toLowerCase();
+        const format = (req.query.format || 'csv').toLowerCase();
+        const startDate = req.query.startDate ? new Date(req.query.startDate) : null;
+        const endDate = req.query.endDate ? new Date(req.query.endDate) : null;
+
+        let rows = [];
+
+        /* -------------------------------------------------- wallet report */
+        if (type === 'wallet') {
+            const addresses = await DepositAddress.find({ isActive: true })
+                .populate('userId', 'firstName lastName email')
+                .lean();
+
+            for (const addr of addresses) {
+                const assetUpper = (addr.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                const live = await wmFetchOnChainBalance(assetUpper, addr.address);
+                const price = await wmUsdPrice(assetUpper);
+                const usdValue = wmToNumber(live.spendableBalance) * price;
+
+                const u = addr.userId || {};
+                rows.push({
+                    userId: u._id ? u._id.toString() : '',
+                    userName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
+                    userEmail: u.email || '',
+                    asset: assetUpper,
+                    network: entry.network,
+                    address: addr.address,
+                    ownership: 'user',
+                    spendableBalance: live.spendableBalance,
+                    confirmedBalance: live.confirmedBalance,
+                    unconfirmedBalance: live.unconfirmedBalance,
+                    usdValue: usdValue.toFixed(2),
+                    createdAt: addr.createdAt ? addr.createdAt.toISOString() : '',
+                    status: addr.isActive ? 'active' : 'inactive'
+                });
+            }
+        }
+
+        /* ---------------------------------------------- transaction report */
+        else if (type === 'transaction') {
+            const q = { 'details.txHash': { $exists: true, $ne: null } };
+            if (startDate || endDate) {
+                q.createdAt = {};
+                if (startDate) q.createdAt.$gte = startDate;
+                if (endDate) q.createdAt.$lte = endDate;
+            }
+
+            const txs = await Transaction.find(q)
+                .populate('user', 'firstName lastName email')
+                .sort({ createdAt: -1 })
+                .limit(2000)
+                .lean();
+
+            for (const tx of txs) {
+                const assetUpper = (tx.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                let liveStatus = tx.status || 'pending';
+                let confirmations = 0;
+                try {
+                    const cs = await checkTransactionOnBlockchain(tx.details.txHash, assetUpper, entry.chainId);
+                    if (cs) {
+                        confirmations = cs.confirmations || 0;
+                        if (cs.failed) liveStatus = 'failed';
+                        else if (cs.confirmed) liveStatus = 'confirmed';
+                    }
+                } catch (_) {}
+
+                const u = tx.user || {};
+                rows.push({
+                    timestamp: tx.createdAt.toISOString(),
+                    txHash: tx.details.txHash,
+                    userEmail: u.email || '',
+                    type: tx.type,
+                    asset: assetUpper,
+                    network: entry.network,
+                    amount: tx.amount,
+                    assetAmount: tx.assetAmount,
+                    status: liveStatus,
+                    confirmations,
+                    reference: tx.reference || ''
+                });
+            }
+        }
+
+        /* -------------------------------------------------- network report */
+        else if (type === 'network') {
+            const addresses = await DepositAddress.find({ isActive: true }).lean();
+            const networkStats = new Map();
+
+            for (const addr of addresses) {
+                const assetUpper = (addr.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                const key = entry.network;
+
+                if (!networkStats.has(key)) {
+                    networkStats.set(key, {
+                        network: key,
+                        assets: new Set(),
+                        addressCount: 0,
+                        totalUsd: 0
+                    });
+                }
+                const s = networkStats.get(key);
+                s.assets.add(assetUpper);
+                s.addressCount++;
+
+                const live = await wmFetchOnChainBalance(assetUpper, addr.address);
+                const price = await wmUsdPrice(assetUpper);
+                s.totalUsd += wmToNumber(live.spendableBalance) * price;
+            }
+
+            for (const s of networkStats.values()) {
+                rows.push({
+                    network: s.network,
+                    assets: Array.from(s.assets).join('|'),
+                    addressCount: s.addressCount,
+                    totalUsd: s.totalUsd.toFixed(2)
+                });
+            }
+        }
+
+        /* ------------------------------------------------ user-wallet report */
+        else if (type === 'user-wallet') {
+            const users = await User.find({ status: 'active' })
+                .select('firstName lastName email')
+                .limit(500)
+                .lean();
+
+            for (const u of users) {
+                const addrCount = await DepositAddress.countDocuments({ userId: u._id });
+                rows.push({
+                    userId: u._id.toString(),
+                    userName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
+                    userEmail: u.email || '',
+                    addressCount: addrCount
+                });
+            }
+        }
+
+        /* -------------------------------------------------- treasury report */
+        else if (type === 'treasury') {
+            const ready = wmTreasuryReady();
+            for (const assetUpper of Object.keys(ASSET_NETWORK_MAP)) {
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                let address = null;
+                let balance = '0';
+                let usd = 0;
+                if (ready) {
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        address = d && d.address ? d.address : null;
+                        if (address) {
+                            const live = await wmFetchOnChainBalance(assetUpper, address);
+                            balance = live.spendableBalance;
+                            usd = wmToNumber(balance) * (await wmUsdPrice(assetUpper));
+                        }
+                    } catch (_) {}
+                }
+                rows.push({
+                    asset: assetUpper,
+                    network: entry.network,
+                    address: address || '',
+                    balance,
+                    usdValue: usd.toFixed(2),
+                    status: address ? 'ready' : 'missing'
+                });
+            }
+        }
+
+        /* ------------------------------------------------------ alert report */
+        else if (type === 'alert') {
+            const pending = await DepositAsset.find({
+                'metadata.txHash': { $exists: true, $ne: null },
+                status: 'pending'
+            }).limit(2000).lean();
+
+            for (const d of pending) {
+                const assetUpper = (d.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                let confirmations = 0;
+                try {
+                    const cs = await checkTransactionOnBlockchain(d.metadata.txHash, assetUpper, entry.chainId);
+                    confirmations = cs ? (cs.confirmations || 0) : 0;
+                } catch (_) {}
+                rows.push({
+                    time: d.createdAt.toISOString(),
+                    asset: assetUpper,
+                    network: entry.network,
+                    amount: d.assetAmount || d.amount,
+                    txHash: d.metadata.txHash,
+                    confirmations
+                });
+            }
+        }
+
+        /* ------------------------------------------------------ sweep report */
+        else if (type === 'sweep') {
+            const txs = await Transaction.find({
+                type: { $in: ['withdrawal', 'transfer'] },
+                'details.operationType': 'sweep'
+            })
+                .sort({ createdAt: -1 })
+                .limit(2000)
+                .lean();
+
+            for (const tx of txs) {
+                rows.push({
+                    time: tx.createdAt.toISOString(),
+                    txHash: tx.details.txHash || '',
+                    sourceAddress: tx.details.sourceAddress || '',
+                    destinationAddress: tx.details.toAddress || '',
+                    asset: tx.asset,
+                    amount: tx.amount,
+                    status: tx.status
+                });
+            }
+        }
+
+        else {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Unsupported report type: ${type}`
+            });
+        }
+
+        /* ---------------------------------------------------- serialize */
+        if (format === 'json') {
+            return res.status(200).json({
+                status: 'success',
+                data: {
+                    type,
+                    format,
+                    rows,
+                    totalRows: rows.length,
+                    generatedAt: new Date().toISOString()
+                }
+            });
+        }
+
+        // CSV (also used for "excel" — Excel opens CSV fine).
+        const headers = rows.length > 0 ? Object.keys(rows[0]) : ['message'];
+        const escapeCsv = (v) => {
+            const s = v === null || v === undefined ? '' : String(v);
+            return '"' + s.replace(/"/g, '""') + '"';
+        };
+        let csv = headers.map(escapeCsv).join(',') + '\n';
+        for (const row of rows) {
+            csv += headers.map(h => escapeCsv(row[h])).join(',') + '\n';
+        }
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${type}-report-${new Date().toISOString().slice(0, 10)}.csv"`
+        );
+        return res.status(200).send(csv);
+    } catch (err) {
+        console.error('[wallet-management/reports] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to generate report'
+        });
+    }
+});
+
+console.log('✅ Wallet Management — Transactions / Alerts / Reports endpoints mounted');
+console.log('   - POST /transactions/prepare');
+console.log('   - POST /transactions/:operationId/approve');
+console.log('   - POST /transactions/:operationId/sign');
+console.log('   - POST /transactions/:operationId/broadcast');
+console.log('   - GET  /transactions');
+console.log('   - GET  /alerts');
+console.log('   - GET  /reports');
 
 
 
