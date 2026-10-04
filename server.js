@@ -38,6 +38,9 @@ const DeviceDetector = require('node-device-detector');
 const DeviceHelper = require('node-device-detector/helper');
 const { installAppDownloadRoute } = require('./app-download');
 const bitcoin = require('bitcoinjs-lib');
+const blake = require('blakejs');
+const bech32 = require('bech32');
+const { encodeAddress } = require('@polkadot/util-crypto');
 const bip32 = require('bip32');
 const bip39 = require('bip39');
 const { 
@@ -49,7 +52,7 @@ const {
     sendAndConfirmTransaction 
 } = require('@solana/web3.js');
 const xrpl = require('xrpl');
-const TronWeb = require('tronweb');
+const TronWeb = require('tronweb').TronWeb;
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 const { Keyring } = require('@polkadot/keyring');
 const AWS = require('@aws-sdk/client-s3');
@@ -14649,7 +14652,6 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
-
 class PlatformWallet {
     constructor() {
         // ── Customer-facing wallet (existing) ──────────────────────────────
@@ -15334,12 +15336,11 @@ class PlatformWallet {
 
                 case 'ADA': {
                     const pubKeyBytes = child.publicKey;
-                    const hash = crypto.createHash('blake2b256').update(pubKeyBytes).digest();
+                    const hash = blake.blake2b(pubKeyBytes, undefined, 32);
                     const paymentPart = hash.slice(0, 28);
 
-                    const hrp = 'addr1';
                     const words = bech32.toWords(paymentPart);
-                    const address = bech32.encode(hrp, words);
+                    const address = bech32.encode('addr', words, 200);
 
                     result = {
                         address: address,
@@ -15357,8 +15358,7 @@ class PlatformWallet {
 
                 case 'DOT': {
                     const pubKeyBytes = child.publicKey;
-                    const prefix = 0;
-                    const address = ss58Encode(pubKeyBytes, prefix);
+                    const address = encodeAddress(pubKeyBytes, 0);
 
                     result = {
                         address: address,
@@ -15548,12 +15548,11 @@ class PlatformWallet {
 
                 case 'ADA': {
                     const pubKeyBytes = child.publicKey;
-                    const hash = crypto.createHash('blake2b256').update(pubKeyBytes).digest();
+                    const hash = blake.blake2b(pubKeyBytes, undefined, 32);
                     const paymentPart = hash.slice(0, 28);
 
-                    const hrp = 'addr1';
                     const words = bech32.toWords(paymentPart);
-                    const address = bech32.encode(hrp, words);
+                    const address = bech32.encode('addr', words, 200);
 
                     result = {
                         address: address,
@@ -15572,8 +15571,7 @@ class PlatformWallet {
 
                 case 'DOT': {
                     const pubKeyBytes = child.publicKey;
-                    const prefix = 0;
-                    const address = ss58Encode(pubKeyBytes, prefix);
+                    const address = encodeAddress(pubKeyBytes, 0);
 
                     result = {
                         address: address,
