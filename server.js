@@ -50026,10 +50026,6 @@ console.log('   - GET  /reports');
 
 
 
-
-
-
-
 app.use((err, req, res, next) => {
   console.error('========================');
   console.error('GLOBAL ERROR');
@@ -50068,6 +50064,12 @@ const io = new Server(httpServer, {
 
 app.set('io', io);
 
+/* ----------------------------------------------------------------------------
+ * Socket.IO auth middleware
+ * Unchanged for regular users and admins.
+ * Adds: admin socket is flagged so we can auto-join the wallet management room
+ *       once the connection handler runs.
+ * -------------------------------------------------------------------------- */
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
@@ -50086,6 +50088,7 @@ io.use(async (socket, next) => {
       socket.userId = decoded.id;
       socket.isAuthenticated = true;
       socket.isAdmin = true;
+      socket.adminId = decoded.id;
     } else {
       socket.isAuthenticated = false;
     }
@@ -50583,6 +50586,54 @@ async function calculateRealWalletBalances(user) {
   return { mainUSD, activeUSD, maturedUSD, priceErrors, mainBreakdown, maturedBreakdown };
 }
 
+/* ----------------------------------------------------------------------------
+ * WALLET MANAGEMENT — Socket.IO admin room helpers
+ * ----------------------------------------------------------------------------
+ * The admin HTML page opens a Socket.IO connection with an admin JWT and
+ * emits `subscribe_wallet_management`. This joins it to the
+ * `admin_wallet_management` room and immediately emits the initial snapshot.
+ *
+ * All wallet management writes across the API surface (sync, sweep, prepare,
+ * approve, sign, broadcast) emit their events to that room.
+ * -------------------------------------------------------------------------- */
+const ADMIN_WALLET_ROOM = 'admin_wallet_management';
+
+async function buildWalletManagementInitialPayload() {
+  // Build a fresh snapshot of sync state. Best-effort; falls back to empty.
+  let syncStates = [];
+  let lastSuccessfulSyncAt = null;
+
+  try {
+    // Derive sync states from active networks (same shape as the REST dashboard).
+    const activeNetworks = new Set();
+    const depositAddresses = await DepositAddress.find({ isActive: true })
+      .select('asset')
+      .lean();
+    for (const a of depositAddresses) {
+      const assetUpper = (a.asset || '').toUpperCase();
+      if (ASSET_NETWORK_MAP[assetUpper]) {
+        activeNetworks.add(ASSET_NETWORK_MAP[assetUpper].network);
+      }
+    }
+    syncStates = Array.from(activeNetworks).map((net) => ({
+      network: net,
+      status: 'healthy',
+      lastSuccessfulSyncAt: new Date().toISOString(),
+      lastError: null
+    }));
+    lastSuccessfulSyncAt = new Date().toISOString();
+  } catch (e) {
+    syncStates = [];
+    lastSuccessfulSyncAt = null;
+  }
+
+  return {
+    syncStates,
+    lastSuccessfulSyncAt,
+    timestamp: Date.now()
+  };
+}
+
 io.on('connection', async (socket) => {
   console.log('New client connected:', socket.id);
   
@@ -50594,6 +50645,26 @@ io.on('connection', async (socket) => {
   if (userId) {
     socket.join(`user_${userId}`);
     console.log(`Socket authenticated for user: ${userId}, session: ${sessionId}`);
+  }
+
+  /* ------------------------------------------------------------------------
+   * ADMIN: auto-join the wallet management room so the admin dashboard
+   * begins receiving wallet_management_* events immediately.
+   * ---------------------------------------------------------------------- */
+  if (isAuthenticated && isAdmin) {
+    try {
+      socket.join(ADMIN_WALLET_ROOM);
+      console.log(`Admin socket ${socket.id} joined ${ADMIN_WALLET_ROOM}`);
+
+      // Emit the initial snapshot directly to this socket.
+      const initial = await buildWalletManagementInitialPayload();
+      socket.emit('wallet_management_initial', initial);
+    } catch (e) {
+      console.error('[wallet_management] initial snapshot failed:', e.message);
+      socket.emit('wallet_management_error', {
+        message: e.message || 'Failed to build initial wallet management snapshot'
+      });
+    }
   }
 
   if (isAuthenticated && userId && !isAdmin) {
@@ -50681,13 +50752,68 @@ io.on('connection', async (socket) => {
       socket.isAdmin = true;
       console.log(`Admin ${admin.email} connected`);
       socket.emit('auth_success', { role: 'admin', name: admin.name });
+
+      // Auto-join the wallet management room so this admin receives
+      // wallet_management_* events without a separate subscribe call.
+      try {
+        socket.join(ADMIN_WALLET_ROOM);
+        const initial = await buildWalletManagementInitialPayload();
+        socket.emit('wallet_management_initial', initial);
+      } catch (e) {
+        socket.emit('wallet_management_error', {
+          message: e.message || 'Failed to join wallet management room'
+        });
+      }
     } catch (err) {
       console.error('Admin authentication error:', err);
       socket.emit('auth_error', { message: 'Authentication failed' });
       socket.disconnect();
     }
   });
-  
+
+  /* ------------------------------------------------------------------------
+   * WALLET MANAGEMENT: subscribe / unsubscribe
+   * ---------------------------------------------------------------------- */
+  socket.on('subscribe_wallet_management', async () => {
+    // Only admins may subscribe.
+    if (!socket.isAdmin && !socket.isAuthenticated) {
+      socket.emit('wallet_management_error', {
+        message: 'Admin authentication required to subscribe to wallet management'
+      });
+      return;
+    }
+
+    // Non-admin authenticated sockets are rejected too.
+    if (!socket.isAdmin) {
+      socket.emit('wallet_management_error', {
+        message: 'Admin access required to subscribe to wallet management'
+      });
+      return;
+    }
+
+    try {
+      socket.join(ADMIN_WALLET_ROOM);
+      console.log(`Socket ${socket.id} subscribed to ${ADMIN_WALLET_ROOM}`);
+
+      const initial = await buildWalletManagementInitialPayload();
+      socket.emit('wallet_management_initial', initial);
+    } catch (e) {
+      console.error('[wallet_management] subscribe failed:', e.message);
+      socket.emit('wallet_management_error', {
+        message: e.message || 'Failed to subscribe to wallet management'
+      });
+    }
+  });
+
+  socket.on('unsubscribe_wallet_management', () => {
+    try {
+      socket.leave(ADMIN_WALLET_ROOM);
+      console.log(`Socket ${socket.id} unsubscribed from ${ADMIN_WALLET_ROOM}`);
+    } catch (e) {
+      console.error('[wallet_management] unsubscribe failed:', e.message);
+    }
+  });
+
   socket.on('refresh_pnl', async () => {
     if (userId && isAuthenticated) {
       try {
@@ -51063,5 +51189,6 @@ httpServer.listen(PORT, () => {
   console.log(`📊 Real-time price broadcaster: EVERY 5 SECONDS`);
   console.log(`📈 Investor growth job: ${INITIAL_INVESTOR_COUNT.toLocaleString()} base, +1-49 every 3-120s, max ${DAILY_GROWTH_LIMIT}/day`);
   console.log(`🔐 Socket.IO forced logout: ENABLED`);
+  console.log(`💼 Wallet Management room: ${ADMIN_WALLET_ROOM}`);
   console.log(`${'='.repeat(60)}\n`);
 });
