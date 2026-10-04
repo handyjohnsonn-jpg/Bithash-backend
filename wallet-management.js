@@ -1,322 +1,37 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const { ethers } = require('ethers');
-
-const ERC20_ABI = [
-  'function balanceOf(address) view returns (uint256)',
-  'function decimals() view returns (uint8)',
-  'function transfer(address,uint256) returns (bool)'
-];
-
-const NETWORKS = {
-  ETH: { id: 'ETH', name: 'Ethereum Mainnet', chainId: 1, nativeAsset: 'ETH', rpcEnv: ['WALLET_MANAGEMENT_RPC_ETHEREUM_URL', 'ETHEREUM_RPC_URL'] },
-  BSC: { id: 'BSC', name: 'BNB Smart Chain', chainId: 56, nativeAsset: 'BNB', rpcEnv: ['WALLET_MANAGEMENT_RPC_BSC_URL', 'BSC_RPC_URL'] },
-  POLYGON: { id: 'POLYGON', name: 'Polygon', chainId: 137, nativeAsset: 'MATIC', rpcEnv: ['WALLET_MANAGEMENT_RPC_POLYGON_URL', 'POLYGON_RPC_URL'] },
-  ARBITRUM: { id: 'ARBITRUM', name: 'Arbitrum One', chainId: 42161, nativeAsset: 'ETH', rpcEnv: ['WALLET_MANAGEMENT_RPC_ARBITRUM_URL', 'ARBITRUM_RPC_URL'] },
-  OPTIMISM: { id: 'OPTIMISM', name: 'Optimism', chainId: 10, nativeAsset: 'ETH', rpcEnv: ['WALLET_MANAGEMENT_RPC_OPTIMISM_URL', 'OPTIMISM_RPC_URL'] },
-  BASE: { id: 'BASE', name: 'Base', chainId: 8453, nativeAsset: 'ETH', rpcEnv: ['WALLET_MANAGEMENT_RPC_BASE_URL', 'BASE_RPC_URL'] },
-  AVALANCHE: { id: 'AVALANCHE', name: 'Avalanche C-Chain', chainId: 43114, nativeAsset: 'AVAX', rpcEnv: ['WALLET_MANAGEMENT_RPC_AVALANCHE_URL', 'AVALANCHE_RPC_URL'] }
-};
-
-const TOKENS = {
-  ETH: {
-    USDT: { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
-    USDC: { address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6 },
-    SHIB: { address: '0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE', decimals: 18 },
-    LINK: { address: '0x514910771AF9Ca656af840dff83E8264EcF986CA', decimals: 18 }
-  }
-};
-
-const WalletRegistrySchema = new mongoose.Schema({
-  address: { type: String, required: true, lowercase: true, trim: true },
-  networkId: { type: String, required: true, uppercase: true, trim: true },
-  asset: { type: String, required: true, uppercase: true, trim: true },
-  role: { type: String, required: true, enum: ['deposit', 'treasury'], index: true },
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
-  label: { type: String, trim: true, maxlength: 200 },
-  status: { type: String, enum: ['active', 'disabled'], default: 'active', index: true },
-  watchOnly: { type: Boolean, default: true },
-  signingEnabled: { type: Boolean, default: false },
-  custodySignerRef: { type: String, select: false, trim: true },
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' }
-}, { timestamps: true });
-WalletRegistrySchema.index({ address: 1, networkId: 1, asset: 1, role: 1 }, { unique: true });
-
-const WalletOperationSchema = new mongoose.Schema({
-  idempotencyKey: { type: String, required: true, unique: true, index: true },
-  operationType: { type: String, enum: ['transfer', 'withdraw', 'sweep'], required: true },
-  wallet: { type: mongoose.Schema.Types.ObjectId, ref: 'WalletRegistry', required: true, index: true },
-  networkId: { type: String, required: true }, asset: { type: String, required: true },
-  amount: { type: String, required: true }, destinationAddress: { type: String, required: true },
-  memo: String, notes: String, fee: { type: String }, feeAsset: String,
-  status: { type: String, enum: ['prepared', 'approved', 'signing_pending', 'signed', 'broadcast', 'confirmed', 'failed', 'expired'], default: 'prepared', index: true },
-  initiatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', required: true },
-  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
-  approvedAt: Date, signedAt: Date, broadcastAt: Date, txHash: { type: String, index: true },
-  expiresAt: { type: Date, required: true, index: true }, failureReason: String
-}, { timestamps: true });
-WalletOperationSchema.index({ status: 1, expiresAt: 1 });
-
-const WalletRegistry = mongoose.models.WalletRegistry || mongoose.model('WalletRegistry', WalletRegistrySchema);
-const WalletOperation = mongoose.models.WalletOperation || mongoose.model('WalletOperation', WalletOperationSchema);
-
-function normalizeNetwork(value) {
-  const input = String(value || '').toUpperCase();
-  const aliases = { '0X1': 'ETH', '1': 'ETH', ETHEREUM: 'ETH', MATIC: 'POLYGON', AVAX: 'AVALANCHE', ARB: 'ARBITRUM', OP: 'OPTIMISM' };
-  return aliases[input] || input;
+const express=require('express'),mongoose=require('mongoose'),{ethers}=require('ethers'),crypto=require('crypto');
+const ABI=['function balanceOf(address) view returns (uint256)','function transfer(address,uint256) returns (bool)'];
+const RegistrySchema=new mongoose.Schema({address:{type:String,lowercase:true},networkId:String,asset:String,role:String,user:mongoose.Schema.Types.ObjectId,status:{type:String,default:'active'},isActive:Boolean,watchOnly:Boolean,signingEnabled:Boolean,publicKey:String,derivationPath:String,sweepIndex:Number,signerRef:String},{timestamps:true}); RegistrySchema.index({address:1,networkId:1,asset:1,role:1},{unique:true});
+const OperationSchema=new mongoose.Schema({idempotencyKey:{type:String,unique:true},operationType:String,wallet:mongoose.Schema.Types.ObjectId,networkId:String,asset:String,amount:String,destinationAddress:String,nonce:String,status:String,createdBy:mongoose.Schema.Types.ObjectId,initiatedBy:mongoose.Schema.Types.ObjectId,approvedBy:mongoose.Schema.Types.ObjectId,signedTx:String,txRequest:Object,txHash:String},{timestamps:true});
+const LocalRegistry=mongoose.models.WalletRegistry||mongoose.model('WalletRegistry',RegistrySchema),LocalOperation=mongoose.models.WalletOperation||mongoose.model('WalletOperation',OperationSchema);
+const norm=v=>({ETHEREUM:'ETH',MATIC:'POLYGON',AVAX:'AVALANCHE'}[String(v||'').toUpperCase()]||String(v||'').toUpperCase()),pg=v=>Math.max(1,Number.parseInt(v,10)||1),lim=v=>Math.min(100,Math.max(1,Number.parseInt(v,10)||50)),fail=(r,e)=>r.status(e.statusCode||500).json({status:'error',message:e.message||'Wallet Management request failed'});
+function createWalletManagementRouter(deps={}){
+ const {platformWallet,DepositAddress,User,WalletRegistry,WalletOperation,WalletTransaction,signerAdapter,ASSET_METADATA,NETWORKS,logger}=deps,registry=WalletRegistry||LocalRegistry,operations=WalletOperation||LocalOperation,assets=ASSET_METADATA||{},networks=NETWORKS||{},adminProtect=deps.adminProtect||((q,r,n)=>n()),checkCSRF=deps.checkCSRF||((q,r,n)=>n()),getIO=deps.getIO||(()=>deps.io),router=express.Router();
+ const net=id=>networks[norm(id)],url=n=>(n?.rpcEnv||[]).map(x=>process.env[x]).find(Boolean),config=(id,a)=>{const x=assets[String(a||'').toUpperCase()],n=net(id||x?.networkId);return x&&{...x,symbol:String(a).toUpperCase(),network:n,native:x.type==='native'||x.symbol===n?.nativeAsset}},provider=id=>{const n=net(id),u=url(n);if(!n||!u)throw Object.assign(new Error('No RPC endpoint configured'),{statusCode:503});return{network:n,url:u,provider:new ethers.JsonRpcProvider(u,n.chainId)}};
+ const pub=w=>({id:String(w._id),address:w.address,walletAddress:w.address,network:w.networkId,networkId:w.networkId,asset:w.asset,role:w.role,status:w.status,userId:w.user||w.userId||null,createdAt:w.createdAt}),dep=w=>({id:String(w._id),address:w.address,walletAddress:w.address,network:norm(w.network||assets[String(w.asset).toUpperCase()]?.networkId),networkId:norm(w.network||assets[String(w.asset).toUpperCase()]?.networkId),asset:String(w.asset).toUpperCase(),role:'deposit',status:w.isActive?'active':'disabled',userId:w.userId,createdAt:w.createdAt});
+ async function resolve(id){if(DepositAddress){const d=await DepositAddress.findById(id).lean();if(d)return{...d,networkId:norm(d.network||assets[String(d.asset).toUpperCase()]?.networkId),asset:String(d.asset).toUpperCase(),role:'deposit'}}return registry.findById(id).lean()}
+ async function state(w){const a=config(w.networkId,w.asset);if(!a||!ethers.isAddress(w.address))throw Object.assign(new Error('Wallet asset or address is not EVM-compatible'),{statusCode:422});const{provider:p}=provider(w.networkId);const[b,n,nb]=await Promise.all([p.getBlockNumber(),p.getTransactionCount(w.address,'pending'),p.getBalance(w.address)]),bal=a.native?nb:await new ethers.Contract(a.contract||a.address,ABI,p).balanceOf(w.address);return{balance:bal.toString(),confirmedBalance:bal.toString(),spendableBalance:bal.toString(),nativeBalance:nb.toString(),transactionCount:n,pendingNonce:n,blockNumber:b,fetchedAt:new Date().toISOString(),source:'rpc'}}
+ async function safe(w){const a=config(w.networkId,w.asset),{provider:p,network:n}=provider(w.networkId),nb=await p.getBalance(w.address),fd=await p.getFeeData(),gl=a.native?21000n:65000n,m=fd.maxFeePerGas||fd.gasPrice;if(!m)throw Object.assign(new Error('RPC did not return fee data'),{statusCode:503});const reserve=m*gl*2n;if(a.native)return{gasFee:(m*gl).toString(),feeAsset:n.nativeAsset,sendableAmount:nb>reserve?(nb-reserve).toString():'0',nativeBalance:nb.toString()};if(nb<=reserve)throw Object.assign(new Error('Native balance does not meet gas reserve'),{statusCode:400});const tb=await new ethers.Contract(a.contract||a.address,ABI,p).balanceOf(w.address);return{gasFee:(m*gl).toString(),feeAsset:n.nativeAsset,sendableAmount:tb.toString(),nativeBalance:nb.toString()}}
+ async function enqueue(w){const d=await registry.findOne({role:'treasury',asset:w.asset,networkId:w.networkId,status:'active'}).lean();if(!d)return false;const x=await safe(w);if(x.sendableAmount==='0')return false;await operations.findOneAndUpdate({idempotencyKey:crypto.createHash('sha256').update(`sweep|${w._id}|${x.sendableAmount}`).digest('hex')},{$setOnInsert:{operationType:'sweep',wallet:w._id,networkId:w.networkId,asset:w.asset,amount:x.sendableAmount,destinationAddress:d.address,status:'queued'}},{upsert:true});return true}
+ router.use(adminProtect,(q,r,n)=>{const p=q.admin?.permissions||[];return q.admin?.role==='super'||p.includes('all')||p.includes('wallet_management')||p.includes('wallet_operations')?n():r.status(403).json({status:'fail',message:'Wallet Management permission is required'})});
+ router.get('/assets/metadata',(q,r)=>r.json({status:'success',data:{assets:Object.fromEntries(Object.entries(assets).map(([s,a])=>[s,{symbol:s,...a}]))}}));
+ router.get('/networks',(q,r)=>r.json({status:'success',data:{networks:Object.values(networks).filter(url)}})); router.get('/assets',(q,r)=>r.json({status:'success',data:{assets:Object.entries(assets).map(([s,a])=>({symbol:s,id:s,...a}))}}));
+ router.get('/wallets',async(q,r)=>{try{const p=pg(q.query.page),l=lim(q.query.limit);if(q.query.role==='deposit'){const f={isActive:{$ne:false}};if(q.query.asset)f.asset=String(q.query.asset).toLowerCase();const[x,t]=await Promise.all([DepositAddress.find(f).populate('userId','firstName lastName email').skip((p-1)*l).limit(l).lean(),DepositAddress.countDocuments(f)]);return r.json({status:'success',data:{wallets:x.map(dep),networks:Object.keys(networks),assets:Object.keys(assets),pagination:{page:p,totalPages:Math.max(1,Math.ceil(t/l)),total:t}}})}const[x,t]=await Promise.all([registry.find(q.query.role?{role:q.query.role}:{}).skip((p-1)*l).limit(l).lean(),registry.countDocuments(q.query.role?{role:q.query.role}:{})]);r.json({status:'success',data:{wallets:x.map(pub),networks:Object.keys(networks),assets:Object.keys(assets),pagination:{page:p,totalPages:Math.max(1,Math.ceil(t/l)),total:t}}})}catch(e){fail(r,e)}});
+ router.get('/wallets/:walletId/state',async(q,r)=>{try{const w=await resolve(q.params.walletId);if(!w)return r.status(404).json({status:'fail',message:'Registered wallet not found'});r.json({status:'success',data:{chainState:await state(w)}})}catch(e){fail(r,e)}});
+ router.post('/treasury/generate',checkCSRF,async(q,r)=>{try{const asset=String(q.body?.asset||'').toUpperCase(),a=assets[asset];if(!a||!platformWallet?.isTreasuryReady?.())return r.status(400).json({status:'fail',message:'Treasury or asset is unavailable'});const g=platformWallet.generateTreasuryAddress(asset,0),networkId=norm(a.networkId),w=await registry.findOneAndUpdate({asset,networkId,role:'treasury',sweepIndex:0},{$set:{address:g.address,publicKey:g.publicKey,derivationPath:g.derivationPath,asset,networkId,role:'treasury',sweepIndex:0,signerRef:`treasury:${asset}:0`,isActive:true,status:'active',watchOnly:false,signingEnabled:true}},{upsert:true,new:true});r.json({status:'success',data:{treasuryAddress:w.address,walletId:String(w._id)}})}catch(e){fail(r,e)}});
+ router.get('/treasury/address',async(q,r)=>{const w=await registry.findOne({role:'treasury',asset:String(q.query.asset||'').toUpperCase(),networkId:norm(q.query.network),status:'active'}).lean();return w?r.json({status:'success',data:{treasuryAddress:w.address,walletId:String(w._id)}}):r.status(404).json({status:'fail',message:'Treasury wallet not found'})});
+ router.get('/treasury',async(q,r)=>{try{const rows=await Promise.all(Object.entries(assets).map(async([asset,a])=>{const networkId=norm(a.networkId),w=await registry.findOne({role:'treasury',asset,networkId,status:'active'}).lean(),configured=a.type==='native'||a.type==='erc20'||(a.rpcEnv||[]).some(x=>process.env[x]);if(!configured)return{asset,network:networkId,status:'pending'};if(!w)return{asset,network:networkId,status:'missing'};try{return{asset,network:networkId,status:'ready',walletId:String(w._id),treasuryAddress:w.address,chainState:await state(w)}}catch(e){return{asset,network:networkId,status:'pending',walletId:String(w._id),error:e.message}}}));r.json({status:'success',data:{treasury:rows}})}catch(e){fail(r,e)}});
+ router.get('/sweep/addresses',async(q,r)=>{try{const ds=await DepositAddress.find({isActive:{$ne:false}}).populate('userId','firstName lastName email').lean(),rows=await Promise.all(ds.map(async d=>{const w={...d,asset:String(d.asset).toUpperCase(),networkId:norm(d.network||assets[String(d.asset).toUpperCase()]?.networkId)},a=assets[w.asset];if(!a||(a.type!=='native'&&a.type!=='erc20'&&!(a.rpcEnv||[]).some(x=>process.env[x])))return null;try{const x=await safe(w);if(BigInt(x.sendableAmount)<=BigInt(q.query.minBalance||'0'))return null;const t=await registry.findOne({role:'treasury',asset:w.asset,networkId:w.networkId,status:'active'}).lean();return t?{wallet:dep(d),user:d.userId,treasuryAddress:t.address,...x}:null}catch(_){return null}}));r.json({status:'success',data:{addresses:rows.filter(Boolean)}})}catch(e){fail(r,e)}});
+ router.post('/fees/estimate',checkCSRF,async(q,r)=>{try{const w=await resolve(q.body?.walletId);if(!w)return r.status(404).json({status:'fail',message:'Wallet not found'});const x=await safe(w);r.json({status:'success',data:{gasFee:x.gasFee,feeAsset:x.feeAsset,sendableAmount:x.sendableAmount}})}catch(e){fail(r,e)}});
+ router.post('/sweep/all',checkCSRF,async(q,r)=>{try{const ds=await DepositAddress.find({isActive:{$ne:false}}).lean(),x=await Promise.all(ds.map(d=>enqueue({...d,asset:String(d.asset).toUpperCase(),networkId:norm(d.network||assets[String(d.asset).toUpperCase()]?.networkId)}).catch(()=>false)));r.json({status:'success',data:{queued:x.filter(Boolean).length}})}catch(e){fail(r,e)}}); router.post('/sweep/selected',checkCSRF,async(q,r)=>{try{const ds=await DepositAddress.find({_id:{$in:q.body?.walletIds||[]},isActive:{$ne:false}}).lean(),x=await Promise.all(ds.map(d=>enqueue({...d,asset:String(d.asset).toUpperCase(),networkId:norm(d.network||assets[String(d.asset).toUpperCase()]?.networkId)}).catch(()=>false)));r.json({status:'success',data:{queued:x.filter(Boolean).length}})}catch(e){fail(r,e)}});
+ router.post('/transactions/prepare',checkCSRF,async(q,r)=>{try{const{walletId,asset,amount,destination,destinationAddress,nonce=''}=q.body||{},to=destination||destinationAddress,w=await registry.findById(walletId);if(!w||!ethers.isAddress(to))return r.status(400).json({status:'fail',message:'Invalid transaction request'});const k=crypto.createHash('sha256').update([walletId,asset,amount,to,nonce].join('|')).digest('hex'),op=await operations.findOneAndUpdate({idempotencyKey:k},{$setOnInsert:{idempotencyKey:k,operationType:'transfer',wallet:w._id,networkId:w.networkId,asset:String(asset).toUpperCase(),amount:String(amount),destinationAddress:to.toLowerCase(),nonce:String(nonce),status:'prepared',createdBy:q.admin?._id,initiatedBy:q.admin?._id}},{upsert:true,new:true});r.json({status:'success',data:{operationId:String(op._id)}})}catch(e){fail(r,e)}});
+ router.post('/transactions/:id/approve',checkCSRF,async(q,r)=>{try{const o=await operations.findById(q.params.id);if(!o)return r.status(404).json({status:'fail',message:'Operation not found'});if(String(o.createdBy||o.initiatedBy)===String(q.admin?._id))return r.status(403).json({status:'fail',message:'Initiator cannot approve this operation'});o.status='approved';o.approvedBy=q.admin?._id;await o.save();r.json({status:'success',data:{operationId:String(o._id),status:o.status}})}catch(e){fail(r,e)}});
+ router.post('/transactions/:id/sign',checkCSRF,async(q,r)=>{try{const o=await operations.findById(q.params.id).populate('wallet');if(!o||o.status!=='approved')return r.status(409).json({status:'fail',message:'Operation is not approved for signing'});const a=config(o.networkId,o.asset),{provider:p}=provider(o.networkId),tx=o.txRequest||{to:a.native?o.destinationAddress:(a.contract||a.address),value:a.native?ethers.parseUnits(o.amount,a.decimals):0n,data:a.native?undefined:new ethers.Interface(ABI).encodeFunctionData('transfer',[o.destinationAddress,ethers.parseUnits(o.amount,a.decimals)]),nonce:o.nonce?Number.parseInt(o.nonce,10):await p.getTransactionCount(o.wallet.address,'pending'),chainId:a.network.chainId},x=await signerAdapter.sign({scope:'treasury',derivationPath:o.wallet.derivationPath,txRequest:tx});o.signedTx=x.signedTx;o.txRequest=tx;o.status='signed';await o.save();r.json({status:'success',data:{signedTx:x.signedTx}})}catch(e){fail(r,e)}});
+ router.post('/transactions/:id/broadcast',checkCSRF,async(q,r)=>{try{const o=await operations.findById(q.params.id);if(!o?.signedTx)return r.status(409).json({status:'fail',message:'Operation has not been signed'});const n=net(o.networkId),x=await signerAdapter.broadcast(o.signedTx,url(n),n.chainId);o.txHash=x.txHash;o.status='broadcast';await o.save();r.json({status:'success',data:{txHash:x.txHash,status:'broadcast'}})}catch(e){fail(r,e)}});
+ router.get('/transactions',async(q,r)=>{try{const f={};if(q.query.network)f.network=norm(q.query.network);if(q.query.asset)f.asset=String(q.query.asset).toUpperCase();const p=pg(q.query.page),l=lim(q.query.limit),[x,t]=await Promise.all([WalletTransaction.find(f).sort({timestamp:-1}).skip((p-1)*l).limit(l).lean(),WalletTransaction.countDocuments(f)]);r.json({status:'success',data:{transactions:x,pagination:{page:p,totalPages:Math.max(1,Math.ceil(t/l)),total:t}}})}catch(e){fail(r,e)}});
+ router.get('/alerts',async(q,r)=>{try{r.json({status:'success',data:{alerts:await WalletTransaction.find({$or:[{status:{$in:['pending','stuck','failed']}},{confirmations:{$lt:3}}]}).lean()}})}catch(e){fail(r,e)}}); router.get('/dashboard',async(q,r)=>{try{const[d,t,x,p,f]=await Promise.all([DepositAddress.countDocuments(),registry.countDocuments({role:'treasury'}),WalletTransaction.countDocuments(),WalletTransaction.countDocuments({status:{$in:['pending','stuck']}}),WalletTransaction.countDocuments({status:'failed'})]);r.json({status:'success',data:{depositAddresses:d,treasuryWallets:t,transactions:x,pendingTransactions:p,failedTransactions:f}})}catch(e){fail(r,e)}});
+ router.post('/sync',checkCSRF,async(q,r)=>{r.json({status:'success',data:{queued:true}});setImmediate(async()=>{const io=getIO(),ws=await registry.find({status:'active'}).lean();await Promise.all(ws.map(async w=>{try{const s=await state(w),transaction=await WalletTransaction.findOneAndUpdate({txHash:`observation:${w._id}:${s.blockNumber}`},{$set:{network:w.networkId,asset:w.asset,direction:'incoming',toAddress:w.address,amount:s.balance,blockNumber:s.blockNumber,confirmations:0,status:'confirmed',timestamp:new Date(),platformWallet:w.address}},{upsert:true,new:true});io?.to('wallet_management').emit('wallet_management_transaction',{transaction});io?.to('wallet_management').emit('wallet_management_sync_status',{network:w.networkId,status:'healthy',lastSuccessfulSyncAt:new Date()})}catch(e){logger?.warn?.('[wallet-management] reconciliation failed',e.message)}}))})});
+ router.get('/reports',async(q,r)=>{try{const x=await WalletTransaction.find({}).sort({timestamp:-1}).lean();r.json({status:'success',data:{report:{headers:['txHash','network','asset','direction','amount','status','timestamp'],rows:x.map(t=>[t.txHash,t.network,t.asset,t.direction,t.amount,t.status,t.timestamp])}}})}catch(e){fail(r,e)}});
+ for(const[name,val]of Object.entries(deps)){if(val==null&&name!=='logger')logger?.warn?.(`[wallet-management] missing dependency: ${name}`)} logger?.info?.('[wallet-management] mounted',{treasuryEnabled:platformWallet?.isTreasuryReady?.()===true,assetCount:Object.keys(ASSET_METADATA||{}).length,signerReady:!!signerAdapter});return router;
 }
-function getNetwork(networkId) {
-  return NETWORKS[normalizeNetwork(networkId)] || null;
-}
-function rpcUrl(network) {
-  return network && network.rpcEnv.map(name => process.env[name]).find(Boolean);
-}
-function getProvider(networkId) {
-  const network = getNetwork(networkId);
-  const url = rpcUrl(network);
-  if (!network) throw Object.assign(new Error('Unsupported network'), { statusCode: 400 });
-  if (!url) throw Object.assign(new Error(`No RPC endpoint configured for ${network.id}`), { statusCode: 503 });
-  return { network, provider: new ethers.JsonRpcProvider(url, network.chainId) };
-}
-function assetConfig(networkId, asset) {
-  const network = getNetwork(networkId);
-  if (!network) return null;
-  const symbol = String(asset || '').toUpperCase();
-  if (symbol === network.nativeAsset) return { symbol, native: true, decimals: 18 };
-  const token = TOKENS[network.id]?.[symbol];
-  return token ? { symbol, ...token, native: false } : null;
-}
-function publicWallet(wallet) {
-  return {
-    id: String(wallet._id), address: wallet.address, walletAddress: wallet.address,
-    network: wallet.networkId, networkId: wallet.networkId, asset: wallet.asset, coin: wallet.asset,
-    role: wallet.role, label: wallet.label, status: wallet.status, watchOnly: wallet.watchOnly,
-    signingEnabled: wallet.signingEnabled, userId: wallet.user || null, createdAt: wallet.createdAt
-  };
-}
-function depositModel() { return mongoose.models.Web3DepositAddress; }
-function publicDeposit(wallet) {
-  return { id: String(wallet._id), address: wallet.address, walletAddress: wallet.address,
-    network: normalizeNetwork(wallet.network), networkId: normalizeNetwork(wallet.network), asset: wallet.asset,
-    coin: wallet.asset, role: 'deposit', label: 'User deposit address', status: wallet.isActive ? 'active' : 'disabled',
-    watchOnly: true, signingEnabled: false, userId: wallet.user || null, createdAt: wallet.createdAt };
-}
-async function findWallet(walletId) {
-  const registry = await WalletRegistry.findById(walletId).lean();
-  if (registry) return registry;
-  const DepositAddress = depositModel();
-  if (!DepositAddress) return null;
-  const deposit = await DepositAddress.findById(walletId).lean();
-  return deposit ? { _id: deposit._id, address: deposit.address, networkId: normalizeNetwork(deposit.network), asset: deposit.asset, role: 'deposit', status: deposit.isActive ? 'active' : 'disabled', watchOnly: true, signingEnabled: false, user: deposit.user, createdAt: deposit.createdAt } : null;
-}
-async function chainState(wallet) {
-  if (!ethers.isAddress(wallet.address)) throw Object.assign(new Error('Registered wallet has an invalid EVM address'), { statusCode: 422 });
-  const { network, provider } = getProvider(wallet.networkId);
-  const asset = assetConfig(network.id, wallet.asset);
-  if (!asset) throw Object.assign(new Error(`Unsupported asset ${wallet.asset} on ${network.id}`), { statusCode: 400 });
-  const [blockNumber, nonce, nativeBalance] = await Promise.all([
-    provider.getBlockNumber(), provider.getTransactionCount(wallet.address, 'pending'), provider.getBalance(wallet.address)
-  ]);
-  let balance = nativeBalance;
-  if (!asset.native) {
-    const token = new ethers.Contract(asset.address, ERC20_ABI, provider);
-    balance = await token.balanceOf(wallet.address);
-  }
-  return {
-    chainState: {
-      balance: ethers.formatUnits(balance, asset.decimals), confirmedBalance: ethers.formatUnits(balance, asset.decimals),
-      spendableBalance: ethers.formatUnits(balance, asset.decimals), unconfirmedBalance: null,
-      transactionCount: nonce, pendingNonce: nonce, blockNumber, lastActivityAt: null,
-      lastIncomingAt: null, lastOutgoingAt: null, fetchedAt: new Date().toISOString(), source: 'rpc'
-    }
-  };
-}
-function requireWalletPermission(req, res, next) {
-  const permissions = req.admin?.permissions || [];
-  if (req.admin?.role === 'super' || permissions.includes('all') || permissions.includes('wallet_management') || permissions.includes('wallet_operations')) return next();
-  return res.status(403).json({ status: 'fail', message: 'Wallet Management permission is required' });
-}
-function fail(res, error) {
-  const code = error.statusCode || 500;
-  return res.status(code).json({ status: 'error', message: error.message || 'Wallet Management request failed' });
-}
-function page(value) { return Math.max(1, Number.parseInt(value, 10) || 1); }
-function limit(value) { return Math.min(100, Math.max(1, Number.parseInt(value, 10) || 50)); }
-
-function createWalletManagementRouter({ adminProtect, checkCSRF, getIO }) {
-  const router = express.Router();
-  router.use(adminProtect, requireWalletPermission);
-
-  router.get('/networks', (req, res) => res.json({ status: 'success', data: { networks: Object.values(NETWORKS).filter(n => !!rpcUrl(n)).map(n => ({ id: n.id, networkId: n.id, name: n.name, chainId: n.chainId, nativeAsset: n.nativeAsset })) } }));
-  router.get('/assets', (req, res) => {
-    const network = getNetwork(req.query.network);
-    if (!network) return res.status(400).json({ status: 'fail', message: 'Unsupported network' });
-    const assets = [{ symbol: network.nativeAsset, id: network.nativeAsset, supportsOutgoing: true }].concat(Object.keys(TOKENS[network.id] || {}).map(symbol => ({ symbol, id: symbol, supportsOutgoing: true })));
-    res.json({ status: 'success', data: { assets } });
-  });
-  router.get('/wallets', async (req, res) => {
-    try {
-      const filter = {};
-      if (req.query.role) filter.role = req.query.role;
-      if (req.query.network) filter.networkId = normalizeNetwork(req.query.network);
-      if (req.query.asset) filter.asset = String(req.query.asset).toUpperCase();
-      if (req.query.outgoing === 'true') { filter.role = 'treasury'; filter.status = 'active'; filter.signingEnabled = true; filter.watchOnly = false; }
-      if (req.query.search) filter.$or = [{ address: new RegExp(String(req.query.search), 'i') }, { label: new RegExp(String(req.query.search), 'i') }];
-      const currentPage = page(req.query.page), perPage = limit(req.query.limit);
-      if (filter.role === 'deposit' && depositModel()) {
-        const DepositAddress = depositModel();
-        const depositFilter = { isActive: filter.status !== 'disabled' };
-        if (filter.networkId) depositFilter.network = filter.networkId;
-        if (filter.asset) depositFilter.asset = filter.asset;
-        if (req.query.search) depositFilter.address = new RegExp(String(req.query.search), 'i');
-        const [wallets, total] = await Promise.all([DepositAddress.find(depositFilter).sort({ createdAt: -1 }).skip((currentPage - 1) * perPage).limit(perPage).lean(), DepositAddress.countDocuments(depositFilter)]);
-        return res.json({ status: 'success', data: { wallets: wallets.map(publicDeposit), page: currentPage, totalPages: Math.max(1, Math.ceil(total / perPage)), total } });
-      }
-      const [wallets, total] = await Promise.all([WalletRegistry.find(filter).sort({ createdAt: -1 }).skip((currentPage - 1) * perPage).limit(perPage).lean(), WalletRegistry.countDocuments(filter)]);
-      res.json({ status: 'success', data: { wallets: wallets.map(publicWallet), page: currentPage, totalPages: Math.max(1, Math.ceil(total / perPage)), total } });
-    } catch (error) { fail(res, error); }
-  });
-  router.get('/wallets/:walletId/state', async (req, res) => {
-    try {
-      if (!mongoose.isValidObjectId(req.params.walletId)) return res.status(400).json({ status: 'fail', message: 'Invalid wallet identifier' });
-      const wallet = await findWallet(req.params.walletId);
-      if (!wallet) return res.status(404).json({ status: 'fail', message: 'Registered wallet not found' });
-      res.json({ status: 'success', data: await chainState(wallet) });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/fees/estimate', checkCSRF, async (req, res) => {
-    try {
-      const { walletId, networkId, asset, amount, destinationAddress } = req.body || {};
-      if (!mongoose.isValidObjectId(walletId) || !ethers.isAddress(destinationAddress)) return res.status(400).json({ status: 'fail', message: 'A registered source wallet and valid destination address are required' });
-      const wallet = await WalletRegistry.findById(walletId).lean();
-      if (!wallet || wallet.role !== 'treasury' || !wallet.signingEnabled || wallet.watchOnly || wallet.status !== 'active') return res.status(403).json({ status: 'fail', message: 'Source wallet is not enabled for treasury operations' });
-      if (normalizeNetwork(networkId) !== wallet.networkId || String(asset).toUpperCase() !== wallet.asset) return res.status(400).json({ status: 'fail', message: 'Source wallet network or asset does not match request' });
-      const config = assetConfig(wallet.networkId, wallet.asset);
-      if (!config || !amount || Number(amount) <= 0) return res.status(400).json({ status: 'fail', message: 'Unsupported asset or invalid amount' });
-      const { provider, network } = getProvider(wallet.networkId);
-      const units = ethers.parseUnits(String(amount), config.decimals);
-      let request = { from: wallet.address, to: destinationAddress };
-      if (config.native) request.value = units;
-      else request.data = new ethers.Interface(ERC20_ABI).encodeFunctionData('transfer', [destinationAddress, units]);
-      const [gasLimit, feeData, feeBalance] = await Promise.all([provider.estimateGas(request), provider.getFeeData(), provider.getBalance(wallet.address)]);
-      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice;
-      if (!gasPrice) throw Object.assign(new Error('RPC did not return fee data'), { statusCode: 503 });
-      const fee = gasLimit * gasPrice;
-      res.json({ status: 'success', data: { gasFee: ethers.formatEther(fee), estimatedFee: ethers.formatEther(fee), feeAsset: network.nativeAsset, feeBalance: ethers.formatEther(feeBalance), gasLimit: gasLimit.toString(), source: 'rpc' } });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/transactions/prepare', checkCSRF, async (req, res) => {
-    try {
-      const { walletId, networkId, asset, amount, destinationAddress, memo, notes, operationType = 'transfer' } = req.body || {};
-      if (!mongoose.isValidObjectId(walletId) || !ethers.isAddress(destinationAddress) || !amount || Number(amount) <= 0) return res.status(400).json({ status: 'fail', message: 'Invalid transaction request' });
-      const wallet = await WalletRegistry.findById(walletId);
-      if (!wallet || wallet.role !== 'treasury' || !wallet.signingEnabled || wallet.watchOnly || wallet.status !== 'active') return res.status(403).json({ status: 'fail', message: 'Source wallet is not authorized for outgoing transfers' });
-      if (wallet.networkId !== normalizeNetwork(networkId) || wallet.asset !== String(asset).toUpperCase()) return res.status(400).json({ status: 'fail', message: 'Source wallet does not match requested network and asset' });
-      const config = assetConfig(wallet.networkId, wallet.asset);
-      let requestedAmount;
-      try { requestedAmount = ethers.parseUnits(String(amount), config.decimals); } catch (_) { return res.status(400).json({ status: 'fail', message: 'Invalid asset amount' }); }
-      const state = await chainState(wallet.toObject());
-      if (requestedAmount > ethers.parseUnits(state.chainState.spendableBalance, config.decimals)) return res.status(400).json({ status: 'fail', message: 'Amount exceeds live spendable balance' });
-      const key = ethers.keccak256(ethers.toUtf8Bytes([wallet.id, req.admin.id, operationType, amount, destinationAddress.toLowerCase(), Date.now()].join(':')));
-      const operation = await WalletOperation.create({ idempotencyKey: key, operationType, wallet: wallet._id, networkId: wallet.networkId, asset: wallet.asset, amount: String(amount), destinationAddress: destinationAddress.toLowerCase(), memo, notes, initiatedBy: req.admin._id, expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
-      res.status(201).json({ status: 'success', data: { operationId: String(operation._id), id: String(operation._id), approvalRequired: true, status: operation.status, expiresAt: operation.expiresAt } });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/transactions/:operationId/approve', checkCSRF, async (req, res) => {
-    try {
-      const operation = await WalletOperation.findById(req.params.operationId);
-      if (!operation) return res.status(404).json({ status: 'fail', message: 'Operation not found' });
-      if (operation.status === 'approved') return res.json({ status: 'success', data: { operationId: String(operation._id), status: operation.status } });
-      if (operation.status !== 'prepared' || operation.expiresAt <= new Date()) return res.status(409).json({ status: 'fail', message: 'Operation is not eligible for approval' });
-      operation.status = 'approved'; operation.approvedBy = req.admin._id; operation.approvedAt = new Date(); await operation.save();
-      res.json({ status: 'success', data: { operationId: String(operation._id), status: operation.status } });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/transactions/:operationId/sign', checkCSRF, async (req, res) => {
-    try {
-      const operation = await WalletOperation.findById(req.params.operationId).populate('wallet');
-      if (!operation) return res.status(404).json({ status: 'fail', message: 'Operation not found' });
-      if (operation.status !== 'approved' || operation.expiresAt <= new Date()) return res.status(409).json({ status: 'fail', message: 'Operation is not approved for signing' });
-      // This application has no verified custody/KMS signer integration. Refusing to sign is intentional.
-      return res.status(503).json({ status: 'error', message: 'No approved custody signer is configured; signing and broadcasting are disabled' });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/transactions/:operationId/broadcast', checkCSRF, async (req, res) => res.status(409).json({ status: 'fail', message: 'Broadcast requires a transaction signed by an approved custody signer' }));
-  router.get('/transactions', async (req, res) => {
-    try {
-      const filter = {}; ['networkId', 'asset', 'status'].forEach(key => { if (req.query[key] && req.query[key] !== 'all') filter[key === 'networkId' ? key : key] = key === 'asset' ? String(req.query[key]).toUpperCase() : req.query[key]; });
-      if (req.query.network && req.query.network !== 'all') filter.networkId = normalizeNetwork(req.query.network);
-      const currentPage = page(req.query.page), perPage = limit(req.query.limit);
-      const [items, total] = await Promise.all([WalletOperation.find(filter).populate('wallet', 'address label').sort({ createdAt: -1 }).skip((currentPage - 1) * perPage).limit(perPage).lean(), WalletOperation.countDocuments(filter)]);
-      res.json({ status: 'success', data: { transactions: items.map(item => ({ ...item, walletAddress: item.wallet?.address, platformWallet: item.wallet?.address, timestamp: item.createdAt, direction: 'outgoing', transactionType: item.operationType, fee: item.fee, feeAsset: item.feeAsset, txHash: item.txHash })), page: currentPage, totalPages: Math.max(1, Math.ceil(total / perPage)), networks: Object.keys(NETWORKS), assets: Object.keys(TOKENS.ETH || {}) } });
-    } catch (error) { fail(res, error); }
-  });
-  router.get('/treasury/history', async (req, res) => {
-    try {
-      const currentPage = page(req.query.page), perPage = limit(req.query.limit);
-      const [transfers, total] = await Promise.all([WalletOperation.find({}).sort({ createdAt: -1 }).skip((currentPage - 1) * perPage).limit(perPage).lean(), WalletOperation.countDocuments()]);
-      res.json({ status: 'success', data: { transfers, page: currentPage, totalPages: Math.max(1, Math.ceil(total / perPage)), total } });
-    } catch (error) { fail(res, error); }
-  });
-  router.get('/treasury/export', async (req, res) => {
-    try {
-      const filter = { role: 'treasury' };
-      if (req.query.network) filter.networkId = normalizeNetwork(req.query.network);
-      if (req.query.asset) filter.asset = String(req.query.asset).toUpperCase();
-      const wallets = await WalletRegistry.find(filter).lean();
-      res.json({ status: 'success', data: { wallets: wallets.map(publicWallet) } });
-    } catch (error) { fail(res, error); }
-  });
-  router.get('/treasury', async (req, res) => {
-    try {
-      const wallets = await WalletRegistry.find({ role: 'treasury', status: 'active' }).lean();
-      const groups = new Map();
-      for (const wallet of wallets) {
-        const key = `${wallet.networkId}:${wallet.asset}`; if (!groups.has(key)) groups.set(key, { network: wallet.networkId, asset: wallet.asset, available: 'Unavailable', pending: null, total: 'Unavailable', walletCount: 0, lastActivity: null, lastWithdrawal: null });
-        const row = groups.get(key); row.walletCount += 1;
-      }
-      res.json({ status: 'success', data: { treasury: [...groups.values()] } });
-    } catch (error) { fail(res, error); }
-  });
-  router.get('/reports-alerts', async (req, res) => res.json({ status: 'success', data: { alerts: [], totalPages: 1 } }));
-  router.get('/dashboard', async (req, res) => {
-    try {
-      const [treasuryWalletCount, totalWalletAddresses, pendingTransactions, failedTransactions, activeNetworks, activity] = await Promise.all([
-        WalletRegistry.countDocuments({ role: 'treasury' }), WalletRegistry.countDocuments(), WalletOperation.countDocuments({ status: { $in: ['prepared', 'approved', 'signing_pending', 'signed', 'broadcast'] } }), WalletOperation.countDocuments({ status: 'failed' }), WalletRegistry.distinct('networkId', { status: 'active' }), WalletOperation.find({}).sort({ createdAt: -1 }).limit(limit(req.query.limit || 10)).populate('wallet', 'address').lean()
-      ]);
-      const syncStates = Object.values(NETWORKS).map(network => ({ network: network.id, status: rpcUrl(network) ? 'configured' : 'unavailable', lastSuccessfulSyncAt: null, lastError: rpcUrl(network) ? null : 'RPC endpoint is not configured' }));
-      res.json({ status: 'success', data: { treasuryWalletCount, totalWalletAddresses, fundedTreasuryWalletCount: 0, totalChainTransactions: await WalletOperation.countDocuments(), totalDepositsToday: 0, totalWithdrawalsToday: 0, totalCryptoReceived: 0, totalCryptoSent: 0, assetsUnderManagement: 0, pendingTransactions, failedTransactions, activeNetworks: activeNetworks.length, lastBlockchainSyncTime: null, lastSyncStatus: syncStates.some(s => s.status === 'configured') ? 'degraded' : 'error', syncStates, incomingVolume: 0, outgoingVolume: 0, depositsPerHour: { labels: [], values: [] }, depositsPerDay: { labels: [], values: [] }, networkDistribution: { labels: [], values: [] }, assetDistribution: { labels: [], values: [] }, largestDeposits: { labels: [], values: [] }, activity: activity.map(item => ({ time: item.createdAt, event: item.operationType, network: item.networkId, asset: item.asset, amount: item.amount, wallet: item.wallet?.address, status: item.status })) } });
-    } catch (error) { fail(res, error); }
-  });
-  router.post('/sync', checkCSRF, async (req, res) => {
-    try {
-      const wallets = await WalletRegistry.find({ status: 'active' }).lean();
-      const syncStates = await Promise.all(wallets.map(async wallet => {
-        try { await chainState(wallet); return { walletId: String(wallet._id), network: wallet.networkId, status: 'healthy', lastSuccessfulSyncAt: new Date().toISOString() }; }
-        catch (error) { return { walletId: String(wallet._id), network: wallet.networkId, status: 'unavailable', lastError: error.message }; }
-      }));
-      const io = getIO();
-      const status = syncStates.length && syncStates.every(state => state.status === 'healthy') ? 'healthy' : 'degraded';
-      if (io) io.to('wallet_management_admins').emit('wallet_management_sync_status', { status, message: 'Blockchain reconciliation completed', syncStates, lastSuccessfulSyncAt: syncStates.some(state => state.status === 'healthy') ? new Date().toISOString() : null });
-      res.json({ status: 'success', data: { syncStates } });
-    } catch (error) { fail(res, error); }
-  });
-  return router;
-}
-
-function bindWalletManagementSocket(socket, { Admin }) {
-  socket.on('subscribe_wallet_management', async () => {
-    try {
-      if (!socket.isAuthenticated || !socket.isAdmin || !socket.userId) return socket.emit('wallet_management_error', { message: 'Admin authentication is required' });
-      const admin = await Admin.findById(socket.userId).lean();
-      const permissions = admin?.permissions || [];
-      if (!admin || !(admin.role === 'super' || permissions.includes('all') || permissions.includes('wallet_management') || permissions.includes('wallet_operations'))) return socket.emit('wallet_management_error', { message: 'Wallet Management permission is required' });
-      socket.join('wallet_management_admins');
-      const syncStates = Object.values(NETWORKS).map(network => ({ network: network.id, status: rpcUrl(network) ? 'configured' : 'unavailable', lastSuccessfulSyncAt: null }));
-      socket.emit('wallet_management_initial', { syncStates, lastSuccessfulSyncAt: null });
-    } catch (error) { socket.emit('wallet_management_error', { message: 'Unable to authorize Wallet Management subscription' }); }
-  });
-  socket.on('unsubscribe_wallet_management', () => socket.leave('wallet_management_admins'));
-}
-
-module.exports = { createWalletManagementRouter, bindWalletManagementSocket };
+function bindWalletManagementSocket(socket,{Admin}){socket.on('subscribe_wallet_management',async()=>{if(!socket.isAuthenticated||!socket.isAdmin)return socket.emit('wallet_management_error',{message:'Admin authentication is required'});if(!await Admin.findById(socket.userId).lean())return socket.emit('wallet_management_error',{message:'Admin authentication is required'});socket.join('wallet_management')});socket.on('unsubscribe_wallet_management',()=>socket.leave('wallet_management'))}
+module.exports={createWalletManagementRouter,bindWalletManagementSocket,WalletRegistry:LocalRegistry,WalletOperation:LocalOperation};
