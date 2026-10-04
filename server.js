@@ -49426,7 +49426,6 @@ async function wmBuildActivityRow(source, assetUpper, networkKey) {
 /* ============================================================================
  * MOUNT WALLET MANAGEMENT ROUTER
  * ========================================================================== */
-const walletManagementRouter = express.Router();
 walletManagementRouter.use(adminProtect, restrictTo('super', 'finance'));
 
 /* ============================================================================
