@@ -14649,7 +14649,6 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
-
 class PlatformWallet {
     constructor() {
         // ── Customer-facing wallet (existing) ──────────────────────────────
@@ -15299,12 +15298,41 @@ class PlatformWallet {
                 }
 
                 case 'ADA': {
+                    // ── Cardano (Shelley) address generation ────────────────
+                    // bech32@2.0.0 changed the export shape: `require('bech32')`
+                    // returns a namespace object where the actual helpers live
+                    // under `.bech32`. This shim accepts either the v1 flat
+                    // shape or the v2 namespace shape so the same code works
+                    // regardless of which major version is installed.
+                    const bech32Lib = (bech32 && bech32.bech32) ? bech32.bech32 : bech32;
+
+                    if (!bech32Lib || typeof bech32Lib.toWords !== 'function' ||
+                        typeof bech32Lib.encode !== 'function') {
+                        throw new Error(
+                            'bech32 library is missing toWords/encode. ' +
+                            'Ensure bech32@^2.0.0 is installed and required as ' +
+                            "`const bech32 = require('bech32');`."
+                        );
+                    }
+
+                    // CIP-19: payment credential = blake2b-224(pubkey) → 28 bytes
                     const pubKeyBytes = child.publicKey;
                     const hash = blake.blake2b(pubKeyBytes, undefined, 32);
                     const paymentPart = hash.slice(0, 28);
 
-                    const words = bech32.toWords(paymentPart);
-                    const address = bech32.encode('addr', words, 200);
+                    // Header byte encodes (address type << 4) | network_id.
+                    //   0x61 = enterprise (type 6) + mainnet (network id 1)
+                    //   0x60 = enterprise (type 6) + testnet (network id 0)
+                    // If this platform ever migrates to base addresses
+                    // (payment + stake), the header becomes 0x01 (mainnet)
+                    // and a 28-byte stake credential must be appended.
+                    const MAINNET_ENTERPRISE_HEADER = 0x61;
+                    const header = Buffer.from([MAINNET_ENTERPRISE_HEADER]);
+
+                    const payload = Buffer.concat([header, paymentPart]); // 1 + 28 = 29 bytes
+
+                    const words = bech32Lib.toWords(payload);
+                    const address = bech32Lib.encode('addr', words, 1000);
 
                     result = {
                         address: address,
@@ -15510,12 +15538,34 @@ class PlatformWallet {
                 }
 
                 case 'ADA': {
+                    // ── Cardano (Shelley) treasury address generation ───────
+                    // Same fix as the user-side branch above: handle the
+                    // bech32@2.x namespace export shape and prepend the
+                    // CIP-19 header byte so the resulting address is valid
+                    // on-chain. Treasury mainnet enterprise addresses use
+                    // the same header (0x61) as user addresses.
+                    const bech32Lib = (bech32 && bech32.bech32) ? bech32.bech32 : bech32;
+
+                    if (!bech32Lib || typeof bech32Lib.toWords !== 'function' ||
+                        typeof bech32Lib.encode !== 'function') {
+                        throw new Error(
+                            'bech32 library is missing toWords/encode. ' +
+                            'Ensure bech32@^2.0.0 is installed and required as ' +
+                            "`const bech32 = require('bech32');`."
+                        );
+                    }
+
                     const pubKeyBytes = child.publicKey;
                     const hash = blake.blake2b(pubKeyBytes, undefined, 32);
                     const paymentPart = hash.slice(0, 28);
 
-                    const words = bech32.toWords(paymentPart);
-                    const address = bech32.encode('addr', words, 200);
+                    const MAINNET_ENTERPRISE_HEADER = 0x61;
+                    const header = Buffer.from([MAINNET_ENTERPRISE_HEADER]);
+
+                    const payload = Buffer.concat([header, paymentPart]); // 1 + 28 = 29 bytes
+
+                    const words = bech32Lib.toWords(payload);
+                    const address = bech32Lib.encode('addr', words, 1000);
 
                     result = {
                         address: address,
@@ -16306,8 +16356,6 @@ async function getSystemUserId() {
         return null;
     }
 }
-
-
 
 
 
