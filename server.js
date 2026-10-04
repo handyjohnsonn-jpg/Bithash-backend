@@ -45492,6 +45492,9 @@ console.log('   - GET  /api/users/kyc/facial/status');
 
 
 
+const { createWalletManagementRouter, bindWalletManagementSocket } = require('./wallet-management');
+app.use('/api/admin/wallet-management', createWalletManagementRouter({ adminProtect, checkCSRF, getIO: () => app.get('io') }));
+
 app.use((err, req, res, next) => {
   console.error('========================');
   console.error('GLOBAL ERROR');
@@ -46052,6 +46055,8 @@ io.on('connection', async (socket) => {
   const sessionId = socket.sessionId;
   const isAuthenticated = socket.isAuthenticated;
   const isAdmin = socket.isAdmin;
+
+  bindWalletManagementSocket(socket, { Admin });
 
   if (userId) {
     socket.join(`user_${userId}`);
