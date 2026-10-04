@@ -14645,6 +14645,8 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
+
+
 class PlatformWallet {
     constructor() {
         // ── Customer-facing wallet (existing) ──────────────────────────────
@@ -14655,12 +14657,6 @@ class PlatformWallet {
 
         this.initialized = false;
         this.treasuryInitialized = false;
-
-        // Master-seed gate: treasury is opt-in via TREASURY_SEED_ENABLED=true.
-        // When false, the entire treasury subsystem stays dormant and any
-        // attempt to derive a treasury address throws a clear error rather
-        // than silently returning undefined.
-        this.treasuryEnabled = false;
 
         this.walletCache = new Map();
         this.treasuryCache = new Map();
@@ -14836,62 +14832,25 @@ class PlatformWallet {
     }
 
     /**
-     * Initialize the TREASURY wallet.
+     * Initialize the TREASURY wallet (new).
      *
-     * IMPORTANT DESIGN NOTES
-     * ----------------------
-     * 1. This is opt-in. It only runs when TREASURY_SEED_ENABLED === 'true'.
-     *    If the flag is false, we mark the treasury as disabled and return
-     *    cleanly — the user wallet subsystem continues unaffected.
+     * Uses TREASURY_MASTER_SEED, which MUST be a valid BIP-39 phrase
+     * and MUST be different from MASTER_SEED_PHRASE. If they are identical,
+     * we refuse to boot because that would defeat the entire separation-of-
+     * concerns design (users could derive the treasury root, and vice-versa).
      *
-     * 2. The master seed is a ROOT only. We never treat it as "the treasury
-     *    wallet". Per-chain accounts are derived on demand via
-     *    getTreasuryDerivationPath(asset, sweepIndex):
-     *
-     *        TREASURY_MASTER_SEED
-     *                │
-     *                ├── BTC account  (m/44'/0'/1'/0/<idx>)
-     *                ├── EVM account  (m/44'/60'/1'/0/<idx>)  ← ETH, BNB,
-     *                │                                          MATIC, ARB,
-     *                │                                          BASE, USDT,
-     *                │                                          USDC, etc.
-     *                ├── SOL account
-     *                ├── XRP account
-     *                ├── DOGE account
-     *                ├── LTC account
-     *                └── ADA account
-     *
-     * 3. The seed string itself is NEVER logged, never stringified, never
-     *    stored anywhere reachable by Mongo, GitHub, the frontend, admin UI,
-     *    or Render logs. Only the public key / fingerprint are ever emitted.
-     *
-     * 4. Guard against fingerprint collision with the user master seed.
-     *    Two identical seed phrases would defeat the whole isolation model.
+     * The treasury tree is derived with account index = 1, giving it a fully
+     * disjoint derivation space from user wallets (account index = 0).
      */
-    initializeTreasury(mnemonic, enabled) {
-        // Normalise the enabled flag. Callers may pass true/false/undefined.
-        // Any value other than an explicit boolean true is treated as "off".
-        const isEnabled = enabled === true;
-
-        this.treasuryEnabled = isEnabled;
-
-        if (!isEnabled) {
-            this.treasuryRoot = null;
-            this.treasuryInitialized = false;
-            console.log('ℹ️  Treasury wallet subsystem is DISABLED (TREASURY_SEED_ENABLED is not "true").');
-            console.log('   Treasury derivation endpoints will reject requests until enabled.');
-            return false;
-        }
-
-        // Enabled → seed MUST be present. Fail closed, never fall back.
+    initializeTreasury(mnemonic) {
         if (!mnemonic || typeof mnemonic !== 'string') {
-            console.error('[FATAL] Treasury wallet init failed: TREASURY_SEED_ENABLED=true but TREASURY_MASTER_SEED is missing.');
-            throw new Error('TREASURY_MASTER_SEED is not configured while TREASURY_SEED_ENABLED=true.');
+            console.error('[FATAL] Treasury wallet init failed: Invalid mnemonic');
+            throw new Error('Invalid treasury mnemonic provided. System cannot initialize.');
         }
 
         try {
             if (!bip39.validateMnemonic(mnemonic)) {
-                console.error('[FATAL] Treasury wallet init failed: TREASURY_MASTER_SEED is not a valid BIP-39 phrase.');
+                console.error('[FATAL] Treasury wallet init failed: Invalid mnemonic phrase');
                 throw new Error('Invalid treasury mnemonic phrase. System cannot initialize.');
             }
 
@@ -14900,32 +14859,24 @@ class PlatformWallet {
             this.treasuryInitialized = true;
             this.lastTreasuryBalanceCheck = new Date();
 
-            // Fingerprint collision guard. We compare fingerprints, never the
-            // raw seed, so nothing sensitive is ever routed to a logger.
+            // Fingerprint collision guard
             if (this.root && this.treasuryRoot) {
                 const userFp = this.root.fingerprint.toString('hex');
                 const treasuryFp = this.treasuryRoot.fingerprint.toString('hex');
                 if (userFp === treasuryFp) {
                     this.treasuryRoot = null;
                     this.treasuryInitialized = false;
-                    this.treasuryEnabled = false;
                     console.error('[FATAL] TREASURY_MASTER_SEED resolves to the same BIP-32 fingerprint as MASTER_SEED_PHRASE.');
                     console.error('[FATAL] User and Treasury wallets MUST use different seed phrases.');
                     throw new Error('Treasury and platform seeds must be different.');
                 }
             }
 
-            // Only emit PUBLIC metadata. No mnemonic, no seed, no private keys.
             console.log('✅ Treasury wallet initialized successfully');
             console.log(`   Treasury account index: ${this.TREASURY_ACCOUNT_INDEX}`);
-            console.log(`   Treasury fingerprint:   ${this.treasuryRoot.fingerprint.toString('hex')}`);
-            console.log(`   Treasury public key:    ${this.treasuryRoot.publicKey.toString('hex')}`);
-            console.log(`   Derivation layout:      m/44'/coin'/1'/0/<sweepIndex>`);
-            console.log(`   Chains covered:         BTC, ETH, BNB, MATIC, AVAX, USDT, USDC, SHIB, LINK, UNI, WBTC, DAI, SOL, XRP, TRX, DOGE, LTC, ADA, DOT`);
+            console.log(`   Treasury fingerprint: ${this.treasuryRoot.fingerprint.toString('hex')}`);
             return true;
         } catch (e) {
-            // Careful: never echo the seed. Only echo the error message that
-            // we ourselves composed (which never contains the mnemonic).
             console.error('[FATAL] Treasury wallet init error:', e.message);
             throw new Error(`Failed to initialize treasury wallet: ${e.message}`);
         }
@@ -14940,15 +14891,8 @@ class PlatformWallet {
     /**
      * Treasury equivalent of ensureInitialized(). Fails loudly so we never
      * silently route a sweep into a null treasury root.
-     *
-     * Two distinct failure modes are reported so operators can tell them apart:
-     *   - "disabled"   → TREASURY_SEED_ENABLED is not "true"
-     *   - "not ready"  → flag on, but init has not completed / was aborted
      */
     ensureTreasuryInitialized() {
-        if (!this.treasuryEnabled) {
-            throw new Error('Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable treasury operations.');
-        }
         if (!this.treasuryInitialized || !this.treasuryRoot) {
             throw new Error('Treasury wallet not initialized. Cannot derive treasury addresses.');
         }
@@ -15041,10 +14985,6 @@ class PlatformWallet {
      * - For EVM-family assets (native + ERC-20) we mix the asset's
      *   derivationIndex into the sweepIndex so USDT/USDC/etc. each have
      *   their own dedicated address, exactly like the user side.
-     *
-     * This is how the "master seed → per-chain account" model is realized:
-     * the same treasury seed produces independent, deterministic accounts
-     * for BTC, every EVM chain, SOL, XRP, DOGE, ADA, etc., with no overlap.
      */
     getTreasuryDerivationPath(asset, sweepIndex = 0) {
         const assetUpper = asset.toUpperCase();
@@ -15589,7 +15529,6 @@ class PlatformWallet {
                     throw new Error(`Asset ${assetUpper} not implemented for treasury`);
             }
 
-            // ⚠️ Never log the private key. Only public metadata.
             console.log(`🏦 Generated TREASURY ${assetUpper} address (sweep ${sweep}):`);
             console.log(`   Address: ${result.address.substring(0, 10)}...`);
             console.log(`   Path: ${path}`);
@@ -15608,8 +15547,7 @@ class PlatformWallet {
 
     /**
      * Convenience wrapper: return the primary treasury address for every
-     * supported asset in one pass. Useful for cold-storage ceremony UIs
-     * and sweep-routing configuration.
+     * supported asset in one pass. Useful for cold-storage ceremony UIs     * and sweep-routing configuration.
      */
     getAllTreasuryPrimaryAddresses() {
         this.ensureTreasuryInitialized();
@@ -15667,7 +15605,7 @@ class PlatformWallet {
      */
     isTreasuryAddress(address, asset, maxSweepIndex = 1000) {
         if (!address || typeof address !== 'string') return false;
-        if (!this.treasuryEnabled || !this.treasuryInitialized) return false;
+        if (!this.treasuryInitialized) return false;
 
         const target = address.trim();
         const assetUpper = asset.toUpperCase();
@@ -15726,7 +15664,6 @@ class PlatformWallet {
 
         return {
             initialized: this.initialized,
-            treasuryEnabled: this.treasuryEnabled,
             treasuryInitialized: this.treasuryInitialized,
             treasuryAccountIndex: this.TREASURY_ACCOUNT_INDEX,
             totalAddressesGenerated: this.walletCache.size,
@@ -15960,13 +15897,8 @@ class PlatformWallet {
     // ═══════════════════════════════════════════════════════════════════════
 
     exportWalletData(options = {}) {
-        // SAFETY: This function intentionally never returns the mnemonic,
-        // the BIP-39 seed bytes, or any raw private key — even when callers
-        // pass includePrivateKeys. It only ever returns public metadata,
-        // fingerprints, and derived public keys.
         const data = {
             initialized: this.initialized,
-            treasuryEnabled: this.treasuryEnabled,
             treasuryInitialized: this.treasuryInitialized,
             treasuryAccountIndex: this.TREASURY_ACCOUNT_INDEX,
             lastBalanceCheck: this.lastBalanceCheck,
@@ -15984,14 +15916,10 @@ class PlatformWallet {
             data.treasuryTransactionHistory = this.treasuryTransactionHistory;
         }
         if (options.includePrivateKeys && this.initialized) {
-            // Deliberately only expose PUBLIC key material here.
-            // No private keys, no seeds, no mnemonics.
             data.masterPublicKey = this.root.publicKey.toString('hex');
             data.masterFingerprint = this.root.fingerprint.toString('hex');
         }
-        if (options.includePrivateKeys && this.treasuryEnabled && this.treasuryInitialized) {
-            // Deliberately only expose PUBLIC key material here.
-            // No private keys, no seeds, no mnemonics.
+        if (options.includePrivateKeys && this.treasuryInitialized) {
             data.treasuryMasterPublicKey = this.treasuryRoot.publicKey.toString('hex');
             data.treasuryMasterFingerprint = this.treasuryRoot.fingerprint.toString('hex');
         }
@@ -16003,16 +15931,12 @@ class PlatformWallet {
     }
 
     isTreasuryReady() {
-        return this.treasuryEnabled && this.treasuryInitialized;
+        return this.treasuryInitialized;
     }
 }
 
 const platformWallet = new PlatformWallet();
 const MASTER_SEED_PHRASE = process.env.MASTER_SEED_PHRASE;
-
-// Master seed gate: treasury signing is opt-in via TREASURY_SEED_ENABLED=true.
-// Never log the raw seed or the raw mnemonic. Only booleans and public keys.
-const TREASURY_SEED_ENABLED = process.env.TREASURY_SEED_ENABLED === 'true';
 const TREASURY_MASTER_SEED = process.env.TREASURY_MASTER_SEED;
 
 if (!MASTER_SEED_PHRASE) {
@@ -16021,8 +15945,8 @@ if (!MASTER_SEED_PHRASE) {
     process.exit(1);
 }
 
-if (TREASURY_SEED_ENABLED && !TREASURY_MASTER_SEED) {
-    console.error('❌ FATAL: TREASURY_SEED_ENABLED=true but TREASURY_MASTER_SEED is not configured!');
+if (!TREASURY_MASTER_SEED) {
+    console.error('❌ FATAL: TREASURY_MASTER_SEED not found in environment variables!');
     console.error('❌ System cannot initialize treasury wallet. Shutting down...');
     process.exit(1);
 }
@@ -16037,15 +15961,8 @@ try {
 }
 
 try {
-    if (TREASURY_SEED_ENABLED) {
-        platformWallet.initializeTreasury(TREASURY_MASTER_SEED, true);
-        console.log('✅ Treasury wallet initialized successfully');
-    } else {
-        // Dormant mode. Do not pass the seed at all when disabled, so even
-        // a stray env var cannot leak through into the treasury root.
-        platformWallet.initializeTreasury(null, false);
-        console.log('ℹ️  Treasury wallet DISABLED (TREASURY_SEED_ENABLED is not "true").');
-    }
+    platformWallet.initializeTreasury(TREASURY_MASTER_SEED);
+    console.log('✅ Treasury wallet initialized successfully');
 } catch (error) {
     console.error('❌ FATAL: Failed to initialize treasury wallet:', error.message);
     console.error('❌ System cannot operate without treasury wallet. Shutting down...');
