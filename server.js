@@ -14,6 +14,7 @@ const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const Cardano = require('@emurgo/cardano-serialization-lib-nodejs');
 const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const Redis = require('ioredis');
