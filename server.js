@@ -47295,6 +47295,26 @@ console.log('   - GET  /wallets/:walletId/state');
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ============================================================================
  * WALLET MANAGEMENT — TREASURY / SWEEP / ASSETS / FEES
  * ----------------------------------------------------------------------------
@@ -48308,6 +48328,32 @@ console.log('   - POST /sweep/selected');
 console.log('   - GET  /assets');
 console.log('   - GET  /assets/metadata');
 console.log('   - POST /fees/estimate');
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
