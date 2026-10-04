@@ -48427,7 +48427,7 @@ console.log('   - POST /fees/estimate');
  * SHARED CONSTANTS AND HELPERS
  * ========================================================================== */
 
-const WM_RPC_TIMEOUT_MS = 9000;
+
 const WM_ERC20_ABI = [
     'function name() view returns (string)',
     'function symbol() view returns (string)',
