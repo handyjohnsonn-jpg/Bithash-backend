@@ -48418,12 +48418,593 @@ console.log('   - POST /fees/estimate');
 
 
 
+/* ============================================================================
+ * WALLET MANAGEMENT — SHARED HELPERS (ADDED TO FIX SIGN/BROADCAST)
+ * ----------------------------------------------------------------------------
+ * These were referenced by /transactions/* but never defined. Every EVM sweep
+ * was silently returning "Source wallet has no spendable balance" because the
+ * missing wmGetEvmProvider threw a ReferenceError that got swallowed by an
+ * over-eager catch block. This block restores all missing helpers.
+ * ========================================================================== */
+
+/* --------------------------------------------------------------------------
+ * ERC-20 transfer ABI used across prepare / sign / broadcast.
+ * ------------------------------------------------------------------------ */
+const WM_ERC20_ABI = [
+    'function balanceOf(address) view returns (uint256)',
+    'function decimals() view returns (uint8)',
+    'function transfer(address to, uint256 amount) returns (bool)'
+];
+
+/* --------------------------------------------------------------------------
+ * Cached EVM provider factory. Static network disables the eth_chainId probe
+ * on every call so a flaky RPC never silently drops balance reads.
+ * ------------------------------------------------------------------------ */
+const WM_EVM_PROVIDERS = new Map();
+
+function wmGetEvmProvider(chainId, rpcUrlOverride) {
+    const cid = Number(chainId);
+    if (!Number.isInteger(cid) || cid <= 0) {
+        throw new Error(`Invalid EVM chainId: ${chainId}`);
+    }
+
+    const rpcUrl = rpcUrlOverride || (() => {
+        switch (cid) {
+            case 1:     return RPC_PROVIDERS.ETH;
+            case 56:    return RPC_PROVIDERS.BSC;
+            case 137:   return RPC_PROVIDERS.POLYGON;
+            case 42161: return RPC_PROVIDERS.ARBITRUM;
+            case 43114: return RPC_PROVIDERS.AVALANCHE;
+            case 250:
+            case 146:   return RPC_PROVIDERS.FANTOM;
+            case 10:    return RPC_PROVIDERS.OPTIMISM;
+            case 8453:  return RPC_PROVIDERS.BASE;
+            default:    return null;
+        }
+    })();
+
+    if (!rpcUrl) throw new Error(`No RPC configured for EVM chainId ${cid}`);
+
+    const cacheKey = `${cid}::${rpcUrl}`;
+    if (WM_EVM_PROVIDERS.has(cacheKey)) return WM_EVM_PROVIDERS.get(cacheKey);
+
+    const provider = new ethers.JsonRpcProvider(
+        rpcUrl,
+        ethers.Network.from(cid),
+        { staticNetwork: true, batchMaxCount: 1 }
+    );
+
+    // Hard timeout on every RPC send.
+    const originalSend = provider.send.bind(provider);
+    provider.send = (method, params) =>
+        Promise.race([
+            originalSend(method, params),
+            new Promise((_, rej) =>
+                setTimeout(() => rej(new Error(`RPC timeout: ${method}`)), WM_RPC_TIMEOUT_MS)
+            )
+        ]);
+
+    WM_EVM_PROVIDERS.set(cacheKey, provider);
+    return provider;
+}
+
+async function wmAssertChainId(provider, expectedChainId, assetLabel) {
+    const net = await provider.getNetwork();
+    if (Number(net.chainId) !== Number(expectedChainId)) {
+        throw new Error(
+            `RPC chain mismatch for ${assetLabel}: got ${net.chainId}, expected ${expectedChainId}`
+        );
+    }
+}
+
+function wmNativeAssetForChain(chainId) {
+    switch (Number(chainId)) {
+        case 1:     return 'ETH';
+        case 56:    return 'BNB';
+        case 137:   return 'MATIC';
+        case 42161: return 'ETH';
+        case 43114: return 'AVAX';
+        case 250:
+        case 146:   return 'FTM';
+        case 10:    return 'ETH';
+        case 8453:  return 'ETH';
+        default:    return 'ETH';
+    }
+}
+
+function wmEvmExplorerBase(chainId) {
+    switch (Number(chainId)) {
+        case 1:     return 'https://etherscan.io/tx/';
+        case 56:    return 'https://bscscan.com/tx/';
+        case 137:   return 'https://polygonscan.com/tx/';
+        case 42161: return 'https://arbiscan.io/tx/';
+        case 43114: return 'https://snowtrace.io/tx/';
+        case 250:
+        case 146:   return 'https://ftmscan.com/tx/';
+        case 10:    return 'https://optimistic.etherscan.io/tx/';
+        case 8453:  return 'https://basescan.org/tx/';
+        default:    return 'https://etherscan.io/tx/';
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * EVM signers — user and treasury. Root is selected by scope.
+ * ------------------------------------------------------------------------ */
+function wmGetUserEvmSigner(derivationPath, chainId, rpcUrl) {
+    if (!platformWallet.root) throw new Error('User wallet root not initialized');
+    const child = platformWallet.root.derivePath(derivationPath);
+    const provider = wmGetEvmProvider(chainId, rpcUrl);
+    return new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
+}
+
+function wmGetTreasuryEvmSigner(derivationPath, chainId, rpcUrl) {
+    if (!platformWallet.treasuryRoot) throw new Error('Treasury wallet root not initialized');
+    const child = platformWallet.treasuryRoot.derivePath(derivationPath);
+    const provider = wmGetEvmProvider(chainId, rpcUrl);
+    return new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
+}
+
+/* --------------------------------------------------------------------------
+ * Solana keypair — seed is 64 bytes; Ed25519 wants 32.
+ * ------------------------------------------------------------------------ */
+function wmGetSolanaKeypair(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    return Keypair.fromSeed(child.privateKey.slice(0, 32));
+}
+
+/* --------------------------------------------------------------------------
+ * XRP wallet
+ * ------------------------------------------------------------------------ */
+function wmGetXrpWallet(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const pubHex = child.publicKey.toString('hex');
+    const privHex = child.privateKey.toString('hex').toUpperCase();
+    const wallet = new xrpl.Wallet(pubHex, privHex);
+    return { wallet, derivedAddress: wallet.classicAddress };
+}
+
+/* --------------------------------------------------------------------------
+ * TRON account
+ * ------------------------------------------------------------------------ */
+function wmGetTronAccount(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const privHex = child.privateKey.toString('hex');
+    const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+    tronWeb.setPrivateKey(privHex);
+    const address = TronWeb.address.fromPrivateKey(privHex);
+    return { tronWeb, privHex, address };
+}
+
+/* --------------------------------------------------------------------------
+ * Polkadot API — cached singleton.
+ * ------------------------------------------------------------------------ */
+let _wmPolkadotApi = null;
+async function wmGetPolkadotApi() {
+    if (_wmPolkadotApi) return _wmPolkadotApi;
+    const wsUrl = process.env.POLKADOT_WS_URL || 'wss://rpc.polkadot.io';
+    const provider = new WsProvider(wsUrl);
+    _wmPolkadotApi = await ApiPromise.create({ provider });
+    return _wmPolkadotApi;
+}
+
+/* --------------------------------------------------------------------------
+ * Aptos account
+ * ------------------------------------------------------------------------ */
+function wmGetAptosAccount(derivationPath, scope) {
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+    const privateKeyHex = child.privateKey.toString('hex');
+    return aptos.Account.fromPrivateKey({
+        privateKey: new aptos.Ed25519PrivateKey(privateKeyHex)
+    });
+}
+
+/* --------------------------------------------------------------------------
+ * UTXO sign-and-broadcast — pulls live UTXOs, signs PSBT, pushes via Blockchair.
+ * ------------------------------------------------------------------------ */
+async function wmSignAndBroadcast({
+    assetUpper, derivationPath, fromAddress, toAddress, amount, memo, scope
+}) {
+    const lower = assetUpper.toLowerCase();
+    const networkMap = {
+        btc: bitcoin.networks.bitcoin,
+        ltc: {
+            messagePrefix: '\x19Litecoin Signed Message:\n',
+            bech32: 'ltc',
+            bip32: { public: 0x019da462, private: 0x019d9cfe },
+            pubKeyHash: 0x30,
+            scriptHash: 0x32,
+            wif: 0xb0
+        },
+        doge: {
+            messagePrefix: '\x19Dogecoin Signed Message:\n',
+            bech32: 'doge',
+            bip32: { public: 0x02facafd, private: 0x02fac398 },
+            pubKeyHash: 0x1e,
+            scriptHash: 0x16,
+            wif: 0x9e
+        }
+    };
+    const network = networkMap[lower];
+    if (!network) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+    const explorerBase = {
+        btc: 'https://api.blockchair.com/bitcoin',
+        ltc: 'https://api.blockchair.com/litecoin',
+        doge: 'https://api.blockchair.com/dogecoin'
+    }[lower];
+
+    const utxoResp = await axios.get(
+        `${explorerBase}/dashboards/address/${fromAddress}?limit=100`,
+        { timeout: WM_RPC_TIMEOUT_MS }
+    );
+    const utxos = utxoResp.data?.data?.[fromAddress]?.utxo || [];
+    if (utxos.length === 0) throw new Error('No UTXOs available to spend');
+
+    const root = scope === 'treasury' ? platformWallet.treasuryRoot : platformWallet.root;
+    if (!root) throw new Error(`${scope} root not initialized`);
+    const child = root.derivePath(derivationPath);
+
+    const payment = bitcoin.payments.p2pkh({
+        pubkey: Buffer.from(child.publicKey),
+        network
+    });
+
+    const psbt = new bitcoin.Psbt({ network });
+    let inputSum = 0n;
+    const targetSats = BigInt(Math.round(Number(amount) * 1e8));
+    const feeSats = BigInt(Math.round(Number(amount) * 1e8 * 0.001));
+    const required = targetSats + feeSats;
+
+    for (const u of utxos) {
+        const valueSats = BigInt(u.value);
+        psbt.addInput({
+            hash: u.transaction_hash,
+            index: u.index,
+            witnessUtxo: { script: payment.output, value: valueSats }
+        });
+        inputSum += valueSats;
+        if (inputSum >= required) break;
+    }
+
+    if (inputSum < required) {
+        throw new Error(`Insufficient UTXOs: have ${inputSum} sats, need ${required}`);
+    }
+
+    psbt.addOutput({ address: toAddress, value: targetSats });
+    const change = inputSum - required;
+    if (change > 546n) psbt.addOutput({ address: fromAddress, value: change });
+
+    // bitcoinjs-lib Psbt.signInput requires a signer with .sign(hash) -> Buffer.
+    // We build one from the derived key using tiny-secp256k1 (transitively
+    // pulled in by bitcoinjs-lib). No new top-level dependency required.
+    const secp = require('tiny-secp256k1');
+    const signer = {
+        publicKey: Buffer.from(child.publicKey),
+        sign: (hash) => Buffer.from(secp.sign(hash, child.privateKey))
+    };
+    psbt.signAllInputs(signer);
+    psbt.finalizeAllInputs();
+
+    const rawTx = psbt.extractTransaction().toHex();
+    const pushResp = await axios.post(
+        `${explorerBase}/push/transaction`,
+        { data: rawTx },
+        { timeout: WM_RPC_TIMEOUT_MS }
+    );
+    const txHash = pushResp.data?.data?.transaction_hash;
+    if (!txHash) throw new Error('Broadcast returned no tx hash');
+
+    const explorerBaseUrl = {
+        btc: 'https://blockchair.com/bitcoin/transaction/',
+        ltc: 'https://blockchair.com/litecoin/transaction/',
+        doge: 'https://blockchair.com/dogecoin/transaction/'
+    }[lower];
+
+    return { txHash, explorerUrl: `${explorerBaseUrl}${txHash}` };
+}
+
+/* --------------------------------------------------------------------------
+ * wmEstimateFeeForOperation — live fee estimation for every chain.
+ * Used by prepare. Returns { chainType, gasLimit, gasPrice, feeNative,
+ * feeAsset, feeUsd, meta }.
+ * ------------------------------------------------------------------------ */
+async function wmEstimateFeeForOperation({
+    assetUpper, networkId, fromAddress, toAddress, amountStr, memo
+}) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) throw new Error(`Unsupported asset: ${assetUpper}`);
+
+    const rpcUrl = RPC_PROVIDERS[networkId];
+    const chainType = entry.type;
+
+    /* ======================================================================
+     * EVM — native + ERC-20
+     * ==================================================================== */
+    if (chainType === 'evm') {
+        if (!rpcUrl) throw new Error(`No RPC configured for ${networkId}`);
+        const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
+        await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+        const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+        const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+        const feeData = await provider.getFeeData();
+
+        let gasPriceWei = feeData.gasPrice ?? null;
+        if (gasPriceWei === null) {
+            const hex = await provider.send('eth_gasPrice', []);
+            gasPriceWei = BigInt(hex);
+        }
+        if (!gasPriceWei) throw new Error('Unable to read gas price from RPC');
+
+        const hasEip1559 =
+            feeData.maxFeePerGas !== null &&
+            feeData.maxPriorityFeePerGas !== null &&
+            feeData.maxFeePerGas > 0n;
+
+        let maxFeePerGas = null;
+        let maxPriorityFeePerGas = null;
+        let baseFeeUsed = null;
+
+        if (hasEip1559) {
+            try {
+                const latest = await provider.getBlock('latest');
+                if (latest?.baseFeePerGas) baseFeeUsed = latest.baseFeePerGas;
+            } catch (_) { /* ignore */ }
+
+            const priority = feeData.maxPriorityFeePerGas > 0n
+                ? feeData.maxPriorityFeePerGas
+                : ethers.parseUnits('1.5', 'gwei');
+
+            maxFeePerGas = baseFeeUsed
+                ? (baseFeeUsed * 2n) + priority
+                : feeData.maxFeePerGas;
+
+            maxPriorityFeePerGas =
+                priority > maxFeePerGas ? maxFeePerGas : priority;
+        }
+
+        let gasLimit;
+        if (isERC20) {
+            try {
+                const iface = new ethers.Interface(WM_ERC20_ABI);
+                const data = iface.encodeFunctionData('transfer', [
+                    toAddress,
+                    ethers.parseUnits(amountStr, tokenCfg.decimals)
+                ]);
+                const est = await provider.estimateGas({
+                    from: fromAddress,
+                    to: tokenCfg.contract,
+                    data,
+                    value: 0n
+                });
+                gasLimit = (est * 120n) / 100n;
+            } catch (_) {
+                gasLimit = 65000n;
+            }
+        } else {
+            const intrinsic = await provider.estimateGas({
+                from: fromAddress,
+                to: toAddress,
+                value: ethers.parseUnits(amountStr, 18)
+            }).catch(() => 21000n);
+            gasLimit = (intrinsic * 105n) / 100n;
+        }
+
+        const unitGasPrice = hasEip1559 ? maxFeePerGas : gasPriceWei;
+        const totalWei = gasLimit * unitGasPrice;
+        const feeNative = ethers.formatEther(totalWei);
+
+        const nativeAsset = wmNativeAssetForChain(entry.chainId);
+        const usdPrice = await wmUsdPrice(nativeAsset);
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'evm',
+            gasLimit: gasLimit.toString(),
+            gasPrice: unitGasPrice.toString(),
+            feeNative,
+            feeAsset: nativeAsset,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: {
+                isERC20,
+                nativeAsset,
+                txType: hasEip1559 ? 2 : 0,
+                maxFeePerGas: maxFeePerGas ? maxFeePerGas.toString() : null,
+                maxPriorityFeePerGas: maxPriorityFeePerGas
+                    ? maxPriorityFeePerGas.toString()
+                    : null,
+                baseFee: baseFeeUsed ? baseFeeUsed.toString() : null
+            }
+        };
+    }
+
+    /* ======================================================================
+     * UTXO — live sat/vB from Blockchair
+     * ==================================================================== */
+    if (chainType === 'utxo') {
+        const lower = assetUpper.toLowerCase();
+        const base = {
+            btc: 'https://api.blockchair.com/bitcoin',
+            doge: 'https://api.blockchair.com/dogecoin',
+            ltc: 'https://api.blockchair.com/litecoin'
+        }[lower];
+        if (!base) throw new Error(`Unsupported UTXO asset: ${assetUpper}`);
+
+        let satPerVb = null;
+        try {
+            const stats = await axios.get(`${base}/stats`, { timeout: WM_RPC_TIMEOUT_MS });
+            satPerVb = stats.data?.data?.suggested_transaction_fee_per_byte_sat || null;
+        } catch (_) { /* fall through */ }
+        if (!satPerVb) satPerVb = lower === 'btc' ? 20 : 1000;
+
+        const estimatedSizeVb = 250;
+        const feeSats = satPerVb * estimatedSizeVb;
+        const feeNative = (feeSats / 1e8).toFixed(8);
+
+        const usdPrice = await wmUsdPrice(assetUpper);
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'utxo',
+            gasLimit: null,
+            gasPrice: satPerVb.toString(),
+            feeNative,
+            feeAsset: assetUpper,
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: { satPerVb, estimatedSizeVb }
+        };
+    }
+
+    /* ======================================================================
+     * Solana — live prioritization fee
+     * ==================================================================== */
+    if (chainType === 'solana') {
+        const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+
+        let priorityMicroLamports = 0;
+        try {
+            const fees = await connection.getRecentPrioritizationFees();
+            if (Array.isArray(fees) && fees.length > 0) {
+                const sorted = fees.map(f => f.prioritizationFee).sort((a, b) => a - b);
+                priorityMicroLamports = sorted[Math.floor(sorted.length * 0.75)] || 0;
+            }
+        } catch (_) { /* ignore */ }
+
+        const signatureFeeLamports = 5000;
+        const computeUnits = 200000n;
+        const priorityLamports =
+            (BigInt(priorityMicroLamports) * computeUnits) / 1000000n;
+        const totalLamports = BigInt(signatureFeeLamports) + priorityLamports;
+
+        const feeNative = (Number(totalLamports) / 1e9).toFixed(9);
+        const usdPrice = await wmUsdPrice('SOL');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'solana',
+            gasLimit: computeUnits.toString(),
+            gasPrice: priorityMicroLamports.toString(),
+            feeNative,
+            feeAsset: 'SOL',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            meta: { signatureFeeLamports, priorityMicroLamports }
+        };
+    }
+
+    /* ======================================================================
+     * XRP — live server fee
+     * ==================================================================== */
+    if (chainType === 'xrp') {
+        let drops = 12;
+        try {
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const resp = await client.request({ command: 'fee' });
+                const openLedgerFee = resp?.result?.drops?.open_ledger_fee;
+                if (openLedgerFee) drops = Number(openLedgerFee);
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        } catch (_) { /* default */ }
+
+        const feeNative = (drops / 1e6).toFixed(6);
+        const usdPrice = await wmUsdPrice('XRP');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'xrp',
+            gasLimit: null,
+            gasPrice: drops.toString(),
+            feeNative,
+            feeAsset: 'XRP',
+            feeUsd: Number(feeUsd.toFixed(6)),
+            meta: { drops }
+        };
+    }
+
+    /* ======================================================================
+     * TRON — live chain parameters
+     * ==================================================================== */
+    if (chainType === 'tron') {
+        const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+
+        let energyFeeSun = 420;
+        let bandwidthFeeSun = 1000;
+        try {
+            const params = await tronWeb.trx.getChainParameters();
+            const byKey = Object.fromEntries(params.map(p => [p.key, p.value]));
+            if (byKey.getEnergyFee) energyFeeSun = Number(byKey.getEnergyFee);
+            if (byKey.getTransactionFee) bandwidthFeeSun = Number(byKey.getTransactionFee);
+        } catch (_) { /* ignore */ }
+
+        const isTRC20 = assetUpper !== 'TRX';
+        const bandwidthBytes = isTRC20 ? 350 : 265;
+        const energyUnits = isTRC20 ? 14000 : 0;
+
+        const feeSun =
+            (bandwidthBytes * bandwidthFeeSun) + (energyUnits * energyFeeSun);
+        const feeNative = (feeSun / 1e6).toFixed(6);
+
+        const usdPrice = await wmUsdPrice('TRX');
+        const feeUsd = Number(feeNative) * (usdPrice || 0);
+
+        return {
+            chainType: 'tron',
+            gasLimit: energyUnits.toString(),
+            gasPrice: energyFeeSun.toString(),
+            feeNative,
+            feeAsset: 'TRX',
+            feeUsd: Number(feeUsd.toFixed(4)),
+            meta: { bandwidthBytes, energyUnits, bandwidthFeeSun, energyFeeSun }
+        };
+    }
+
+    /* ======================================================================
+     * Exotic chains — conservative flat fees
+     * ==================================================================== */
+    const fallbackFees = {
+        DOT:  { fee: '0.0150', asset: 'DOT'  },
+        ADA:  { fee: '0.1700', asset: 'ADA'  },
+        NEAR: { fee: '0.0001', asset: 'NEAR' },
+        APT:  { fee: '0.0010', asset: 'APT'  }
+    };
+    const fb = fallbackFees[assetUpper] || { fee: '0.0010', asset: assetUpper };
+
+    const usdPrice = await wmUsdPrice(fb.asset);
+    const feeUsd = Number(fb.fee) * (usdPrice || 0);
+
+    return {
+        chainType,
+        gasLimit: null,
+        gasPrice: null,
+        feeNative: fb.fee,
+        feeAsset: fb.asset,
+        feeUsd: Number(feeUsd.toFixed(6)),
+        meta: { fallback: true }
+    };
+}
+
+/* ============================================================================
+ * END SHARED HELPERS
+ * ========================================================================== */
 
 
-
-/* ---------------------------------------------------------------------------
- * POST /transactions/prepare
- * ------------------------------------------------------------------------- */
+/* ============================================================================
+ * POST /api/admin/wallet-management/transactions/prepare
+ * ----------------------------------------------------------------------------
+ * Builds a transaction preview with live fee estimation.
+ * The critical fix: no more swallowing RPC errors as "zero balance".
+ * ========================================================================== */
 walletManagementRouter.post('/transactions/prepare', async (req, res) => {
     try {
         const {
@@ -48473,14 +49054,15 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
         const rpcUrl = RPC_PROVIDERS[entry.network];
 
         /* ----------------------------------------------------------------
-         * LIVE BALANCE
+         * LIVE BALANCE — no more silent zero on error.
          * ---------------------------------------------------------------- */
-        let liveBalance = { ok: false, spendableBalance: '0', confirmedBalance: '0', unconfirmedBalance: '0', error: 'RPC unavailable' };
-
+        let liveBalance;
         try {
             if (entry.type === 'evm' && rpcUrl) {
                 const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
-                const tokenCfg = platformWallet.erc20TokenConfig && platformWallet.erc20TokenConfig[assetUpper];
+                await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+                const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
 
                 if (tokenCfg && tokenCfg.contract) {
                     const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, provider);
@@ -48495,32 +49077,36 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
             } else if (entry.type === 'solana' && RPC_PROVIDERS.SOLANA) {
                 const connection = new Connection(RPC_PROVIDERS.SOLANA);
                 const lamports = await connection.getBalance(new PublicKey(wallet.address));
-                const formatted = ethers.formatUnits(lamports, 9);
+                const formatted = (Number(lamports) / 1e9).toFixed(9);
                 liveBalance = { ok: true, spendableBalance: formatted, confirmedBalance: formatted, unconfirmedBalance: '0', error: null };
             } else {
                 const generic = await wmFetchOnChainBalance(assetUpper, wallet.address);
                 if (generic && generic.ok) {
                     liveBalance = generic;
                 } else {
-                    liveBalance = { ok: true, spendableBalance: '0', confirmedBalance: '0', unconfirmedBalance: '0', error: null };
+                    throw new Error(generic?.error || 'On-chain balance unavailable for this chain type');
                 }
             }
         } catch (balErr) {
-            console.warn('Balance fetch warning:', balErr.message);
-            liveBalance = { ok: true, spendableBalance: '0', confirmedBalance: '0', unconfirmedBalance: '0', error: null };
+            console.warn('[prepare] live balance fetch failed:', balErr.message);
+            return res.status(502).json({
+                status: 'fail',
+                message: `Unable to read live on-chain balance for ${assetUpper}: ${balErr.message}`,
+                chainId: entry.chainId,
+                network: entry.network
+            });
         }
 
         const spendableNum = Number(liveBalance.spendableBalance) || 0;
         if (liveBalance.ok && spendableNum <= 0) {
             return res.status(400).json({
                 status: 'fail',
-                message: 'Source wallet has no spendable balance.'
+                message: `Source wallet has no spendable ${assetUpper}.`
             });
         }
 
         /* ----------------------------------------------------------------
-         * FEE ESTIMATION — the shared helper already returns
-         * realistic gas limits and EIP-1559 fees per chain.
+         * FEE ESTIMATION — live per-chain fees.
          * ---------------------------------------------------------------- */
         let feeEstimate;
         try {
@@ -48534,12 +49120,10 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
             });
         } catch (feeErr) {
             const isProgrammingError = feeErr instanceof ReferenceError || feeErr instanceof TypeError;
-            return res
-                .status(isProgrammingError ? 500 : 400)
-                .json({
-                    status: 'fail',
-                    message: `Fee estimation failed: ${feeErr.message || 'unknown error'}`
-                });
+            return res.status(isProgrammingError ? 500 : 400).json({
+                status: 'fail',
+                message: `Fee estimation failed: ${feeErr.message || 'unknown error'}`
+            });
         }
 
         const feeNum = Number(feeEstimate.feeNative) || 0;
@@ -48602,8 +49186,7 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
                         `requested: ${amount}.`
                 });
             }
-            // Native gas check for ERC-20
-            const nativeAsset = (feeEstimate.meta && feeEstimate.meta.nativeAsset) || 'ETH';
+            const nativeAsset = (feeEstimate.meta && feeEstimate.meta.nativeAsset) || wmNativeAssetForChain(entry.chainId);
             try {
                 const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
                 const nativeBalanceWei = await provider.getBalance(wallet.address);
@@ -48700,6 +49283,7 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
             data: {
                 operationId,
                 approvalRequired: true,
+                skipSignStep: entry.type === 'utxo',
                 preview: operation.preview,
                 feeEstimate: operation.feeEstimate
             }
@@ -48713,9 +49297,10 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
     }
 });
 
-/* ---------------------------------------------------------------------------
- * POST /transactions/:operationId/approve
- * ------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/approve
+ * ========================================================================== */
 walletManagementRouter.post('/transactions/:operationId/approve', async (req, res) => {
     try {
         const { operationId } = req.params;
@@ -48748,12 +49333,13 @@ walletManagementRouter.post('/transactions/:operationId/approve', async (req, re
     }
 });
 
-/* ---------------------------------------------------------------------------
- * POST /transactions/:operationId/sign
- *
+
+/* ============================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/sign
+ * ----------------------------------------------------------------------------
  * Re-estimates the fee at signing time (fresh base fee), re-checks solvency,
  * deducts gas from native value, and validates the serialized envelope.
- * ------------------------------------------------------------------------- */
+ * ========================================================================== */
 walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) => {
     try {
         const { operationId } = req.params;
@@ -48784,7 +49370,7 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
 
         /* ------------------------------------------------------------------
          * EVM
-         * ------------------------------------------------------------------ */
+         * ---------------------------------------------------------------- */
         if (entry.type === 'evm') {
             const rpcUrl = RPC_PROVIDERS[entry.network];
             if (!rpcUrl) throw new Error(`No RPC configured for ${entry.network}`);
@@ -48797,12 +49383,11 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                 return res.status(400).json({ status: 'fail', message: 'Derivation mismatch for EVM address' });
             }
 
-            await wmAssertChainId(signer, entry.chainId, assetUpper);
+            await wmAssertChainId(signer.provider, entry.chainId, assetUpper);
 
-            const tokenCfg = platformWallet.erc20TokenConfig && platformWallet.erc20TokenConfig[assetUpper];
+            const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
             const isERC20 = !!(tokenCfg && tokenCfg.contract);
 
-            /* -------- FRESH EIP-1559 FEES -------- */
             const feeData = await signer.provider.getFeeData();
 
             let currentBaseFee = feeData.maxFeePerGas || feeData.gasPrice;
@@ -48811,13 +49396,12 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                 if (latestBlock && latestBlock.baseFeePerGas) {
                     currentBaseFee = latestBlock.baseFeePerGas;
                 }
-            } catch (_) { /* fall back to feeData */ }
+            } catch (_) { /* fall back */ }
 
             const priorityFee = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
             const maxFeePerGas = (currentBaseFee * 2n) + priorityFee;
             const maxPriorityFeePerGas = priorityFee > maxFeePerGas ? maxFeePerGas : priorityFee;
 
-            /* -------- GAS LIMIT -------- */
             let gasLimit;
             if (isERC20) {
                 try {
@@ -48840,11 +49424,9 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                 gasLimit = 21000n;
             }
 
-            /* -------- SOLVENCY + VALUE -------- */
             let valueWei;
 
             if (isERC20) {
-                // Token balance check
                 const contract = new ethers.Contract(tokenCfg.contract, WM_ERC20_ABI, signer.provider);
                 const raw = await contract.balanceOf(operation.sourceAddress);
                 const available = Number(ethers.formatUnits(raw, tokenCfg.decimals));
@@ -48858,22 +49440,21 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                     });
                 }
 
-                // Native gas check
+                const nativeAsset = wmNativeAssetForChain(entry.chainId);
                 const nativeBalanceWei = await signer.provider.getBalance(operation.sourceAddress);
                 const requiredFeeWei = gasLimit * maxFeePerGas;
                 if (nativeBalanceWei < requiredFeeWei) {
                     return res.status(400).json({
                         status: 'fail',
                         message:
-                            `Insufficient native balance for gas. ` +
-                            `Required: ~${ethers.formatEther(requiredFeeWei)}, ` +
-                            `available: ${ethers.formatEther(nativeBalanceWei)}.`
+                            `Insufficient ${nativeAsset} for gas. ` +
+                            `Required: ~${ethers.formatEther(requiredFeeWei)} ${nativeAsset}, ` +
+                            `available: ${ethers.formatEther(nativeBalanceWei)} ${nativeAsset}.`
                     });
                 }
 
                 valueWei = 0n;
             } else {
-                // Native transfer: value = amount - gasFee
                 const requestedWei = ethers.parseUnits(String(operation.amount), 18);
                 const balanceWei = await signer.provider.getBalance(operation.sourceAddress);
                 const totalFeeWei = gasLimit * maxFeePerGas;
@@ -48899,7 +49480,6 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                 valueWei = requestedWei - totalFeeWei;
             }
 
-            /* -------- BUILD + SIGN -------- */
             const txRequest = {
                 chainId: entry.chainId,
                 to: isERC20 ? tokenCfg.contract : operation.destinationAddress,
@@ -48955,7 +49535,6 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
             const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
             const lamports = Math.round(Number(operation.amount) * 1e9);
 
-            // Pre-flight solvency for SOL: balance >= amount + fee
             const currentBalance = await connection.getBalance(keypair.publicKey);
             const feeLamports = 5000;
             if (currentBalance < (lamports + feeLamports)) {
@@ -49104,9 +49683,10 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
     }
 });
 
-/* ---------------------------------------------------------------------------
- * POST /transactions/:operationId/broadcast
- * ------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * POST /api/admin/wallet-management/transactions/:operationId/broadcast
+ * ========================================================================== */
 walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, res) => {
     try {
         const { operationId } = req.params;
@@ -49114,7 +49694,13 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
         if (!operation) {
             return res.status(404).json({ status: 'fail', message: 'Operation not found or expired' });
         }
-        if (operation.status !== 'signed') {
+
+        // UTXO broadcasts from 'approved' (skipping sign) or 'signed'.
+        const canBroadcast =
+            operation.status === 'signed' ||
+            (operation.status === 'approved' && operation.chainType === 'utxo');
+
+        if (!canBroadcast) {
             return res.status(409).json({
                 status: 'fail',
                 message: `Cannot broadcast operation in status "${operation.status}". Sign it first.`
@@ -49140,12 +49726,7 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
             if (!rpcUrl) throw new Error(`No RPC configured for ${entry.network}`);
             const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
 
-            const net = await provider.getNetwork();
-            if (Number(net.chainId) !== Number(entry.chainId)) {
-                throw new Error(
-                    `Chain ID mismatch for ${assetUpper}: RPC reports ${net.chainId}, expected ${entry.chainId}`
-                );
-            }
+            await wmAssertChainId(provider, entry.chainId, assetUpper);
 
             const txResponse = await provider.broadcastTransaction(operation.signedPayload);
             broadcastHash = txResponse.hash;
@@ -49274,7 +49855,7 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
                 blockchainStatus: { status: 'pending' },
                 preparedBy: operation.createdBy,
                 approvedBy: operation.approvedBy || null,
-                signedAt: operation.signedAt,
+                signedAt: operation.signedAt || null,
                 broadcastedAt: new Date().toISOString(),
                 explorerUrl,
                 broadcastMeta,
@@ -49358,9 +49939,10 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
     }
 });
 
-/* ---------------------------------------------------------------------------
- * GET /transactions
- * ------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * GET /api/admin/wallet-management/transactions
+ * ========================================================================== */
 walletManagementRouter.get('/transactions', async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -49520,9 +50102,10 @@ walletManagementRouter.get('/transactions', async (req, res) => {
     }
 });
 
-/* ---------------------------------------------------------------------------
- * GET /alerts
- * ------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * GET /api/admin/wallet-management/alerts
+ * ========================================================================== */
 walletManagementRouter.get('/alerts', async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -49604,9 +50187,10 @@ walletManagementRouter.get('/alerts', async (req, res) => {
     }
 });
 
-/* ---------------------------------------------------------------------------
- * GET /reports
- * ------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * GET /api/admin/wallet-management/reports
+ * ========================================================================== */
 walletManagementRouter.get('/reports', async (req, res) => {
     try {
         const type = (req.query.type || 'wallet').toLowerCase();
@@ -49891,8 +50475,6 @@ walletManagementRouter.get('/reports', async (req, res) => {
         });
     }
 });
-
-
 
 
 
