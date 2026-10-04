@@ -47263,7 +47263,1097 @@ console.log('   - GET  /wallets/:walletId/state');
 
 
 
+/* ============================================================================
+ * WALLET MANAGEMENT — TREASURY / SWEEP / ASSETS / FEES
+ * ----------------------------------------------------------------------------
+ * Continues the /api/admin/wallet-management router.
+ * All endpoints are adminProtect + restrictTo('super','finance').
+ *
+ * Rules enforced here:
+ *   - Treasury addresses are DERIVED, never stored in Mongo.
+ *   - Treasury is gated by platformWallet.isTreasuryReady() which is
+ *     driven by TREASURY_SEED_ENABLED and TREASURY_MASTER_SEED.
+ *   - Live balances come on-chain via the shared wmFetchOnChainBalance().
+ *   - Asset metadata (logos) come from getCryptoLogo() + ASSET_NETWORK_MAP.
+ *   - Fee estimates use the imported chain libraries with hard timeouts.
+ *   - Sweep endpoints are async orchestrators that prepare+approve+sign+
+ *     broadcast each address, but the actual prepare/approve/sign/broadcast
+ *     primitives live in the transactions batch (next file). Here we call
+ *     them through an in-process helper defined at the bottom of this block.
+ * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * Short-lived in-process operation store for the fee/prepare flow.
+ * In production this should be Redis. We use Redis if available, else a
+ * Map so the endpoints still function in dev.
+ * ------------------------------------------------------------------------ */
+const WM_OPERATION_TTL_SECONDS = 600; // 10 minutes
+
+async function wmStoreOperation(operationId, payload) {
+    const serialized = JSON.stringify(payload);
+    try {
+        if (redis && typeof redis.setex === 'function') {
+            await redis.setex(`wm:op:${operationId}`, WM_OPERATION_TTL_SECONDS, serialized);
+            return;
+        }
+    } catch (e) {
+        console.warn('[wm] Redis op store failed, falling back to memory:', e.message);
+    }
+    wmMemoryOperationStore.set(operationId, {
+        payload,
+        expiresAt: Date.now() + WM_OPERATION_TTL_SECONDS * 1000
+    });
+}
+const wmMemoryOperationStore = new Map();
+
+async function wmLoadOperation(operationId) {
+    try {
+        if (redis && typeof redis.get === 'function') {
+            const raw = await redis.get(`wm:op:${operationId}`);
+            if (raw) return JSON.parse(raw);
+        }
+    } catch (e) {
+        // fall through to memory
+    }
+    const entry = wmMemoryOperationStore.get(operationId);
+    if (!entry) return null;
+    if (entry.expiresAt < Date.now()) {
+        wmMemoryOperationStore.delete(operationId);
+        return null;
+    }
+    return entry.payload;
+}
+
+async function wmUpdateOperation(operationId, patch) {
+    const existing = await wmLoadOperation(operationId);
+    if (!existing) return null;
+    const merged = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+    await wmStoreOperation(operationId, merged);
+    return merged;
+}
+
+/* --------------------------------------------------------------------------
+ * Sanity check: is treasury configured?
+ * ------------------------------------------------------------------------ */
+function wmTreasuryReady() {
+    try {
+        return !!(platformWallet && typeof platformWallet.isTreasuryReady === 'function'
+                  && platformWallet.isTreasuryReady());
+    } catch (_) {
+        return false;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Asset metadata builder — used by /assets and /assets/metadata.
+ * Single source of truth: ASSET_NETWORK_MAP + platformWallet token config +
+ * getCryptoLogo(asset).
+ * ------------------------------------------------------------------------ */
+function wmBuildAssetMetadata() {
+    const registry = {};
+    for (const assetUpper of Object.keys(ASSET_NETWORK_MAP)) {
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const tokenCfg = wmTokenConfig(assetUpper);
+
+        registry[assetUpper] = {
+            symbol: assetUpper,
+            name: entry.name || assetUpper,
+            network: entry.network,
+            chainId: entry.chainId,
+            type: entry.type,
+            decimals: tokenCfg ? (tokenCfg.decimals ?? 18)
+                     : (platformWallet.networkProviders[assetUpper] &&
+                        platformWallet.networkProviders[assetUpper].decimals) || 18,
+            contract: tokenCfg ? tokenCfg.contract : (entry.contract || null),
+            isERC20: !!(tokenCfg && tokenCfg.contract),
+            logoUrl: getCryptoLogo(assetUpper),
+            requiredConfirmations: REQUIRED_CONFIRMATIONS[entry.network] ||
+                                   REQUIRED_CONFIRMATIONS[assetUpper] || 12,
+            supportsOutgoing: true
+        };
+    }
+    return registry;
+}
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/assets
+ * Flat list form (used by the treasury-transfer modal dropdowns).
+ * Query: ?network=ETH
+ * ========================================================================== */
+walletManagementRouter.get('/assets', async (req, res) => {
+    try {
+        const networkFilter = req.query.network && req.query.network !== 'all'
+            ? req.query.network
+            : null;
+
+        const registry = wmBuildAssetMetadata();
+
+        const list = Object.values(registry)
+            .filter(a => !networkFilter || a.network === networkFilter)
+            .filter(a => a.supportsOutgoing)
+            .sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                assets: list,
+                total: list.length
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/assets] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load assets'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/assets/metadata
+ * Keyed registry form. This is the ONLY place the admin UI may learn
+ * about asset logos. No logo may be hardcoded in the HTML.
+ * ========================================================================== */
+walletManagementRouter.get('/assets/metadata', async (req, res) => {
+    try {
+        const registry = wmBuildAssetMetadata();
+
+        // Optional short-lived cache to avoid re-deriving on every poll.
+        try {
+            if (redis && typeof redis.setex === 'function') {
+                await redis.setex(
+                    'wm:assets:metadata',
+                    24 * 60 * 60,
+                    JSON.stringify(registry)
+                );
+            }
+        } catch (_) { /* cache is best-effort */ }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                assets: registry,
+                generatedAt: new Date().toISOString()
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/assets/metadata] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load asset metadata'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/treasury
+ * Lists derived treasury wallets with live on-chain balances.
+ * Query: page, limit, network, asset, status
+ * ========================================================================== */
+walletManagementRouter.get('/treasury', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const skip = (page - 1) * limit;
+        const networkFilter = req.query.network && req.query.network !== 'all'
+            ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all'
+            ? req.query.asset.toUpperCase() : null;
+        const statusFilter = req.query.status && req.query.status !== 'all'
+            ? req.query.status : null;
+
+        const treasuryReady = wmTreasuryReady();
+
+        // Build the candidate asset list.
+        let assetsToCheck = Object.keys(ASSET_NETWORK_MAP);
+        if (assetFilter) assetsToCheck = [assetFilter];
+        assetsToCheck = assetsToCheck.filter(a => !!ASSET_NETWORK_MAP[a]);
+        if (networkFilter) {
+            assetsToCheck = assetsToCheck.filter(
+                a => ASSET_NETWORK_MAP[a].network === networkFilter
+            );
+        }
+
+        const rows = [];
+        for (const assetUpper of assetsToCheck) {
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+            let address = null;
+            let derivationPath = null;
+            let status = 'missing';
+            let hasAddress = false;
+            let balanceState = { spendableBalance: '0', confirmedBalance: '0',
+                                 unconfirmedBalance: '0', ok: false };
+            let usdValue = 0;
+            let activity = { lastActivityAt: null };
+
+            if (treasuryReady) {
+                try {
+                    const derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                    if (derived && derived.address) {
+                        address = derived.address;
+                        derivationPath = derived.derivationPath || null;
+                        hasAddress = true;
+                        status = 'ready';
+                    }
+                } catch (e) {
+                    status = 'missing';
+                }
+            }
+
+            if (hasAddress) {
+                balanceState = await wmFetchOnChainBalance(assetUpper, address);
+                const price = await wmUsdPrice(assetUpper);
+                usdValue = wmToNumber(balanceState.spendableBalance) * price;
+                activity = await wmFetchLastActivity(assetUpper, address);
+            }
+
+            // Apply status filter post-derivation
+            if (statusFilter && status !== statusFilter) continue;
+
+            rows.push({
+                _id: `treasury:${assetUpper}:0`,
+                asset: assetUpper,
+                network: entry.network,
+                chainId: entry.chainId,
+                address,
+                derivationPath,
+                status,
+                hasAddress,
+                balanceError: balanceState.ok ? null : balanceState.error || null,
+                spendableBalance: balanceState.spendableBalance,
+                confirmedBalance: balanceState.confirmedBalance,
+                unconfirmedBalance: balanceState.unconfirmedBalance,
+                usdValue: Number(usdValue.toFixed(2)),
+                lastActivityAt: activity.lastActivityAt
+            });
+        }
+
+        const totalItems = rows.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+        const paged = rows.slice(skip, skip + limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                treasuryReady,
+                wallets: paged,
+                totalPages,
+                totalItems,
+                currentPage: page
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/treasury] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load treasury wallets'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/treasury/address?asset=USDT&network=ETH
+ * Returns a single treasury destination address, used by the sweep modal.
+ * ========================================================================== */
+walletManagementRouter.get('/treasury/address', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable treasury operations.'
+            });
+        }
+
+        const assetUpper = (req.query.asset || '').toUpperCase();
+        const networkFilter = req.query.network || null;
+
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A valid asset query parameter is required (e.g. asset=USDT)'
+            });
+        }
+
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        if (networkFilter && entry.network !== networkFilter) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Asset ${assetUpper} does not live on network ${networkFilter}`
+            });
+        }
+
+        let derived;
+        try {
+            derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+        } catch (e) {
+            derived = null;
+        }
+
+        if (!derived || !derived.address) {
+            return res.status(404).json({
+                status: 'fail',
+                message: `No treasury address has been generated for ${assetUpper}. Generate one first.`
+            });
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                treasuryAddress: derived.address,
+                asset: assetUpper,
+                network: entry.network,
+                derivationPath: derived.derivationPath || null
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/treasury/address] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to resolve treasury address'
+        });
+    }
+});
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/treasury/generate
+ * Derives missing treasury addresses for the requested assets.
+ * Body: { assets: ["BTC","ETH","USDT"] }
+ * ========================================================================== */
+walletManagementRouter.post('/treasury/generate', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable treasury operations.'
+            });
+        }
+
+        const requested = Array.isArray(req.body.assets) ? req.body.assets : [];
+        if (requested.length === 0) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Provide a non-empty assets array'
+            });
+        }
+
+        const generated = [];
+        const errors = [];
+
+        for (const raw of requested) {
+            const assetUpper = String(raw).toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) {
+                errors.push({ asset: assetUpper, error: 'Unsupported asset' });
+                continue;
+            }
+            try {
+                const derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                if (derived && derived.address) {
+                    generated.push({
+                        asset: assetUpper,
+                        network: ASSET_NETWORK_MAP[assetUpper].network,
+                        address: derived.address,
+                        derivationPath: derived.derivationPath || null
+                    });
+                } else {
+                    errors.push({ asset: assetUpper, error: 'Derivation returned no address' });
+                }
+            } catch (e) {
+                errors.push({ asset: assetUpper, error: e.message || 'Derivation failed' });
+            }
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                generated,
+                errors
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/treasury/generate] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to generate treasury addresses'
+        });
+    }
+});
+
+/* ==========================================================================
+ * GET /api/admin/wallet-management/sweep/addresses
+ * Lists user deposit addresses that currently hold a spendable balance,
+ * paired with the treasury destination for that asset.
+ * Query: page, limit, network, asset, minBalance
+ * ========================================================================== */
+walletManagementRouter.get('/sweep/addresses', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const networkFilter = req.query.network && req.query.network !== 'all'
+            ? req.query.network : null;
+        const assetFilter = req.query.asset && req.query.asset !== 'all'
+            ? req.query.asset.toUpperCase() : null;
+        const minBalance = req.query.minBalance !== undefined
+            ? Number(req.query.minBalance) || 0 : 0;
+
+        const treasuryReady = wmTreasuryReady();
+
+        // Load active user deposit addresses only.
+        const addresses = await DepositAddress.find({ isActive: true })
+            .populate('userId', 'firstName lastName email')
+            .lean();
+
+        // Cache treasury destinations per asset so we don't re-derive per row.
+        const treasuryByAsset = {};
+
+        const rows = [];
+
+        for (const addr of addresses) {
+            const assetUpper = (addr.asset || '').toUpperCase();
+            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+            const entry = ASSET_NETWORK_MAP[assetUpper];
+
+            if (networkFilter && entry.network !== networkFilter) continue;
+            if (assetFilter && assetUpper !== assetFilter) continue;
+
+            // Get treasury destination (memoized).
+            let treasuryAddress = null;
+            if (treasuryReady) {
+                if (treasuryByAsset[assetUpper] === undefined) {
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        treasuryByAsset[assetUpper] = d && d.address ? d.address : null;
+                    } catch (_) {
+                        treasuryByAsset[assetUpper] = null;
+                    }
+                }
+                treasuryAddress = treasuryByAsset[assetUpper];
+            }
+
+            // Live on-chain balance.
+            const balanceState = await wmFetchOnChainBalance(assetUpper, addr.address);
+            const spendable = wmToNumber(balanceState.spendableBalance);
+
+            if (!balanceState.ok) continue;
+            if (spendable <= 0) continue;
+            if (minBalance > 0 && spendable < minBalance) continue;
+
+            const price = await wmUsdPrice(assetUpper);
+            const usdValue = spendable * price;
+
+            const u = addr.userId || {};
+            const userName = `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown';
+            const userEmail = u.email || '';
+
+            rows.push({
+                walletId: addr._id.toString(),
+                userId: u._id ? u._id.toString() : (addr.userId ? addr.userId.toString() : null),
+                asset: assetUpper,
+                network: entry.network,
+                address: addr.address,
+                liveBalance: spendable.toFixed(8),
+                usdValue: Number(usdValue.toFixed(2)),
+                userName,
+                userEmail,
+                treasuryAddress,
+                treasuryReady: !!treasuryAddress,
+                status: treasuryAddress ? 'ready' : 'blocked'
+            });
+        }
+
+        // Sort by USD value desc — most valuable sweep targets first.
+        rows.sort((a, b) => b.usdValue - a.usdValue);
+
+        const totalItems = rows.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+        const skip = (page - 1) * limit;
+        const paged = rows.slice(skip, skip + limit);
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                treasuryReady,
+                addresses: paged,
+                totalPages,
+                totalItems,
+                currentPage: page
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/addresses] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load sweepable addresses'
+        });
+    }
+});
+
+/* --------------------------------------------------------------------------
+ * Shared sweep executor.
+ *
+ * Given a wallet record (DepositAddress doc, lean) and a treasury destination,
+ * run the full prepare → approve → sign → broadcast pipeline for that one
+ * address. Returns { ok, txHash, error }.
+ *
+ * NOTE: The actual prepare/approve/sign/broadcast primitives live in the
+ * /transactions/* endpoints (next batch). To keep this file self-contained
+ * while those are still being wired, we define a small internal orchestrator
+ * here that calls the same underlying helpers. When the /transactions/*
+ * endpoints land, this function can be refactored to delegate to them.
+ * ------------------------------------------------------------------------ */
+async function wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, adminId }) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return { ok: false, error: `Unsupported asset: ${assetUpper}` };
+
+    // Re-read live balance; never trust a stale preview.
+    const live = await wmFetchOnChainBalance(assetUpper, wallet.address);
+    if (!live.ok) return { ok: false, error: live.error || 'Live balance unavailable' };
+
+    const balanceNum = wmToNumber(live.spendableBalance);
+    if (balanceNum <= 0) return { ok: false, error: 'Nothing to sweep' };
+
+    // Prepare the operation record. The signing/broadcast primitives will
+    // consume this record when the /transactions/* batch is installed.
+    const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+
+    const operation = {
+        operationId,
+        operationType: 'sweep',
+        walletId: wallet._id.toString(),
+        sourceAddress: wallet.address,
+        networkId: entry.network,
+        chainId: entry.chainId,
+        asset: assetUpper,
+        amount: live.spendableBalance,
+        destinationAddress: treasuryAddress,
+        createdBy: adminId ? adminId.toString() : null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        status: 'prepared',
+        approvalRequired: true
+    };
+
+    await wmStoreOperation(operationId, operation);
+
+    // The /transactions/:id/approve|sign|broadcast endpoints will move this
+    // record through the lifecycle. Here we mark it as queued for that flow.
+    await wmUpdateOperation(operationId, { status: 'queued_for_broadcast' });
+
+    return {
+        ok: true,
+        operationId,
+        queued: true,
+        asset: assetUpper,
+        source: wallet.address,
+        destination: treasuryAddress,
+        amount: live.spendableBalance
+    };
+}
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/sweep/all
+ * Body: { network, asset, minBalance }
+ * Returns 202 with a batchId immediately. Work runs in background.
+ * ========================================================================== */
+walletManagementRouter.post('/sweep/all', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable sweeps.'
+            });
+        }
+
+        const networkFilter = req.body.network && req.body.network !== 'all'
+            ? req.body.network : null;
+        const assetFilter = req.body.asset && req.body.asset !== 'all'
+            ? String(req.body.asset).toUpperCase() : null;
+        const minBalance = Number(req.body.minBalance) || 0;
+
+        const batchId = `batch_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        const io = req.app.get('io');
+        const adminId = req.admin && req.admin._id ? req.admin._id : null;
+
+        // Fire-and-forget background execution.
+        (async () => {
+            const results = { succeeded: [], failed: [] };
+            try {
+                const addresses = await DepositAddress.find({ isActive: true }).lean();
+
+                for (const wallet of addresses) {
+                    const assetUpper = (wallet.asset || '').toUpperCase();
+                    if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+                    const entry = ASSET_NETWORK_MAP[assetUpper];
+
+                    if (networkFilter && entry.network !== networkFilter) continue;
+                    if (assetFilter && assetUpper !== assetFilter) continue;
+
+                    let treasuryAddress;
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        treasuryAddress = d && d.address ? d.address : null;
+                    } catch (_) {
+                        treasuryAddress = null;
+                    }
+                    if (!treasuryAddress) {
+                        results.failed.push({ walletId: wallet._id.toString(),
+                                              error: 'No treasury address' });
+                        continue;
+                    }
+
+                    const live = await wmFetchOnChainBalance(assetUpper, wallet.address);
+                    if (!live.ok) {
+                        results.failed.push({ walletId: wallet._id.toString(),
+                                              error: live.error || 'Live balance unavailable' });
+                        continue;
+                    }
+                    const bal = wmToNumber(live.spendableBalance);
+                    if (bal <= 0) continue;
+                    if (minBalance > 0 && bal < minBalance) continue;
+
+                    const outcome = await wmExecuteSingleSweep({
+                        wallet,
+                        assetUpper,
+                        treasuryAddress,
+                        adminId
+                    });
+
+                    if (outcome.ok) {
+                        results.succeeded.push({
+                            walletId: wallet._id.toString(),
+                            operationId: outcome.operationId,
+                            asset: assetUpper,
+                            source: wallet.address,
+                            destination: treasuryAddress,
+                            amount: outcome.amount
+                        });
+                    } else {
+                        results.failed.push({
+                            walletId: wallet._id.toString(),
+                            asset: assetUpper,
+                            error: outcome.error
+                        });
+                    }
+
+                    if (io) {
+                        io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                            status: 'syncing',
+                            message: `Sweep batch ${batchId}: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                            lastSuccessfulSyncAt: new Date().toISOString()
+                        });
+                    }
+                }
+
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: results.failed.length > 0 ? 'degraded' : 'healthy',
+                        message: `Sweep batch ${batchId} complete: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            } catch (bgErr) {
+                console.error('[sweep/all] background error:', bgErr);
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'degraded',
+                        message: `Sweep batch ${batchId} failed: ${bgErr.message || 'unknown error'}`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            }
+        })();
+
+        return res.status(202).json({
+            status: 'success',
+            data: {
+                batchId,
+                message: 'Sweep-all batch accepted and running in background'
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/all] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to start sweep-all'
+        });
+    }
+});
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/sweep/selected
+ * Body: { walletIds: ["...", "..."] }
+ * Same as sweep/all but for a bounded list. 202 + background.
+ * ========================================================================== */
+walletManagementRouter.post('/sweep/selected', async (req, res) => {
+    try {
+        if (!wmTreasuryReady()) {
+            return res.status(503).json({
+                status: 'fail',
+                message: 'Treasury wallet is disabled. Set TREASURY_SEED_ENABLED=true to enable sweeps.'
+            });
+        }
+
+        const walletIds = Array.isArray(req.body.walletIds) ? req.body.walletIds : [];
+        if (walletIds.length === 0) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Provide a non-empty walletIds array'
+            });
+        }
+
+        const validIds = walletIds.filter(id => mongoose.Types.ObjectId.isValid(id));
+        if (validIds.length === 0) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'None of the supplied walletIds are valid'
+            });
+        }
+
+        const batchId = `batch_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        const io = req.app.get('io');
+        const adminId = req.admin && req.admin._id ? req.admin._id : null;
+
+        (async () => {
+            const results = { succeeded: [], failed: [] };
+            try {
+                const addresses = await DepositAddress.find({ _id: { $in: validIds } }).lean();
+
+                for (const wallet of addresses) {
+                    const assetUpper = (wallet.asset || '').toUpperCase();
+                    if (!ASSET_NETWORK_MAP[assetUpper]) {
+                        results.failed.push({ walletId: wallet._id.toString(),
+                                              error: 'Unsupported asset' });
+                        continue;
+                    }
+
+                    let treasuryAddress;
+                    try {
+                        const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                        treasuryAddress = d && d.address ? d.address : null;
+                    } catch (_) {
+                        treasuryAddress = null;
+                    }
+                    if (!treasuryAddress) {
+                        results.failed.push({ walletId: wallet._id.toString(),
+                                              error: 'No treasury address' });
+                        continue;
+                    }
+
+                    const outcome = await wmExecuteSingleSweep({
+                        wallet,
+                        assetUpper,
+                        treasuryAddress,
+                        adminId
+                    });
+
+                    if (outcome.ok) {
+                        results.succeeded.push({
+                            walletId: wallet._id.toString(),
+                            operationId: outcome.operationId,
+                            asset: assetUpper,
+                            source: wallet.address,
+                            destination: treasuryAddress,
+                            amount: outcome.amount
+                        });
+                    } else {
+                        results.failed.push({
+                            walletId: wallet._id.toString(),
+                            asset: assetUpper,
+                            error: outcome.error
+                        });
+                    }
+
+                    if (io) {
+                        io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                            status: 'syncing',
+                            message: `Selected sweep ${batchId}: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                            lastSuccessfulSyncAt: new Date().toISOString()
+                        });
+                    }
+                }
+
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: results.failed.length > 0 ? 'degraded' : 'healthy',
+                        message: `Selected sweep ${batchId} complete: ${results.succeeded.length} queued, ${results.failed.length} failed`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            } catch (bgErr) {
+                console.error('[sweep/selected] background error:', bgErr);
+                if (io) {
+                    io.to('admin_wallet_management').emit('wallet_management_sync_status', {
+                        status: 'degraded',
+                        message: `Selected sweep ${batchId} failed: ${bgErr.message || 'unknown error'}`,
+                        lastSuccessfulSyncAt: new Date().toISOString()
+                    });
+                }
+            }
+        })();
+
+        return res.status(202).json({
+            status: 'success',
+            data: {
+                batchId,
+                message: 'Selected sweep batch accepted and running in background'
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/sweep/selected] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to start selected sweep'
+        });
+    }
+});
+
+/* ==========================================================================
+ * POST /api/admin/wallet-management/fees/estimate
+ * Body: {
+ *   operationType: 'sweep' | 'transfer',
+ *   walletId, networkId, asset, amount, destinationAddress
+ * }
+ * Returns a fee preview without touching the operation store.
+ * ========================================================================== */
+walletManagementRouter.post('/fees/estimate', async (req, res) => {
+    try {
+        const {
+            operationType = 'transfer',
+            walletId,
+            networkId,
+            asset,
+            amount,
+            destinationAddress
+        } = req.body || {};
+
+        const assetUpper = (asset || '').toUpperCase();
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A valid asset is required'
+            });
+        }
+
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const effectiveNetwork = networkId || entry.network;
+        if (effectiveNetwork !== entry.network) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Asset ${assetUpper} does not live on network ${effectiveNetwork}`
+            });
+        }
+
+        const amountStr = String(amount || '0');
+        const amountNum = wmToNumber(amountStr);
+
+        const feeResult = {
+            gasFee: '0',
+            estimatedFee: '0',
+            feeAsset: assetUpper,
+            feeCurrency: assetUpper,
+            feeUsd: 0,
+            netAmount: amountStr,
+            netUsd: 0,
+            feeUnavailable: false,
+            error: null
+        };
+
+        const rpcUrl = RPC_PROVIDERS[effectiveNetwork];
+
+        try {
+            /* ---------------------------------------------------------- EVM */
+            if (entry.type === 'evm') {
+                if (!rpcUrl) throw new Error(`No RPC configured for ${effectiveNetwork}`);
+                const provider = new ethers.JsonRpcProvider(rpcUrl);
+
+                // Read source address if a walletId was provided.
+                let fromAddress = null;
+                if (walletId && mongoose.Types.ObjectId.isValid(walletId)) {
+                    const wallet = await DepositAddress.findById(walletId).lean();
+                    if (wallet) fromAddress = wallet.address;
+                }
+
+                const feeData = await Promise.race([
+                    provider.getFeeData(),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                ]);
+
+                // Gas limit — 21000 for native, estimateGas for tokens.
+                let gasLimit = 21000n;
+                const tokenCfg = wmTokenConfig(assetUpper);
+
+                if (tokenCfg && tokenCfg.contract && fromAddress && destinationAddress) {
+                    try {
+                        const erc20Abi = [
+                            'function transfer(address to, uint256 amount) returns (bool)',
+                            'function decimals() view returns (uint8)'
+                        ];
+                        const contract = new ethers.Contract(tokenCfg.contract, erc20Abi, provider);
+                        const decimals = tokenCfg.decimals ?? 18;
+                        const rawAmount = ethers.parseUnits(amountStr, decimals);
+                        const est = await Promise.race([
+                            contract.transfer.estimateGas(destinationAddress, rawAmount, { from: fromAddress }),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
+                        ]);
+                        gasLimit = est;
+                    } catch (_) {
+                        // Fallback: standard ERC-20 transfer size.
+                        gasLimit = 65000n;
+                    }
+                }
+
+                const gasPriceWei = feeData.maxFeePerGas || feeData.gasPrice || 0n;
+                const totalWei = gasLimit * gasPriceWei;
+                const feeEth = ethers.formatEther(totalWei);
+
+                // Fee is denominated in the network's native asset.
+                const nativeAsset = effectiveNetwork === 'BSC' ? 'BNB'
+                                  : effectiveNetwork === 'POLYGON' ? 'MATIC'
+                                  : effectiveNetwork === 'AVALANCHE' ? 'AVAX'
+                                  : 'ETH';
+
+                const nativeUsdPrice = await wmUsdPrice(nativeAsset);
+                const feeUsd = wmToNumber(feeEth) * nativeUsdPrice;
+
+                feeResult.gasFee = feeEth;
+                feeResult.estimatedFee = feeEth;
+                feeResult.feeAsset = nativeAsset;
+                feeResult.feeCurrency = nativeAsset;
+                feeResult.feeUsd = Number(feeUsd.toFixed(2));
+                feeResult.netAmount = amountStr;
+                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
+            }
+
+            /* --------------------------------------------------------- UTXO */
+            else if (entry.type === 'utxo') {
+                // Conservative static estimate: 250 vB at a per-byte rate.
+                const lower = assetUpper.toLowerCase();
+                const explorerBase = {
+                    btc: 'https://api.blockchair.com/bitcoin',
+                    doge: 'https://api.blockchair.com/dogecoin',
+                    ltc: 'https://api.blockchair.com/litecoin'
+                }[lower];
+
+                let feePerByte = null;
+                if (explorerBase) {
+                    try {
+                        const stats = await axios.get(
+                            `${explorerBase}/stats`,
+                            { timeout: WM_RPC_TIMEOUT_MS }
+                        );
+                        const s = stats.data && stats.data.data;
+                        if (s && s.suggested_transaction_fee_per_byte_sat) {
+                            feePerByte = Number(s.suggested_transaction_fee_per_byte_sat);
+                        }
+                    } catch (_) { /* fall through */ }
+                }
+                if (!feePerByte) feePerByte = lower === 'btc' ? 20 : 1000; // sats/vB
+
+                const estimatedSizeVb = 250;
+                const feeSats = feePerByte * estimatedSizeVb;
+                const feeCoin = feeSats / 1e8;
+
+                const usdPrice = await wmUsdPrice(assetUpper);
+                const feeUsd = feeCoin * usdPrice;
+
+                feeResult.gasFee = feeCoin.toFixed(8);
+                feeResult.estimatedFee = feeCoin.toFixed(8);
+                feeResult.feeAsset = assetUpper;
+                feeResult.feeCurrency = assetUpper;
+                feeResult.feeUsd = Number(feeUsd.toFixed(2));
+                feeResult.netAmount = Math.max(0, amountNum - feeCoin).toFixed(8);
+                feeResult.netUsd = Number((amountNum - feeCoin) * usdPrice).toFixed(2);
+            }
+
+            /* ------------------------------------------------------- Solana */
+            else if (entry.type === 'solana') {
+                // Solana base fee: 5000 lamports per signature.
+                const baseLamports = 5000n;
+                const feeSol = wmFormatUnits(baseLamports, 9);
+                const usdPrice = await wmUsdPrice('SOL');
+                const feeUsd = wmToNumber(feeSol) * usdPrice;
+
+                feeResult.gasFee = feeSol;
+                feeResult.estimatedFee = feeSol;
+                feeResult.feeAsset = 'SOL';
+                feeResult.feeCurrency = 'SOL';
+                feeResult.feeUsd = Number(feeUsd.toFixed(4));
+                feeResult.netAmount = amountStr;
+                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
+            }
+
+            /* --------------------------------------------------------- XRP */
+            else if (entry.type === 'xrp') {
+                const drops = 10n; // base network fee
+                const feeXrp = wmFormatUnits(drops, 6);
+                const usdPrice = await wmUsdPrice('XRP');
+                const feeUsd = wmToNumber(feeXrp) * usdPrice;
+
+                feeResult.gasFee = feeXrp;
+                feeResult.estimatedFee = feeXrp;
+                feeResult.feeAsset = 'XRP';
+                feeResult.feeCurrency = 'XRP';
+                feeResult.feeUsd = Number(feeUsd.toFixed(6));
+                feeResult.netAmount = amountStr;
+                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
+            }
+
+            /* -------------------------------------------------------- TRON */
+            else if (entry.type === 'tron') {
+                // TRON bandwidth/energy: use a conservative default in TRX.
+                const feeTrx = 1.0; // ~1 TRX for a TRC-20 transfer
+                const usdPrice = await wmUsdPrice('TRX');
+                const feeUsd = feeTrx * usdPrice;
+
+                feeResult.gasFee = feeTrx.toFixed(6);
+                feeResult.estimatedFee = feeTrx.toFixed(6);
+                feeResult.feeAsset = 'TRX';
+                feeResult.feeCurrency = 'TRX';
+                feeResult.feeUsd = Number(feeUsd.toFixed(4));
+                feeResult.netAmount = amountStr;
+                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
+            }
+
+            /* --------------------------------------------------- Unsupported */
+            else {
+                feeResult.feeUnavailable = true;
+                feeResult.error = `Fee estimation not implemented for chain type: ${entry.type}`;
+            }
+        } catch (feeErr) {
+            feeResult.feeUnavailable = true;
+            feeResult.error = feeErr.message || 'Fee estimation failed';
+        }
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                operationType,
+                walletId: walletId || null,
+                networkId: effectiveNetwork,
+                asset: assetUpper,
+                amount: amountStr,
+                destinationAddress: destinationAddress || null,
+                ...feeResult
+            }
+        });
+    } catch (err) {
+        console.error('[wallet-management/fees/estimate] Error:', err);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to estimate fee'
+        });
+    }
+});
+
+console.log('✅ Wallet Management — Treasury / Sweep / Assets / Fees endpoints mounted');
+console.log('   - GET  /treasury');
+console.log('   - GET  /treasury/address');
+console.log('   - POST /treasury/generate');
+console.log('   - GET  /sweep/addresses');
+console.log('   - POST /sweep/all');
+console.log('   - POST /sweep/selected');
+console.log('   - GET  /assets');
+console.log('   - GET  /assets/metadata');
+console.log('   - POST /fees/estimate');
 
 
 
