@@ -14647,20 +14647,35 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
-
-
 class PlatformWallet {
     constructor() {
+        // ── Customer-facing wallet (existing) ──────────────────────────────
         this.root = null;
+
+        // ── Treasury wallet (NEW) ──────────────────────────────────────────
+        this.treasuryRoot = null;
+
         this.initialized = false;
-        
+        this.treasuryInitialized = false;
+
         this.walletCache = new Map();
+        this.treasuryCache = new Map();
+
         this.maxCacheSize = 1000000;
+        this.maxTreasuryCacheSize = 1000000;
+
         this.cacheStats = { hits: 0, misses: 0, evictions: 0, sets: 0 };
+        this.treasuryCacheStats = { hits: 0, misses: 0, evictions: 0, sets: 0 };
+
         this.transactionHistory = [];
+        this.treasuryTransactionHistory = [];
+
         this.balanceSnapshot = {};
+        this.treasuryBalanceSnapshot = {};
+
         this.lastBalanceCheck = null;
-        
+        this.lastTreasuryBalanceCheck = null;
+
         this.erc20TokenConfig = {
             'USDT': {
                 contract: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
@@ -14722,7 +14737,7 @@ class PlatformWallet {
 
         this.networkProviders = {
             'BTC': { network: bitcoin.networks.bitcoin, type: 'utxo', coinType: 0, derivationIndex: 0 },
-            'DOGE': { 
+            'DOGE': {
                 messagePrefix: '\x19Dogecoin Signed Message:\n',
                 bech32: 'doge',
                 bip32: { public: 0x02facafd, private: 0x02fac398 },
@@ -14744,12 +14759,12 @@ class PlatformWallet {
                 coinType: 2,
                 derivationIndex: 2
             },
-            
+
             'ETH': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 0, isNative: true },
             'BNB': { type: 'evm', chainId: 56, coinType: 714, derivationIndex: 0, isNative: true },
             'MATIC': { type: 'evm', chainId: 137, coinType: 966, derivationIndex: 0, isNative: true },
             'AVAX': { type: 'evm', chainId: 43114, coinType: 9000, derivationIndex: 0, isNative: true },
-            
+
             'USDT': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 1, isERC20: true },
             'USDC': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 2, isERC20: true },
             'SHIB': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 3, isERC20: true },
@@ -14757,15 +14772,39 @@ class PlatformWallet {
             'UNI': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 5, isERC20: true },
             'WBTC': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 6, isERC20: true },
             'DAI': { type: 'evm', chainId: 1, coinType: 60, derivationIndex: 7, isERC20: true },
-            
+
             'SOL': { type: 'solana', network: 'mainnet-beta', coinType: 501, derivationIndex: 0 },
             'XRP': { type: 'xrp', network: 'mainnet', coinType: 144, derivationIndex: 0 },
             'TRX': { type: 'tron', network: 'mainnet', coinType: 195, derivationIndex: 0 },
             'ADA': { type: 'cardano', network: 'mainnet', coinType: 1815, derivationIndex: 0 },
             'DOT': { type: 'polkadot', network: 'polkadot', coinType: 354, derivationIndex: 0 }
         };
+
+        // ── Treasury derivation namespace ──────────────────────────────────
+        // All treasury addresses live under m/44'/coin'/TREASURY_ACCOUNT'/0/index
+        // This is entirely separate from user wallets (which use account 0).
+        // Using a distinct account index (1) guarantees:
+        //   1. Zero collision between user and treasury addresses
+        //   2. Independent xpubs / audit trails for compliance
+        //   3. Ability to rotate the treasury seed without touching users
+        this.TREASURY_ACCOUNT_INDEX = 1;
+
+        // Sweep-pool index space. Each asset gets a dedicated sequence of
+        // sweep addresses under m/44'/coin'/1'/0/<sweepIndex>.
+        // Customer deposit sweeps land on sweepIndex 0 (the primary treasury
+        // holding address). Hot/warm sweep pools can use 1, 2, 3, ...
+        this.treasurySweepBaseIndex = 0;
+        this.treasuryMaxSweepIndex = 2147483647;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // INITIALIZATION — dual-wallet bootstrap
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Initialize the customer-facing wallet (existing behavior).
+     * Kept as-is for backward compatibility.
+     */
     initialize(mnemonic) {
         if (!mnemonic || typeof mnemonic !== 'string') {
             console.error('[FATAL] Wallet init failed: Invalid mnemonic');
@@ -14782,13 +14821,64 @@ class PlatformWallet {
             this.root = bip32.fromSeed(seed);
             this.initialized = true;
             this.lastBalanceCheck = new Date();
-            
+
             console.log('✅ Platform wallet initialized successfully');
             console.log(`   Supported ERC-20 tokens: ${Object.keys(this.erc20TokenConfig).join(', ')}`);
             return true;
         } catch (e) {
             console.error('[FATAL] Wallet init error:', e.message);
             throw new Error(`Failed to initialize wallet: ${e.message}`);
+        }
+    }
+
+    /**
+     * Initialize the TREASURY wallet (new).
+     *
+     * Uses TREASURY_MASTER_SEED, which MUST be a valid BIP-39 phrase
+     * and MUST be different from MASTER_SEED_PHRASE. If they are identical,
+     * we refuse to boot because that would defeat the entire separation-of-
+     * concerns design (users could derive the treasury root, and vice-versa).
+     *
+     * The treasury tree is derived with account index = 1, giving it a fully
+     * disjoint derivation space from user wallets (account index = 0).
+     */
+    initializeTreasury(mnemonic) {
+        if (!mnemonic || typeof mnemonic !== 'string') {
+            console.error('[FATAL] Treasury wallet init failed: Invalid mnemonic');
+            throw new Error('Invalid treasury mnemonic provided. System cannot initialize.');
+        }
+
+        try {
+            if (!bip39.validateMnemonic(mnemonic)) {
+                console.error('[FATAL] Treasury wallet init failed: Invalid mnemonic phrase');
+                throw new Error('Invalid treasury mnemonic phrase. System cannot initialize.');
+            }
+
+            const seed = bip39.mnemonicToSeedSync(mnemonic);
+            this.treasuryRoot = bip32.fromSeed(seed);
+            this.treasuryInitialized = true;
+            this.lastTreasuryBalanceCheck = new Date();
+
+            // Fingerprint collision guard
+            if (this.root && this.treasuryRoot) {
+                const userFp = this.root.fingerprint.toString('hex');
+                const treasuryFp = this.treasuryRoot.fingerprint.toString('hex');
+                if (userFp === treasuryFp) {
+                    this.treasuryRoot = null;
+                    this.treasuryInitialized = false;
+                    console.error('[FATAL] TREASURY_MASTER_SEED resolves to the same BIP-32 fingerprint as MASTER_SEED_PHRASE.');
+                    console.error('[FATAL] User and Treasury wallets MUST use different seed phrases.');
+                    throw new Error('Treasury and platform seeds must be different.');
+                }
+            }
+
+            console.log('✅ Treasury wallet initialized successfully');
+            console.log(`   Treasury account index: ${this.TREASURY_ACCOUNT_INDEX}`);
+            console.log(`   Treasury fingerprint: ${this.treasuryRoot.fingerprint.toString('hex')}`);
+            return true;
+        } catch (e) {
+            console.error('[FATAL] Treasury wallet init error:', e.message);
+            throw new Error(`Failed to initialize treasury wallet: ${e.message}`);
         }
     }
 
@@ -14799,32 +14889,46 @@ class PlatformWallet {
     }
 
     /**
+     * Treasury equivalent of ensureInitialized(). Fails loudly so we never
+     * silently route a sweep into a null treasury root.
+     */
+    ensureTreasuryInitialized() {
+        if (!this.treasuryInitialized || !this.treasuryRoot) {
+            throw new Error('Treasury wallet not initialized. Cannot derive treasury addresses.');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // USER-ID HASHING (existing)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
      * Convert MongoDB ObjectId to unique 32-bit integer
      */
     _userIdToNumeric(userId) {
         if (!userId) return 1;
-        
+
         if (typeof userId === 'number') {
             return Math.max(1, Math.min(userId, 2147483647));
         }
-        
+
         const idStr = userId.toString();
-        
+
         let numeric = 0;
         let multiplier = 1;
-        
+
         for (let i = idStr.length - 1; i >= 0 && i >= idStr.length - 12; i--) {
             const charCode = idStr.charCodeAt(i);
             numeric = (numeric + (charCode * multiplier)) & 0xFFFFFFFF;
             multiplier = (multiplier * 31) & 0xFFFFFFFF;
-            
+
             if (i % 3 === 0) {
                 numeric = ((numeric << 3) | (numeric >>> 29)) & 0xFFFFFFFF;
             }
         }
-        
+
         numeric = Math.abs(numeric) & 0x7FFFFFFF;
-        
+
         if (numeric < 1000) {
             let hash = 0;
             for (let i = 0; i < idStr.length; i++) {
@@ -14832,38 +14936,101 @@ class PlatformWallet {
             }
             numeric = Math.abs(hash) & 0x7FFFFFFF;
         }
-        
+
         return Math.max(1, Math.min(numeric, 2147483647));
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // USER DERIVATION PATHS (existing)
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * ✅ FIXED: Get BIP44 derivation path with unique addresses for each ERC-20 token
+     * Get BIP44 derivation path with unique addresses for each ERC-20 token
+     * (customer / user wallets, account index = 0).
      */
     getDerivationPath(asset, userId) {
         const assetUpper = asset.toUpperCase();
         const userIdNum = this._userIdToNumeric(userId);
         const provider = this.networkProviders[assetUpper];
-        
+
         if (!provider) {
             throw new Error(`Unsupported asset: ${assetUpper}`);
         }
 
         const coinType = provider.coinType;
-        
         const derivationIndex = provider.derivationIndex || 0;
 
         if (provider.type === 'evm') {
             const combinedIndex = (userIdNum * 1000) + derivationIndex;
             const safeIndex = combinedIndex & 0x7FFFFFFF;
-            
+
             return `m/44'/${coinType}'/0'/0/${safeIndex}`;
         }
 
         return `m/44'/${coinType}'/0'/0/${userIdNum}`;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // TREASURY DERIVATION PATHS (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * ✅ FIXED: Check if asset is ERC-20 token
+     * Treasury derivation path for an asset.
+     *
+     * Structure:  m / 44' / coinType' / TREASURY_ACCOUNT_INDEX' / 0 / sweepIndex
+     *
+     * - TREASURY_ACCOUNT_INDEX = 1 (guarantees disjoint space from users)
+     * - The internal change/index field is reused as a sweep-index for
+     *   multi-address treasury rotation pools.
+     * - For EVM-family assets (native + ERC-20) we mix the asset's
+     *   derivationIndex into the sweepIndex so USDT/USDC/etc. each have
+     *   their own dedicated address, exactly like the user side.
+     */
+    getTreasuryDerivationPath(asset, sweepIndex = 0) {
+        const assetUpper = asset.toUpperCase();
+        const provider = this.networkProviders[assetUpper];
+
+        if (!provider) {
+            throw new Error(`Unsupported asset for treasury derivation: ${assetUpper}`);
+        }
+
+        const coinType = provider.coinType;
+        const assetDerivationIndex = provider.derivationIndex || 0;
+
+        const baseSweepIndex = Number.isFinite(sweepIndex) && sweepIndex >= 0
+            ? Math.floor(sweepIndex)
+            : 0;
+
+        if (provider.type === 'evm') {
+            // Match user-side layout: [assetIndex * 1000 + sweepIndex]
+            // wrapped into a 31-bit safe integer.
+            const combined = (assetDerivationIndex * 1000) + baseSweepIndex;
+            const safeIndex = combined & 0x7FFFFFFF;
+
+            return `m/44'/${coinType}'/${this.TREASURY_ACCOUNT_INDEX}'/0/${safeIndex}`;
+        }
+
+        // Non-EVM assets (UTXO, Solana, XRP, TRON, ADA, DOT) use the sweep
+        // index directly because they don't share coinType across tokens.
+        const safeIndex = baseSweepIndex & 0x7FFFFFFF;
+        return `m/44'/${coinType}'/${this.TREASURY_ACCOUNT_INDEX}'/0/${safeIndex}`;
+    }
+
+    /**
+     * Primary treasury holding address for an asset. This is the address
+     * every customer deposit sweep should ultimately land on (or route
+     * through) — it's sweepIndex 0 of the treasury tree.
+     */
+    getTreasuryPrimaryDerivationPath(asset) {
+        return this.getTreasuryDerivationPath(asset, this.treasurySweepBaseIndex);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TOKEN / CONFIG HELPERS (existing)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Check if asset is ERC-20 token
      */
     isERC20Token(asset) {
         const assetUpper = asset.toUpperCase();
@@ -14871,7 +15038,7 @@ class PlatformWallet {
     }
 
     /**
-     * ✅ FIXED: Get ERC-20 token config
+     * Get ERC-20 token config
      */
     getERC20Config(asset) {
         const assetUpper = asset.toUpperCase();
@@ -14879,20 +15046,20 @@ class PlatformWallet {
     }
 
     /**
-     * ✅ FIXED: Get token decimals (ERC-20 or native)
+     * Get token decimals (ERC-20 or native)
      */
     getTokenDecimals(asset) {
         const assetUpper = asset.toUpperCase();
-        
+
         if (this.isERC20Token(assetUpper)) {
             return this.erc20TokenConfig[assetUpper].decimals;
         }
-        
+
         return 18;
     }
 
     /**
-     * ✅ FIXED: Get contract address (ERC-20 only)
+     * Get contract address (ERC-20 only)
      */
     getContractAddress(asset) {
         const assetUpper = asset.toUpperCase();
@@ -14902,9 +15069,13 @@ class PlatformWallet {
         return null;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // CACHE HELPERS — user (existing) + treasury (new)
+    // ═══════════════════════════════════════════════════════════════════════
+
     getOrGenerateAddress(userId, asset, forceRefresh = false) {
         const cacheKey = `${asset.toUpperCase()}:${userId.toString()}`;
-        
+
         if (!forceRefresh && this.walletCache.has(cacheKey)) {
             this.cacheStats.hits++;
             const value = this.walletCache.get(cacheKey);
@@ -14912,9 +15083,9 @@ class PlatformWallet {
             this.walletCache.set(cacheKey, value);
             return value;
         }
-        
+
         this.cacheStats.misses++;
-        
+
         if (this.walletCache.size >= this.maxCacheSize) {
             const oldestKey = this.walletCache.keys().next().value;
             if (oldestKey) {
@@ -14922,12 +15093,51 @@ class PlatformWallet {
                 this.cacheStats.evictions++;
             }
         }
-        
+
         const result = this.generateDepositAddress(userId, asset);
         this.walletCache.set(cacheKey, result);
         this.cacheStats.sets++;
         return result;
     }
+
+    /**
+     * Treasury equivalent of getOrGenerateAddress.
+     * Cache key: "treasury:<ASSET>:<sweepIndex>"
+     */
+    getOrGenerateTreasuryAddress(asset, sweepIndex = 0, forceRefresh = false) {
+        const assetUpper = asset.toUpperCase();
+        const sweep = Number.isFinite(sweepIndex) && sweepIndex >= 0
+            ? Math.floor(sweepIndex)
+            : 0;
+        const cacheKey = `treasury:${assetUpper}:${sweep}`;
+
+        if (!forceRefresh && this.treasuryCache.has(cacheKey)) {
+            this.treasuryCacheStats.hits++;
+            const value = this.treasuryCache.get(cacheKey);
+            this.treasuryCache.delete(cacheKey);
+            this.treasuryCache.set(cacheKey, value);
+            return value;
+        }
+
+        this.treasuryCacheStats.misses++;
+
+        if (this.treasuryCache.size >= this.maxTreasuryCacheSize) {
+            const oldestKey = this.treasuryCache.keys().next().value;
+            if (oldestKey) {
+                this.treasuryCache.delete(oldestKey);
+                this.treasuryCacheStats.evictions++;
+            }
+        }
+
+        const result = this.generateTreasuryAddress(assetUpper, sweep);
+        this.treasuryCache.set(cacheKey, result);
+        this.treasuryCacheStats.sets++;
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ADDRESS GENERATION — user (existing behavior, unchanged)
+    // ═══════════════════════════════════════════════════════════════════════
 
     generateDepositAddress(userId, asset, options = {}) {
         this.ensureInitialized();
@@ -14976,13 +15186,13 @@ class PlatformWallet {
                 case 'DAI': {
                     const privateKeyHex = '0x' + child.privateKey.toString('hex');
                     const wallet = new ethers.Wallet(privateKeyHex);
-                    
+
                     const isERC20 = this.isERC20Token(assetUpper);
-                    
+
                     const contractAddress = isERC20 ? this.getContractAddress(assetUpper) : null;
-                    
+
                     const decimals = this.getTokenDecimals(assetUpper);
-                    
+
                     result = {
                         address: wallet.address,
                         derivationPath: path,
@@ -15061,11 +15271,11 @@ class PlatformWallet {
                     const pubKeyBytes = child.publicKey;
                     const hash = crypto.createHash('blake2b256').update(pubKeyBytes).digest();
                     const paymentPart = hash.slice(0, 28);
-                    
+
                     const hrp = 'addr1';
                     const words = bech32.toWords(paymentPart);
                     const address = bech32.encode(hrp, words);
-                    
+
                     result = {
                         address: address,
                         derivationPath: path,
@@ -15084,7 +15294,7 @@ class PlatformWallet {
                     const pubKeyBytes = child.publicKey;
                     const prefix = 0;
                     const address = ss58Encode(pubKeyBytes, prefix);
-                    
+
                     result = {
                         address: address,
                         derivationPath: path,
@@ -15110,7 +15320,7 @@ class PlatformWallet {
             console.log(`   Is ERC-20: ${result.isERC20 || false}`);
             console.log(`   Contract: ${result.contractAddress || 'N/A'}`);
             console.log(`   Decimals: ${result.decimals || 18}`);
-            
+
             return result;
 
         } catch (error) {
@@ -15119,29 +15329,371 @@ class PlatformWallet {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ADDRESS GENERATION — TREASURY (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Treasury address generator.
+     *
+     * Mirrors generateDepositAddress() one-to-one, but derives from
+     * this.treasuryRoot and uses the treasury derivation namespace.
+     *
+     * Every returned record is annotated with `scope: 'treasury'` and
+     * `sweepIndex` so downstream code can distinguish treasury outputs
+     * from user deposit addresses without ambiguity.
+     */
+    generateTreasuryAddress(asset, sweepIndex = 0) {
+        this.ensureTreasuryInitialized();
+
+        const assetUpper = asset.toUpperCase();
+        const sweep = Number.isFinite(sweepIndex) && sweepIndex >= 0
+            ? Math.floor(sweepIndex)
+            : 0;
+
+        if (sweep > this.treasuryMaxSweepIndex) {
+            throw new Error(`Treasury sweep index exceeds maximum: ${sweep}`);
+        }
+
+        const path = this.getTreasuryDerivationPath(assetUpper, sweep);
+        const child = this.treasuryRoot.derivePath(path);
+
+        let result;
+
+        try {
+            switch (assetUpper) {
+                case 'BTC':
+                case 'DOGE':
+                case 'LTC': {
+                    const network = this.networkProviders[assetUpper];
+                    const { address } = bitcoin.payments.p2pkh({
+                        pubkey: child.publicKey,
+                        network: network
+                    });
+                    result = {
+                        address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: child.privateKey.toString('hex'),
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'utxo',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'ETH':
+                case 'BNB':
+                case 'MATIC':
+                case 'AVAX':
+                case 'USDT':
+                case 'USDC':
+                case 'SHIB':
+                case 'LINK':
+                case 'UNI':
+                case 'WBTC':
+                case 'DAI': {
+                    const privateKeyHex = '0x' + child.privateKey.toString('hex');
+                    const wallet = new ethers.Wallet(privateKeyHex);
+
+                    const isERC20 = this.isERC20Token(assetUpper);
+                    const contractAddress = isERC20 ? this.getContractAddress(assetUpper) : null;
+                    const decimals = this.getTokenDecimals(assetUpper);
+
+                    result = {
+                        address: wallet.address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: child.privateKey.toString('hex'),
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'evm',
+                        isERC20: isERC20,
+                        contractAddress: contractAddress,
+                        decimals: decimals,
+                        chainId: this.networkProviders[assetUpper]?.chainId || 1,
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString(),
+                        _debug: {
+                            path: path,
+                            treasuryAccountIndex: this.TREASURY_ACCOUNT_INDEX,
+                            assetDerivationIndex: this.networkProviders[assetUpper]?.derivationIndex || 0,
+                            isERC20: isERC20
+                        }
+                    };
+                    break;
+                }
+
+                case 'SOL': {
+                    const keypair = Keypair.fromSeed(child.privateKey.slice(0, 32));
+                    result = {
+                        address: keypair.publicKey.toBase58(),
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: Buffer.from(keypair.secretKey).toString('hex'),
+                        publicKey: keypair.publicKey.toString(),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'solana',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'XRP': {
+                    const address = xrpl.deriveAddress(child.publicKey.toString('hex'));
+                    result = {
+                        address: address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: child.privateKey.toString('hex'),
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'xrp',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'TRX': {
+                    const tronWeb = new TronWeb({ fullHost: 'https://api.trongrid.io' });
+                    const privateKeyHex = child.privateKey.toString('hex');
+                    const account = tronWeb.utils.accounts.privateKeyToAccount(privateKeyHex);
+                    result = {
+                        address: account.address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: privateKeyHex,
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'tron',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'ADA': {
+                    const pubKeyBytes = child.publicKey;
+                    const hash = crypto.createHash('blake2b256').update(pubKeyBytes).digest();
+                    const paymentPart = hash.slice(0, 28);
+
+                    const hrp = 'addr1';
+                    const words = bech32.toWords(paymentPart);
+                    const address = bech32.encode(hrp, words);
+
+                    result = {
+                        address: address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: child.privateKey.toString('hex'),
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'cardano',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                case 'DOT': {
+                    const pubKeyBytes = child.publicKey;
+                    const prefix = 0;
+                    const address = ss58Encode(pubKeyBytes, prefix);
+
+                    result = {
+                        address: address,
+                        derivationPath: path,
+                        asset: assetUpper,
+                        privateKey: child.privateKey.toString('hex'),
+                        publicKey: child.publicKey.toString('hex'),
+                        network: this.getNetworkName(assetUpper),
+                        type: 'polkadot',
+                        scope: 'treasury',
+                        sweepIndex: sweep,
+                        createdAt: new Date().toISOString()
+                    };
+                    break;
+                }
+
+                default:
+                    throw new Error(`Asset ${assetUpper} not implemented for treasury`);
+            }
+
+            console.log(`🏦 Generated TREASURY ${assetUpper} address (sweep ${sweep}):`);
+            console.log(`   Address: ${result.address.substring(0, 10)}...`);
+            console.log(`   Path: ${path}`);
+            console.log(`   Treasury Account Index: ${this.TREASURY_ACCOUNT_INDEX}`);
+            console.log(`   Is ERC-20: ${result.isERC20 || false}`);
+            console.log(`   Contract: ${result.contractAddress || 'N/A'}`);
+            console.log(`   Decimals: ${result.decimals || 18}`);
+
+            return result;
+
+        } catch (error) {
+            console.error(`Error generating treasury ${assetUpper} address:`, error.message);
+            throw new Error(`Failed to generate treasury ${assetUpper} address: ${error.message}`);
+        }
+    }
+
+    /**
+     * Convenience wrapper: return the primary treasury address for every
+     * supported asset in one pass. Useful for cold-storage ceremony UIs     * and sweep-routing configuration.
+     */
+    getAllTreasuryPrimaryAddresses() {
+        this.ensureTreasuryInitialized();
+
+        const result = {};
+        for (const asset of Object.keys(this.networkProviders)) {
+            try {
+                const entry = this.getOrGenerateTreasuryAddress(asset, this.treasurySweepBaseIndex);
+                result[asset] = {
+                    asset: asset,
+                    address: entry.address,
+                    network: entry.network,
+                    derivationPath: entry.derivationPath,
+                    publicKey: entry.publicKey,
+                    isERC20: !!entry.isERC20,
+                    contractAddress: entry.contractAddress || null,
+                    decimals: entry.decimals || 18,
+                    chainId: entry.chainId || null,
+                    scope: 'treasury',
+                    sweepIndex: this.treasurySweepBaseIndex
+                };
+            } catch (err) {
+                result[asset] = {
+                    asset: asset,
+                    error: err.message
+                };
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Return the next N treasury sweep addresses for an asset.
+     * Used when you want a pre-warmed pool of sweep destinations for
+     * concurrent sweep jobs that don't want to serialize on one address.
+     */
+    getTreasurySweepPool(asset, count = 10) {
+        this.ensureTreasuryInitialized();
+
+        const safeCount = Math.max(1, Math.min(Math.floor(count), 500));
+        const pool = [];
+
+        for (let i = 0; i < safeCount; i++) {
+            pool.push(this.getOrGenerateTreasuryAddress(asset, i));
+        }
+
+        return pool;
+    }
+
+    /**
+     * Verify that a given address belongs to the treasury tree for an asset.
+     * This is the guard you call before accepting a sweep destination
+     * as "ours". It never trusts user input; it re-derives and compares.
+     */
+    isTreasuryAddress(address, asset, maxSweepIndex = 1000) {
+        if (!address || typeof address !== 'string') return false;
+        if (!this.treasuryInitialized) return false;
+
+        const target = address.trim();
+        const assetUpper = asset.toUpperCase();
+
+        // First check the cache
+        for (const [key, entry] of this.treasuryCache.entries()) {
+            if (key.startsWith(`treasury:${assetUpper}:`) &&
+                entry.address.toLowerCase() === target.toLowerCase()) {
+                return true;
+            }
+        }
+
+        // Then do a bounded brute-force walk of the derived space.
+        // For EVM assets the layout is assetDerivationIndex * 1000 + sweep,
+        // so a single sweepIndex space covers it.
+        const limit = Math.min(Math.max(1, maxSweepIndex), 5000);
+
+        for (let i = 0; i < limit; i++) {
+            try {
+                const derived = this.generateTreasuryAddress(assetUpper, i);
+                if (derived.address.toLowerCase() === target.toLowerCase()) {
+                    // Warm the cache for future lookups
+                    this.treasuryCache.set(
+                        `treasury:${assetUpper}:${i}`,
+                        derived
+                    );
+                    return true;
+                }
+            } catch (err) {
+                break;
+            }
+        }
+
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CACHE MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════
+
     clearCache() {
         this.walletCache.clear();
         this.cacheStats = { hits: 0, misses: 0, evictions: 0, sets: 0 };
         console.log('🧹 Wallet cache cleared');
     }
 
+    clearTreasuryCache() {
+        this.treasuryCache.clear();
+        this.treasuryCacheStats = { hits: 0, misses: 0, evictions: 0, sets: 0 };
+        console.log('🧹 Treasury wallet cache cleared');
+    }
+
     getStats() {
         const total = this.cacheStats.hits + this.cacheStats.misses;
+        const treasuryTotal = this.treasuryCacheStats.hits + this.treasuryCacheStats.misses;
+
         return {
             initialized: this.initialized,
+            treasuryInitialized: this.treasuryInitialized,
+            treasuryAccountIndex: this.TREASURY_ACCOUNT_INDEX,
             totalAddressesGenerated: this.walletCache.size,
+            totalTreasuryAddressesGenerated: this.treasuryCache.size,
             totalTransactions: this.transactionHistory.length,
+            totalTreasuryTransactions: this.treasuryTransactionHistory.length,
             supportedAssets: Object.keys(this.networkProviders).length,
             erc20Tokens: Object.keys(this.erc20TokenConfig).length,
             lastBalanceCheck: this.lastBalanceCheck,
+            lastTreasuryBalanceCheck: this.lastTreasuryBalanceCheck,
             cacheSize: this.walletCache.size,
             maxCacheSize: this.maxCacheSize,
             cacheHits: this.cacheStats.hits,
             cacheMisses: this.cacheStats.misses,
             cacheEvictions: this.cacheStats.evictions,
-            cacheHitRate: total > 0 ? (this.cacheStats.hits / total * 100).toFixed(2) + '%' : '0%'
+            cacheHitRate: total > 0 ? (this.cacheStats.hits / total * 100).toFixed(2) + '%' : '0%',
+            treasuryCacheSize: this.treasuryCache.size,
+            maxTreasuryCacheSize: this.maxTreasuryCacheSize,
+            treasuryCacheHits: this.treasuryCacheStats.hits,
+            treasuryCacheMisses: this.treasuryCacheStats.misses,
+            treasuryCacheEvictions: this.treasuryCacheStats.evictions,
+            treasuryCacheHitRate: treasuryTotal > 0
+                ? (this.treasuryCacheStats.hits / treasuryTotal * 100).toFixed(2) + '%'
+                : '0%'
         };
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // KEY ACCESS
+    // ═══════════════════════════════════════════════════════════════════════
 
     getPrivateKey(derivationPath, asHex = true) {
         this.ensureInitialized();
@@ -15155,6 +15707,22 @@ class PlatformWallet {
         return asHex ? child.publicKey.toString('hex') : child.publicKey;
     }
 
+    getTreasuryPrivateKey(derivationPath, asHex = true) {
+        this.ensureTreasuryInitialized();
+        const child = this.treasuryRoot.derivePath(derivationPath);
+        return asHex ? child.privateKey.toString('hex') : child.privateKey;
+    }
+
+    getTreasuryPublicKey(derivationPath, asHex = true) {
+        this.ensureTreasuryInitialized();
+        const child = this.treasuryRoot.derivePath(derivationPath);
+        return asHex ? child.publicKey.toString('hex') : child.publicKey;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VERIFICATION
+    // ═══════════════════════════════════════════════════════════════════════
+
     verifyAddress(address, asset, userId) {
         try {
             const generated = this.generateDepositAddress(userId, asset);
@@ -15163,6 +15731,19 @@ class PlatformWallet {
             return false;
         }
     }
+
+    verifyTreasuryAddress(address, asset, sweepIndex = 0) {
+        try {
+            const generated = this.generateTreasuryAddress(asset, sweepIndex);
+            return generated.address.toLowerCase() === address.toLowerCase();
+        } catch (error) {
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NETWORK / ASSET METADATA
+    // ═══════════════════════════════════════════════════════════════════════
 
     getNetworkName(asset) {
         const networks = {
@@ -15208,6 +15789,10 @@ class PlatformWallet {
         return !!this.networkProviders[asset.toUpperCase()];
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // TRANSACTION HISTORY — user (existing) + treasury (new)
+    // ═══════════════════════════════════════════════════════════════════════
+
     recordTransaction(transaction) {
         this.transactionHistory.push({
             ...transaction,
@@ -15215,6 +15800,17 @@ class PlatformWallet {
         });
         if (this.transactionHistory.length > 10000) {
             this.transactionHistory = this.transactionHistory.slice(-5000);
+        }
+    }
+
+    recordTreasuryTransaction(transaction) {
+        this.treasuryTransactionHistory.push({
+            ...transaction,
+            scope: 'treasury',
+            recordedAt: new Date().toISOString()
+        });
+        if (this.treasuryTransactionHistory.length > 10000) {
+            this.treasuryTransactionHistory = this.treasuryTransactionHistory.slice(-5000);
         }
     }
 
@@ -15233,6 +15829,25 @@ class PlatformWallet {
         return history;
     }
 
+    getTreasuryTransactionHistory(filters = {}) {
+        let history = this.treasuryTransactionHistory;
+        if (filters.asset) {
+            history = history.filter(tx => tx.asset === filters.asset.toUpperCase());
+        }
+        if (filters.sweepIndex !== undefined && filters.sweepIndex !== null) {
+            history = history.filter(tx => tx.sweepIndex === filters.sweepIndex);
+        }
+        if (filters.limit) {
+            const offset = filters.offset || 0;
+            history = history.slice(offset, offset + filters.limit);
+        }
+        return history;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BALANCE SNAPSHOTS — user (existing) + treasury (new)
+    // ═══════════════════════════════════════════════════════════════════════
+
     updateBalanceSnapshot(asset, balance, metadata = {}) {
         const assetUpper = asset.toUpperCase();
         if (!this.balanceSnapshot[assetUpper]) {
@@ -15249,28 +15864,64 @@ class PlatformWallet {
         this.lastBalanceCheck = new Date();
     }
 
+    updateTreasuryBalanceSnapshot(asset, balance, metadata = {}) {
+        const assetUpper = asset.toUpperCase();
+        if (!this.treasuryBalanceSnapshot[assetUpper]) {
+            this.treasuryBalanceSnapshot[assetUpper] = [];
+        }
+        this.treasuryBalanceSnapshot[assetUpper].push({
+            balance,
+            timestamp: new Date().toISOString(),
+            ...metadata
+        });
+        if (this.treasuryBalanceSnapshot[assetUpper].length > 100) {
+            this.treasuryBalanceSnapshot[assetUpper] = this.treasuryBalanceSnapshot[assetUpper].slice(-100);
+        }
+        this.lastTreasuryBalanceCheck = new Date();
+    }
+
     getBalanceHistory(asset, limit = 30) {
         const assetUpper = asset.toUpperCase();
         const history = this.balanceSnapshot[assetUpper] || [];
         return history.slice(-limit);
     }
 
+    getTreasuryBalanceHistory(asset, limit = 30) {
+        const assetUpper = asset.toUpperCase();
+        const history = this.treasuryBalanceSnapshot[assetUpper] || [];
+        return history.slice(-limit);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXPORT
+    // ═══════════════════════════════════════════════════════════════════════
+
     exportWalletData(options = {}) {
         const data = {
             initialized: this.initialized,
+            treasuryInitialized: this.treasuryInitialized,
+            treasuryAccountIndex: this.TREASURY_ACCOUNT_INDEX,
             lastBalanceCheck: this.lastBalanceCheck,
+            lastTreasuryBalanceCheck: this.lastTreasuryBalanceCheck,
             supportedAssets: this.getSupportedAssets(),
             erc20Tokens: Object.keys(this.erc20TokenConfig),
             balanceSnapshots: this.balanceSnapshot,
+            treasuryBalanceSnapshots: this.treasuryBalanceSnapshot,
             timestamp: new Date().toISOString(),
-            cacheStats: this.cacheStats
+            cacheStats: this.cacheStats,
+            treasuryCacheStats: this.treasuryCacheStats
         };
         if (options.includeHistory) {
             data.transactionHistory = this.transactionHistory;
+            data.treasuryTransactionHistory = this.treasuryTransactionHistory;
         }
         if (options.includePrivateKeys && this.initialized) {
             data.masterPublicKey = this.root.publicKey.toString('hex');
             data.masterFingerprint = this.root.fingerprint.toString('hex');
+        }
+        if (options.includePrivateKeys && this.treasuryInitialized) {
+            data.treasuryMasterPublicKey = this.treasuryRoot.publicKey.toString('hex');
+            data.treasuryMasterFingerprint = this.treasuryRoot.fingerprint.toString('hex');
         }
         return data;
     }
@@ -15278,14 +15929,25 @@ class PlatformWallet {
     isReady() {
         return this.initialized;
     }
+
+    isTreasuryReady() {
+        return this.treasuryInitialized;
+    }
 }
 
 const platformWallet = new PlatformWallet();
 const MASTER_SEED_PHRASE = process.env.MASTER_SEED_PHRASE;
+const TREASURY_MASTER_SEED = process.env.TREASURY_MASTER_SEED;
 
 if (!MASTER_SEED_PHRASE) {
     console.error('❌ FATAL: MASTER_SEED_PHRASE not found in environment variables!');
     console.error('❌ System cannot initialize wallet. Shutting down...');
+    process.exit(1);
+}
+
+if (!TREASURY_MASTER_SEED) {
+    console.error('❌ FATAL: TREASURY_MASTER_SEED not found in environment variables!');
+    console.error('❌ System cannot initialize treasury wallet. Shutting down...');
     process.exit(1);
 }
 
@@ -15295,6 +15957,15 @@ try {
 } catch (error) {
     console.error('❌ FATAL: Failed to initialize wallet:', error.message);
     console.error('❌ System cannot operate without wallet. Shutting down...');
+    process.exit(1);
+}
+
+try {
+    platformWallet.initializeTreasury(TREASURY_MASTER_SEED);
+    console.log('✅ Treasury wallet initialized successfully');
+} catch (error) {
+    console.error('❌ FATAL: Failed to initialize treasury wallet:', error.message);
+    console.error('❌ System cannot operate without treasury wallet. Shutting down...');
     process.exit(1);
 }
 
@@ -15637,7 +16308,6 @@ async function getSystemUserId() {
         return null;
     }
 }
-
 
 
 
