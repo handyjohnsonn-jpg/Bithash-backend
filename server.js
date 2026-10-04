@@ -65,6 +65,14 @@ const polkadotCrypto = require('@polkadot/util-crypto');
 const app = express();
 const { createServer } = require('http');
 const { Server } = require('socket.io');
+const logger = console;
+// Wallet-management receives this map explicitly; it never imports this server.
+const NETWORKS = {
+  ETH: { id: 'ETH', chainId: 1, nativeAsset: 'ETH', rpcEnv: ['WALLET_MANAGEMENT_RPC_ETHEREUM_URL', 'ETHEREUM_RPC_URL'] },
+  BSC: { id: 'BSC', chainId: 56, nativeAsset: 'BNB', rpcEnv: ['WALLET_MANAGEMENT_RPC_BSC_URL', 'BSC_RPC_URL'] },
+  POLYGON: { id: 'POLYGON', chainId: 137, nativeAsset: 'MATIC', rpcEnv: ['WALLET_MANAGEMENT_RPC_POLYGON_URL', 'POLYGON_RPC_URL'] },
+  AVALANCHE: { id: 'AVALANCHE', chainId: 43114, nativeAsset: 'AVAX', rpcEnv: ['WALLET_MANAGEMENT_RPC_AVALANCHE_URL', 'AVALANCHE_RPC_URL'] }
+};
 
 app.set('trust proxy', 1);
 
@@ -16008,6 +16016,12 @@ class PlatformWallet {
 }
 
 const platformWallet = new PlatformWallet();
+const { createSignerAdapter } = require('./signer-adapter');
+const signerAdapter = createSignerAdapter({
+  platformWallet,
+  logger,
+  evmNetworks: NETWORKS,
+});
 const MASTER_SEED_PHRASE = process.env.MASTER_SEED_PHRASE;
 
 // Master seed gate: treasury signing is opt-in via TREASURY_SEED_ENABLED=true.
@@ -46245,8 +46259,25 @@ console.log('   - GET  /api/users/kyc/facial/status');
 
 
 
-const { createWalletManagementRouter, bindWalletManagementSocket } = require('./wallet-management');
-app.use('/api/admin/wallet-management', createWalletManagementRouter({ adminProtect, checkCSRF, getIO: () => app.get('io') }));
+const { createWalletManagementRouter, bindWalletManagementSocket, WalletRegistry, WalletOperation } = require('./wallet-management');
+const { ASSET_METADATA } = require('./assets-metadata');
+const WalletTransaction = require('./models/WalletTransaction');
+
+app.use('/api/admin/wallet-management', createWalletManagementRouter({
+  platformWallet,
+  DepositAddress,
+  User,
+  WalletRegistry,
+  WalletOperation,
+  WalletTransaction,
+  signerAdapter,
+  ASSET_METADATA,
+  NETWORKS,
+  logger,
+  adminProtect,
+  checkCSRF,
+  getIO: () => app.get('io'),
+}));
 
 app.use((err, req, res, next) => {
   console.error('========================');
