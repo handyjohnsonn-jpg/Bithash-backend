@@ -14650,8 +14650,6 @@ async function sendAdminWeb3SignupNotification(user, web3User, req) {
 
 
 
-
-
 class PlatformWallet {
     constructor() {
         // ── Customer-facing wallet (existing) ──────────────────────────────
@@ -14842,39 +14840,6 @@ class PlatformWallet {
         }
     }
 
-    /**
-     * Initialize the TREASURY wallet.
-     *
-     * IMPORTANT DESIGN NOTES
-     * ----------------------
-     * 1. This is opt-in. It only runs when TREASURY_SEED_ENABLED === 'true'.
-     *    If the flag is false, we mark the treasury as disabled and return
-     *    cleanly — the user wallet subsystem continues unaffected.
-     *
-     * 2. The master seed is a ROOT only. We never treat it as "the treasury
-     *    wallet". Per-chain accounts are derived on demand via
-     *    getTreasuryDerivationPath(asset, sweepIndex):
-     *
-     *        TREASURY_MASTER_SEED
-     *                │
-     *                ├── BTC account  (m/44'/0'/1'/0/<idx>)
-     *                ├── EVM account  (m/44'/60'/1'/0/<idx>)  ← ETH, BNB,
-     *                │                                          MATIC, ARB,
-     *                │                                          BASE, USDT,
-     *                │                                          USDC, etc.
-     *                ├── SOL account
-     *                ├── XRP account
-     *                ├── DOGE account
-     *                ├── LTC account
-     *                └── ADA account
-     *
-     * 3. The seed string itself is NEVER logged, never stringified, never
-     *    stored anywhere reachable by Mongo, GitHub, the frontend, admin UI,
-     *    or Render logs. Only the public key / fingerprint are ever emitted.
-     *
-     * 4. Guard against fingerprint collision with the user master seed.
-     *    Two identical seed phrases would defeat the whole isolation model.
-     */
     initializeTreasury(mnemonic, enabled) {
         // Normalise the enabled flag. Callers may pass true/false/undefined.
         // Any value other than an explicit boolean true is treated as "off".
@@ -15317,11 +15282,10 @@ class PlatformWallet {
                 }
 
                 case 'TRX': {
-                    const tronWeb = new TronWeb({ fullHost: 'https://api.trongrid.io' });
                     const privateKeyHex = child.privateKey.toString('hex');
-                    const account = tronWeb.utils.accounts.privateKeyToAccount(privateKeyHex);
+                    const address = TronWeb.address.fromPrivateKey(privateKeyHex);
                     result = {
-                        address: account.address,
+                        address: address,
                         derivationPath: path,
                         asset: assetUpper,
                         privateKey: privateKeyHex,
@@ -15528,11 +15492,10 @@ class PlatformWallet {
                 }
 
                 case 'TRX': {
-                    const tronWeb = new TronWeb({ fullHost: 'https://api.trongrid.io' });
                     const privateKeyHex = child.privateKey.toString('hex');
-                    const account = tronWeb.utils.accounts.privateKeyToAccount(privateKeyHex);
+                    const address = TronWeb.address.fromPrivateKey(privateKeyHex);
                     result = {
-                        address: account.address,
+                        address: address,
                         derivationPath: path,
                         asset: assetUpper,
                         privateKey: privateKeyHex,
@@ -16258,45 +16221,6 @@ app.get('/api/deposits/address/:asset', protect, async (req, res) => {
     }
 });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 function isValidCryptoAddress(address, asset) {
     if (!address || typeof address !== 'string') {
         return false;
@@ -16351,18 +16275,6 @@ function isValidCryptoAddress(address, asset) {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 async function getSystemUserId() {
     try {
         let systemUser = await User.findOne({ email: 'system@bithash.com' });
@@ -16394,7 +16306,6 @@ async function getSystemUserId() {
         return null;
     }
 }
-
 
 
 
