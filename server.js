@@ -47294,6 +47294,7 @@ console.log('   - GET  /wallets/:walletId/state');
 
 
 
+
 /* ============================================================================
  * WALLET MANAGEMENT — TREASURY / SWEEP / ASSETS / FEES
  * ----------------------------------------------------------------------------
@@ -47307,18 +47308,15 @@ console.log('   - GET  /wallets/:walletId/state');
  *   - Live balances come on-chain via the shared wmFetchOnChainBalance().
  *   - Asset metadata (logos) come from getCryptoLogo() + ASSET_NETWORK_MAP.
  *   - Fee estimates use the imported chain libraries with hard timeouts.
- *   - Sweep endpoints are async orchestrators that prepare+approve+sign+
- *     broadcast each address, but the actual prepare/approve/sign/broadcast
- *     primitives live in the transactions batch (next file). Here we call
- *     them through an in-process helper defined at the bottom of this block.
  * ========================================================================== */
 
 /* --------------------------------------------------------------------------
  * Short-lived in-process operation store for the fee/prepare flow.
- * In production this should be Redis. We use Redis if available, else a
- * Map so the endpoints still function in dev.
+ * Redis is preferred; falls back to an in-process Map so the endpoints
+ * still function in development.
  * ------------------------------------------------------------------------ */
 const WM_OPERATION_TTL_SECONDS = 600; // 10 minutes
+const wmMemoryOperationStore = new Map();
 
 async function wmStoreOperation(operationId, payload) {
     const serialized = JSON.stringify(payload);
@@ -47335,7 +47333,6 @@ async function wmStoreOperation(operationId, payload) {
         expiresAt: Date.now() + WM_OPERATION_TTL_SECONDS * 1000
     });
 }
-const wmMemoryOperationStore = new Map();
 
 async function wmLoadOperation(operationId) {
     try {
@@ -47344,7 +47341,7 @@ async function wmLoadOperation(operationId) {
             if (raw) return JSON.parse(raw);
         }
     } catch (e) {
-        // fall through to memory
+        /* fall through to memory */
     }
     const entry = wmMemoryOperationStore.get(operationId);
     if (!entry) return null;
@@ -47376,9 +47373,33 @@ function wmTreasuryReady() {
 }
 
 /* --------------------------------------------------------------------------
+ * Human-readable names for every asset in ASSET_NETWORK_MAP.
+ * ASSET_NETWORK_MAP itself only carries chain metadata, not display names,
+ * so this table is the single source of truth for the /assets endpoints.
+ * ------------------------------------------------------------------------ */
+const WM_ASSET_NAMES = {
+    BTC:  'Bitcoin',
+    ETH:  'Ethereum',
+    USDT: 'Tether USD',
+    USDC: 'USD Coin',
+    BNB:  'BNB',
+    SOL:  'Solana',
+    XRP:  'XRP',
+    TRX:  'TRON',
+    DOGE: 'Dogecoin',
+    LTC:  'Litecoin',
+    ADA:  'Cardano',
+    SHIB: 'Shiba Inu',
+    LINK: 'Chainlink',
+    MATIC:'Polygon',
+    AVAX: 'Avalanche',
+    DOT:  'Polkadot'
+};
+
+/* --------------------------------------------------------------------------
  * Asset metadata builder — used by /assets and /assets/metadata.
  * Single source of truth: ASSET_NETWORK_MAP + platformWallet token config +
- * getCryptoLogo(asset).
+ * getCryptoLogo(asset) + WM_ASSET_NAMES.
  * ------------------------------------------------------------------------ */
 function wmBuildAssetMetadata() {
     const registry = {};
@@ -47388,13 +47409,14 @@ function wmBuildAssetMetadata() {
 
         registry[assetUpper] = {
             symbol: assetUpper,
-            name: entry.name || assetUpper,
+            name: WM_ASSET_NAMES[assetUpper] || assetUpper,
             network: entry.network,
             chainId: entry.chainId,
             type: entry.type,
-            decimals: tokenCfg ? (tokenCfg.decimals ?? 18)
-                     : (platformWallet.networkProviders[assetUpper] &&
-                        platformWallet.networkProviders[assetUpper].decimals) || 18,
+            decimals: tokenCfg
+                ? (tokenCfg.decimals ?? 18)
+                : (platformWallet.networkProviders[assetUpper] &&
+                   platformWallet.networkProviders[assetUpper].decimals) || 18,
             contract: tokenCfg ? tokenCfg.contract : (entry.contract || null),
             isERC20: !!(tokenCfg && tokenCfg.contract),
             logoUrl: getCryptoLogo(assetUpper),
@@ -47449,7 +47471,7 @@ walletManagementRouter.get('/assets/metadata', async (req, res) => {
     try {
         const registry = wmBuildAssetMetadata();
 
-        // Optional short-lived cache to avoid re-deriving on every poll.
+        // Short-lived cache to avoid re-deriving on every poll.
         try {
             if (redis && typeof redis.setex === 'function') {
                 await redis.setex(
@@ -47478,8 +47500,12 @@ walletManagementRouter.get('/assets/metadata', async (req, res) => {
 
 /* ==========================================================================
  * GET /api/admin/wallet-management/treasury
- * Lists derived treasury wallets with live on-chain balances.
+ * Lists derived treasury wallets with LIVE on-chain balances.
  * Query: page, limit, network, asset, status
+ *
+ * The critical fix: after deriving the treasury address for each asset,
+ * we hit the blockchain via wmFetchOnChainBalance() and price via wmUsdPrice().
+ * Without this, every row renders as "Unavailable".
  * ========================================================================== */
 walletManagementRouter.get('/treasury', async (req, res) => {
     try {
@@ -47506,14 +47532,25 @@ walletManagementRouter.get('/treasury', async (req, res) => {
         }
 
         const rows = [];
+        const allNetworks = new Set();
+        const allAssets = new Set();
+
         for (const assetUpper of assetsToCheck) {
             const entry = ASSET_NETWORK_MAP[assetUpper];
+            allNetworks.add(entry.network);
+            allAssets.add(assetUpper);
+
             let address = null;
             let derivationPath = null;
             let status = 'missing';
             let hasAddress = false;
-            let balanceState = { spendableBalance: '0', confirmedBalance: '0',
-                                 unconfirmedBalance: '0', ok: false };
+            let balanceState = {
+                spendableBalance: '0',
+                confirmedBalance: '0',
+                unconfirmedBalance: '0',
+                ok: false,
+                error: null
+            };
             let usdValue = 0;
             let activity = { lastActivityAt: null };
 
@@ -47531,14 +47568,20 @@ walletManagementRouter.get('/treasury', async (req, res) => {
                 }
             }
 
+            // ---------- LIVE ON-CHAIN BALANCE + USD VALUE ----------
             if (hasAddress) {
                 balanceState = await wmFetchOnChainBalance(assetUpper, address);
                 const price = await wmUsdPrice(assetUpper);
-                usdValue = wmToNumber(balanceState.spendableBalance) * price;
-                activity = await wmFetchLastActivity(assetUpper, address);
+                usdValue = wmToNumber(balanceState.spendableBalance) * (price || 0);
+                try {
+                    activity = await wmFetchLastActivity(assetUpper, address);
+                } catch (_) {
+                    activity = { lastActivityAt: null };
+                }
             }
+            // ---------- END LIVE FETCH ----------
 
-            // Apply status filter post-derivation
+            // Apply status filter post-derivation.
             if (statusFilter && status !== statusFilter) continue;
 
             rows.push({
@@ -47550,7 +47593,7 @@ walletManagementRouter.get('/treasury', async (req, res) => {
                 derivationPath,
                 status,
                 hasAddress,
-                balanceError: balanceState.ok ? null : balanceState.error || null,
+                balanceError: balanceState.ok ? null : (balanceState.error || null),
                 spendableBalance: balanceState.spendableBalance,
                 confirmedBalance: balanceState.confirmedBalance,
                 unconfirmedBalance: balanceState.unconfirmedBalance,
@@ -47570,7 +47613,10 @@ walletManagementRouter.get('/treasury', async (req, res) => {
                 wallets: paged,
                 totalPages,
                 totalItems,
-                currentPage: page
+                currentPage: page,
+                // Sent so the frontend can populate its filter dropdowns.
+                networks: Array.from(allNetworks).sort(),
+                assets: Array.from(allAssets).sort()
             }
         });
     } catch (err) {
@@ -47711,7 +47757,7 @@ walletManagementRouter.post('/treasury/generate', async (req, res) => {
 
 /* ==========================================================================
  * GET /api/admin/wallet-management/sweep/addresses
- * Lists user deposit addresses that currently hold a spendable balance,
+ * Lists user deposit addresses that currently hold a LIVE spendable balance,
  * paired with the treasury destination for that asset.
  * Query: page, limit, network, asset, minBalance
  * ========================================================================== */
@@ -47746,7 +47792,7 @@ walletManagementRouter.get('/sweep/addresses', async (req, res) => {
             if (networkFilter && entry.network !== networkFilter) continue;
             if (assetFilter && assetUpper !== assetFilter) continue;
 
-            // Get treasury destination (memoized).
+            // Get treasury destination (memoized per asset).
             let treasuryAddress = null;
             if (treasuryReady) {
                 if (treasuryByAsset[assetUpper] === undefined) {
@@ -47760,16 +47806,16 @@ walletManagementRouter.get('/sweep/addresses', async (req, res) => {
                 treasuryAddress = treasuryByAsset[assetUpper];
             }
 
-            // Live on-chain balance.
+            // LIVE on-chain balance.
             const balanceState = await wmFetchOnChainBalance(assetUpper, addr.address);
-            const spendable = wmToNumber(balanceState.spendableBalance);
-
             if (!balanceState.ok) continue;
+
+            const spendable = wmToNumber(balanceState.spendableBalance);
             if (spendable <= 0) continue;
             if (minBalance > 0 && spendable < minBalance) continue;
 
             const price = await wmUsdPrice(assetUpper);
-            const usdValue = spendable * price;
+            const usdValue = spendable * (price || 0);
 
             const u = addr.userId || {};
             const userName = `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown';
@@ -47825,11 +47871,10 @@ walletManagementRouter.get('/sweep/addresses', async (req, res) => {
  * run the full prepare → approve → sign → broadcast pipeline for that one
  * address. Returns { ok, txHash, error }.
  *
- * NOTE: The actual prepare/approve/sign/broadcast primitives live in the
- * /transactions/* endpoints (next batch). To keep this file self-contained
- * while those are still being wired, we define a small internal orchestrator
- * here that calls the same underlying helpers. When the /transactions/*
- * endpoints land, this function can be refactored to delegate to them.
+ * The actual prepare/approve/sign/broadcast primitives live in the
+ * /transactions/* endpoints. Here we register the operation into the shared
+ * in-process store with status 'queued_for_broadcast' so those endpoints can
+ * pick it up.
  * ------------------------------------------------------------------------ */
 async function wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, adminId }) {
     const entry = ASSET_NETWORK_MAP[assetUpper];
@@ -47842,8 +47887,6 @@ async function wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, admin
     const balanceNum = wmToNumber(live.spendableBalance);
     if (balanceNum <= 0) return { ok: false, error: 'Nothing to sweep' };
 
-    // Prepare the operation record. The signing/broadcast primitives will
-    // consume this record when the /transactions/* batch is installed.
     const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
 
     const operation = {
@@ -47864,9 +47907,6 @@ async function wmExecuteSingleSweep({ wallet, assetUpper, treasuryAddress, admin
     };
 
     await wmStoreOperation(operationId, operation);
-
-    // The /transactions/:id/approve|sign|broadcast endpoints will move this
-    // record through the lifecycle. Here we mark it as queued for that flow.
     await wmUpdateOperation(operationId, { status: 'queued_for_broadcast' });
 
     return {
@@ -48144,6 +48184,10 @@ walletManagementRouter.post('/sweep/selected', async (req, res) => {
  *   walletId, networkId, asset, amount, destinationAddress
  * }
  * Returns a fee preview without touching the operation store.
+ *
+ * Delegates to wmEstimateFeeForOperation() which is defined in the
+ * transactions batch (shared helper). That helper re-checks chain ID,
+ * reads live gas price, and returns a fully-populated fee object.
  * ========================================================================== */
 walletManagementRouter.post('/fees/estimate', async (req, res) => {
     try {
@@ -48176,183 +48220,53 @@ walletManagementRouter.post('/fees/estimate', async (req, res) => {
         const amountStr = String(amount || '0');
         const amountNum = wmToNumber(amountStr);
 
-        const feeResult = {
-            gasFee: '0',
-            estimatedFee: '0',
-            feeAsset: assetUpper,
-            feeCurrency: assetUpper,
-            feeUsd: 0,
-            netAmount: amountStr,
-            netUsd: 0,
-            feeUnavailable: false,
-            error: null
-        };
-
-        const rpcUrl = RPC_PROVIDERS[effectiveNetwork];
-
-        try {
-            /* ---------------------------------------------------------- EVM */
-            if (entry.type === 'evm') {
-                if (!rpcUrl) throw new Error(`No RPC configured for ${effectiveNetwork}`);
-                const provider = new ethers.JsonRpcProvider(rpcUrl);
-
-                // Read source address if a walletId was provided.
-                let fromAddress = null;
-                if (walletId && mongoose.Types.ObjectId.isValid(walletId)) {
-                    const wallet = await DepositAddress.findById(walletId).lean();
-                    if (wallet) fromAddress = wallet.address;
-                }
-
-                const feeData = await Promise.race([
-                    provider.getFeeData(),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                ]);
-
-                // Gas limit — 21000 for native, estimateGas for tokens.
-                let gasLimit = 21000n;
-                const tokenCfg = wmTokenConfig(assetUpper);
-
-                if (tokenCfg && tokenCfg.contract && fromAddress && destinationAddress) {
-                    try {
-                        const erc20Abi = [
-                            'function transfer(address to, uint256 amount) returns (bool)',
-                            'function decimals() view returns (uint8)'
-                        ];
-                        const contract = new ethers.Contract(tokenCfg.contract, erc20Abi, provider);
-                        const decimals = tokenCfg.decimals ?? 18;
-                        const rawAmount = ethers.parseUnits(amountStr, decimals);
-                        const est = await Promise.race([
-                            contract.transfer.estimateGas(destinationAddress, rawAmount, { from: fromAddress }),
-                            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                        ]);
-                        gasLimit = est;
-                    } catch (_) {
-                        // Fallback: standard ERC-20 transfer size.
-                        gasLimit = 65000n;
-                    }
-                }
-
-                const gasPriceWei = feeData.maxFeePerGas || feeData.gasPrice || 0n;
-                const totalWei = gasLimit * gasPriceWei;
-                const feeEth = ethers.formatEther(totalWei);
-
-                // Fee is denominated in the network's native asset.
-                const nativeAsset = effectiveNetwork === 'BSC' ? 'BNB'
-                                  : effectiveNetwork === 'POLYGON' ? 'MATIC'
-                                  : effectiveNetwork === 'AVALANCHE' ? 'AVAX'
-                                  : 'ETH';
-
-                const nativeUsdPrice = await wmUsdPrice(nativeAsset);
-                const feeUsd = wmToNumber(feeEth) * nativeUsdPrice;
-
-                feeResult.gasFee = feeEth;
-                feeResult.estimatedFee = feeEth;
-                feeResult.feeAsset = nativeAsset;
-                feeResult.feeCurrency = nativeAsset;
-                feeResult.feeUsd = Number(feeUsd.toFixed(2));
-                feeResult.netAmount = amountStr;
-                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
-            }
-
-            /* --------------------------------------------------------- UTXO */
-            else if (entry.type === 'utxo') {
-                // Conservative static estimate: 250 vB at a per-byte rate.
-                const lower = assetUpper.toLowerCase();
-                const explorerBase = {
-                    btc: 'https://api.blockchair.com/bitcoin',
-                    doge: 'https://api.blockchair.com/dogecoin',
-                    ltc: 'https://api.blockchair.com/litecoin'
-                }[lower];
-
-                let feePerByte = null;
-                if (explorerBase) {
-                    try {
-                        const stats = await axios.get(
-                            `${explorerBase}/stats`,
-                            { timeout: WM_RPC_TIMEOUT_MS }
-                        );
-                        const s = stats.data && stats.data.data;
-                        if (s && s.suggested_transaction_fee_per_byte_sat) {
-                            feePerByte = Number(s.suggested_transaction_fee_per_byte_sat);
-                        }
-                    } catch (_) { /* fall through */ }
-                }
-                if (!feePerByte) feePerByte = lower === 'btc' ? 20 : 1000; // sats/vB
-
-                const estimatedSizeVb = 250;
-                const feeSats = feePerByte * estimatedSizeVb;
-                const feeCoin = feeSats / 1e8;
-
-                const usdPrice = await wmUsdPrice(assetUpper);
-                const feeUsd = feeCoin * usdPrice;
-
-                feeResult.gasFee = feeCoin.toFixed(8);
-                feeResult.estimatedFee = feeCoin.toFixed(8);
-                feeResult.feeAsset = assetUpper;
-                feeResult.feeCurrency = assetUpper;
-                feeResult.feeUsd = Number(feeUsd.toFixed(2));
-                feeResult.netAmount = Math.max(0, amountNum - feeCoin).toFixed(8);
-                feeResult.netUsd = Number((amountNum - feeCoin) * usdPrice).toFixed(2);
-            }
-
-            /* ------------------------------------------------------- Solana */
-            else if (entry.type === 'solana') {
-                // Solana base fee: 5000 lamports per signature.
-                const baseLamports = 5000n;
-                const feeSol = wmFormatUnits(baseLamports, 9);
-                const usdPrice = await wmUsdPrice('SOL');
-                const feeUsd = wmToNumber(feeSol) * usdPrice;
-
-                feeResult.gasFee = feeSol;
-                feeResult.estimatedFee = feeSol;
-                feeResult.feeAsset = 'SOL';
-                feeResult.feeCurrency = 'SOL';
-                feeResult.feeUsd = Number(feeUsd.toFixed(4));
-                feeResult.netAmount = amountStr;
-                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
-            }
-
-            /* --------------------------------------------------------- XRP */
-            else if (entry.type === 'xrp') {
-                const drops = 10n; // base network fee
-                const feeXrp = wmFormatUnits(drops, 6);
-                const usdPrice = await wmUsdPrice('XRP');
-                const feeUsd = wmToNumber(feeXrp) * usdPrice;
-
-                feeResult.gasFee = feeXrp;
-                feeResult.estimatedFee = feeXrp;
-                feeResult.feeAsset = 'XRP';
-                feeResult.feeCurrency = 'XRP';
-                feeResult.feeUsd = Number(feeUsd.toFixed(6));
-                feeResult.netAmount = amountStr;
-                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
-            }
-
-            /* -------------------------------------------------------- TRON */
-            else if (entry.type === 'tron') {
-                // TRON bandwidth/energy: use a conservative default in TRX.
-                const feeTrx = 1.0; // ~1 TRX for a TRC-20 transfer
-                const usdPrice = await wmUsdPrice('TRX');
-                const feeUsd = feeTrx * usdPrice;
-
-                feeResult.gasFee = feeTrx.toFixed(6);
-                feeResult.estimatedFee = feeTrx.toFixed(6);
-                feeResult.feeAsset = 'TRX';
-                feeResult.feeCurrency = 'TRX';
-                feeResult.feeUsd = Number(feeUsd.toFixed(4));
-                feeResult.netAmount = amountStr;
-                feeResult.netUsd = Number((amountNum - feeUsd).toFixed(2));
-            }
-
-            /* --------------------------------------------------- Unsupported */
-            else {
-                feeResult.feeUnavailable = true;
-                feeResult.error = `Fee estimation not implemented for chain type: ${entry.type}`;
-            }
-        } catch (feeErr) {
-            feeResult.feeUnavailable = true;
-            feeResult.error = feeErr.message || 'Fee estimation failed';
+        // Resolve from address from the wallet record if provided.
+        let fromAddress = null;
+        if (walletId && mongoose.Types.ObjectId.isValid(walletId)) {
+            const wallet = await DepositAddress.findById(walletId).lean();
+            if (wallet) fromAddress = wallet.address;
         }
+
+        // Delegate to the shared live-fee helper.
+        let feeEstimate;
+        try {
+            feeEstimate = await wmEstimateFeeForOperation({
+                assetUpper,
+                networkId: effectiveNetwork,
+                fromAddress,
+                toAddress: destinationAddress,
+                amountStr,
+                memo: ''
+            });
+        } catch (feeErr) {
+            return res.status(200).json({
+                status: 'success',
+                data: {
+                    operationType,
+                    walletId: walletId || null,
+                    networkId: effectiveNetwork,
+                    asset: assetUpper,
+                    amount: amountStr,
+                    destinationAddress: destinationAddress || null,
+                    gasFee: '0',
+                    estimatedFee: '0',
+                    feeAsset: assetUpper,
+                    feeCurrency: assetUpper,
+                    feeUsd: 0,
+                    netAmount: amountStr,
+                    netUsd: 0,
+                    feeUnavailable: true,
+                    error: feeErr.message || 'Fee estimation failed'
+                }
+            });
+        }
+
+        const feeNum = Number(feeEstimate.feeNative) || 0;
+        const feeUsd = Number(feeEstimate.feeUsd) || 0;
+        const netAmount =
+            (feeEstimate.chainType === 'utxo' || feeEstimate.chainType === 'cardano')
+                ? Math.max(0, amountNum - feeNum)
+                : amountNum;
 
         return res.status(200).json({
             status: 'success',
@@ -48363,7 +48277,16 @@ walletManagementRouter.post('/fees/estimate', async (req, res) => {
                 asset: assetUpper,
                 amount: amountStr,
                 destinationAddress: destinationAddress || null,
-                ...feeResult
+                gasFee: feeEstimate.feeNative,
+                estimatedFee: feeEstimate.feeNative,
+                feeAsset: feeEstimate.feeAsset,
+                feeCurrency: feeEstimate.feeCurrency || feeEstimate.feeAsset,
+                feeUsd,
+                netAmount: String(netAmount.toFixed(8)),
+                netUsd: Number((netAmount * ((feeUsd && amountNum) ? (feeUsd / amountNum) : 0)).toFixed(2)),
+                feeUnavailable: false,
+                error: null,
+                meta: feeEstimate.meta || {}
             }
         });
     } catch (err) {
@@ -48385,11 +48308,6 @@ console.log('   - POST /sweep/selected');
 console.log('   - GET  /assets');
 console.log('   - GET  /assets/metadata');
 console.log('   - POST /fees/estimate');
-
-
-
-
-
 
 
 
