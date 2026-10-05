@@ -32553,7 +32553,573 @@ app.get('/api/admin/deposits/:id', adminProtect, restrictTo('super', 'finance'),
 
 
 
+/* ============================================================================
+ * PENDING DEPOSIT NOTIFICATION EMAILS
+ * ----------------------------------------------------------------------------
+ * Dispatched the first time a pending deposit's on-chain transaction is
+ * observed. Idempotent per-txHash via Redis. Errors are swallowed and logged
+ * so a broken SMTP relay never breaks the admin list endpoint.
+ * ========================================================================== */
 
+const PENDING_NOTIFY_TTL = 60 * 60 * 24 * 30;   // 30 days
+const PENDING_NOTIFY_PREFIX = 'pending-notified:';
+
+async function wasPendingNotified(txHash) {
+    if (!txHash) return false;
+    try {
+        if (!redis || typeof redis.get !== 'function') return false;
+        const v = await redis.get(`${PENDING_NOTIFY_PREFIX}${txHash}`);
+        return v === '1';
+    } catch (_) {
+        return false;
+    }
+}
+
+async function markPendingNotified(txHash) {
+    if (!txHash) return;
+    try {
+        if (!redis || typeof redis.setex !== 'function') return;
+        await redis.setex(`${PENDING_NOTIFY_PREFIX}${txHash}`, PENDING_NOTIFY_TTL, '1');
+    } catch (_) { /* silent */ }
+}
+
+/* ---- User-facing "incoming transaction detected" email ------------------- */
+async function sendPendingDepositUserEmail({
+    user,
+    assetUpper,
+    assetAmount,
+    usdValue,
+    exchangeRate,
+    txHash,
+    depositAddress,
+    networkName,
+    explorerUrl,
+    confirmations,
+    requiredConfirmations,
+    reference,
+    createdAt
+}) {
+    if (!user || !user.email) return;
+
+    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+    const formattedAmount = assetAmount.toLocaleString(undefined, {
+        minimumFractionDigits: 8, maximumFractionDigits: 8
+    });
+    const formattedUsd = usdValue.toLocaleString(undefined, {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    const formattedRate = exchangeRate.toLocaleString(undefined, {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    const submittedAt = new Date(createdAt || Date.now()).toLocaleString('en-US', {
+        year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        timeZoneName: 'short'
+    });
+
+    const html = `
+        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+            <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+            </div>
+
+            <div style="padding: 30px; background: #FFFFFF;">
+                <div style="background: #FEF3C7; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <circle cx="12" cy="12" r="10" stroke="#F7A600" stroke-width="2"/>
+                            <path d="M12 8V12M12 16H12.01" stroke="#F7A600" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </div>
+                    <h2 style="color: #F7A600; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">INCOMING TRANSACTION DETECTED</h2>
+                    <p style="color: #92400E; font-size: 13px; margin: 0;">Your deposit is being confirmed on the blockchain</p>
+                </div>
+
+                <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName || 'Valued Customer'}</strong>,</p>
+                <p style="color: #333333; line-height: 1.6;">We have detected an incoming <strong>${assetUpper}</strong> deposit to your account. It is currently awaiting the required number of network confirmations.</p>
+
+                <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <div>
+                            <div style="font-weight: bold; font-size: 18px;">${formattedAmount} ${assetUpper}</div>
+                            <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsd} USD</div>
+                        </div>
+                    </div>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedRate}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${networkName}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Deposit Address:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace; font-size: 11px;">${reference || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Confirmations:</strong></td><td style="padding: 8px 0; text-align: right;">${confirmations} / ${requiredConfirmations}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">Pending Verification</span></td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Detected At:</strong></td><td style="padding: 8px 0; text-align: right;">${submittedAt}</td></tr>
+                    </table>
+                </div>
+
+                <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ What Happens Next?</p>
+                    <p style="color: #78350F; margin: 0; font-size: 14px;">Your deposit will be credited to your Main Wallet once it reaches the required number of confirmations and is approved by our team. This typically takes a few minutes.</p>
+                </div>
+
+                ${explorerUrl ? `
+                <div style="text-align: center; margin: 20px 0;">
+                    <a href="${explorerUrl}" target="_blank" style="color: #F7A600; font-size: 13px; text-decoration: none;">🔍 View on Blockchain Explorer</a>
+                </div>` : ''}
+
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Track Your Deposit</a>
+                </div>
+
+                <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${new Date().toLocaleString()}</p>
+            </div>
+
+            <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+                    <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
+                    <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
+                </p>
+            </div>
+        </div>
+    `;
+
+    try {
+        await infoTransporter.sendMail({
+            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+            to: user.email,
+            subject: `💰 Incoming ${assetUpper} Deposit Detected — ₿itHash Capital`,
+            html
+        });
+        console.log(`[pending-deposit] user email sent to ${user.email} for tx ${txHash}`);
+    } catch (err) {
+        console.error('[pending-deposit] user email failed:', err.message);
+    }
+}
+
+/* ---- Admin-facing "incoming transaction detected" email ------------------ */
+async function sendPendingDepositAdminEmail({
+    user,
+    assetUpper,
+    assetAmount,
+    usdValue,
+    exchangeRate,
+    txHash,
+    depositAddress,
+    walletAddress,
+    networkName,
+    explorerUrl,
+    confirmations,
+    requiredConfirmations,
+    reference,
+    createdAt,
+    requestIp
+}) {
+    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+    const formattedAmount = assetAmount.toLocaleString(undefined, {
+        minimumFractionDigits: 8, maximumFractionDigits: 8
+    });
+    const formattedUsd = usdValue.toLocaleString(undefined, {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    const formattedRate = exchangeRate.toLocaleString(undefined, {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    const submittedAt = new Date(createdAt || Date.now()).toLocaleString('en-US', {
+        year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        timeZoneName: 'short'
+    });
+
+    const html = `
+        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+            <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+            </div>
+
+            <div style="padding: 30px; background: #FFFFFF;">
+                <div style="background: #EFF6FF; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z" stroke="#3B82F6" stroke-width="2" fill="none"/>
+                            <circle cx="12" cy="9" r="2.5" stroke="#3B82F6" stroke-width="2" fill="none"/>
+                        </svg>
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                    </div>
+                    <h2 style="color: #3B82F6; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">INCOMING TRANSACTION DETECTED</h2>
+                    <p style="color: #1E40AF; font-size: 13px; margin: 0;">${user.firstName || ''} ${user.lastName || ''} — pending on-chain confirmation</p>
+                </div>
+
+                <p style="color: #333333; line-height: 1.6;">A pending deposit has been observed on-chain. No admin action is required yet — this is an informational alert. You will receive a separate email when the deposit is ready for approval.</p>
+
+                <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                        <div>
+                            <div style="font-weight: bold; font-size: 18px;">${formattedAmount} ${assetUpper}</div>
+                            <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsd} USD</div>
+                        </div>
+                    </div>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>User:</strong></td><td style="padding: 8px 0; text-align: right;">${user.firstName || ''} ${user.lastName || ''} (${user.email || '—'})</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedRate}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${networkName}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Deposit Address:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sender Wallet:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${walletAddress || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace; font-size: 11px;">${reference || '—'}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Confirmations:</strong></td><td style="padding: 8px 0; text-align: right;">${confirmations} / ${requiredConfirmations}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Detected At:</strong></td><td style="padding: 8px 0; text-align: right;">${submittedAt}</td></tr>
+                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Request IP:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace;">${requestIp || '—'}</td></tr>
+                    </table>
+                </div>
+
+                ${explorerUrl ? `
+                <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Verify on chain</p>
+                    <p style="color: #78350F; margin: 0; font-size: 14px;">Confirm the transaction on the blockchain explorer before approving.</p>
+                    <p style="color: #78350F; margin: 5px 0 0; font-size: 13px;">🔍 <a href="${explorerUrl}" target="_blank" style="color: #F7A600;">View on Blockchain Explorer</a></p>
+                </div>` : ''}
+
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="https://www.bithashcapital.live/admin/deposits/pending" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Review Pending Deposits</a>
+                </div>
+
+                <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${new Date().toLocaleString()}</p>
+            </div>
+
+            <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+            </div>
+        </div>
+    `;
+
+    try {
+        await supportTransporter.sendMail({
+            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
+            to: 'thieretw@gmail.com',
+            subject: `⏳ Pending Deposit Detected: ${user.firstName || ''} ${user.lastName || ''} +${formattedAmount} ${assetUpper}`,
+            html
+        });
+        console.log(`[pending-deposit] admin email sent for tx ${txHash}`);
+    } catch (err) {
+        console.error('[pending-deposit] admin email failed:', err.message);
+    }
+}
+
+/* ---- Fire-and-forget dispatcher ------------------------------------------- */
+async function notifyPendingDeposit({ row, user, deposit }) {
+    const txHash = row.txHash;
+    if (!txHash) return;
+
+    // Idempotency: one email pair per txHash, ever.
+    if (await wasPendingNotified(txHash)) return;
+
+    // Claim the notification slot BEFORE sending, so a race can't double-send.
+    await markPendingNotified(txHash);
+
+    const userPayload = {
+        _id: user?._id || null,
+        firstName: user?.firstName || 'Valued Customer',
+        lastName: user?.lastName || '',
+        email: user?.email || null
+    };
+
+    // Fire both emails in parallel; each is independently error-handled.
+    await Promise.allSettled([
+        sendPendingDepositUserEmail({
+            user: userPayload,
+            assetUpper: row.assetSymbol,
+            assetAmount: row.assetAmount,
+            usdValue: row.amount,
+            exchangeRate: row.exchangeRate,
+            txHash,
+            depositAddress: row.metadata.depositAddress,
+            networkName: row.network,
+            explorerUrl: row.explorerUrl,
+            confirmations: row.onChain?.confirmations ?? row.confirmations ?? 0,
+            requiredConfirmations: row.requiredConfirmations,
+            reference: row.reference,
+            createdAt: row.createdAt
+        }),
+        sendPendingDepositAdminEmail({
+            user: userPayload,
+            assetUpper: row.assetSymbol,
+            assetAmount: row.assetAmount,
+            usdValue: row.amount,
+            exchangeRate: row.exchangeRate,
+            txHash,
+            depositAddress: row.metadata.depositAddress,
+            walletAddress: row.metadata.walletAddress,
+            networkName: row.network,
+            explorerUrl: row.explorerUrl,
+            confirmations: row.onChain?.confirmations ?? row.confirmations ?? 0,
+            requiredConfirmations: row.requiredConfirmations,
+            reference: row.reference,
+            createdAt: row.createdAt,
+            requestIp: row.metadata.requestIp
+        })
+    ]);
+
+    // Audit
+    try {
+        await SystemLog.create({
+            action: 'pending_deposit_notified',
+            entity: 'Transaction',
+            entityId: deposit._id,
+            performedBy: null,
+            performedByModel: 'System',
+            status: 'success',
+            ip: 'system',
+            userAgent: 'pending-deposit-list',
+            metadata: {
+                txHash,
+                asset: row.assetSymbol,
+                amount: row.assetAmount,
+                usdValue: row.amount,
+                userId: userPayload._id,
+                userEmail: userPayload.email,
+                explorerUrl: row.explorerUrl
+            }
+        });
+    } catch (_) { /* audit failure must not throw */ }
+}
+
+/* ============================================================================
+ * GET /api/admin/deposits/pending
+ * ----------------------------------------------------------------------------
+ * Lists every pending deposit, fully enriched with live on-chain data,
+ * the server-side asset logo, and full user/admin context.
+ *
+ * On every request:
+ *   1. Pulls the pending page from MongoDB.
+ *   2. Enriches each row in parallel with a fresh on-chain read (60s cache
+ *      is bypassed so the admin sees the current confirmation count).
+ *   3. For each pending deposit that has a valid on-chain txHash, dispatches
+ *      a one-time pair of "incoming transaction detected" emails:
+ *        - one to the user
+ *        - one to the admin (thieretw@gmail.com)
+ *      Idempotency is enforced via Redis (`pending-notified:<txHash>`).
+ *
+ * Query params:
+ *   page, limit     — pagination
+ *   asset           — filter by asset symbol
+ *   network         — filter by network key
+ *   search          — substring on txHash / reference / user email / address
+ *   from, to        — ISO date range on createdAt
+ *   notify          — "false" to disable email dispatch (useful for polling)
+ * ========================================================================== */
+app.get('/api/admin/deposits/pending', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    const startedAt = Date.now();
+
+    try {
+        /* ------------------------------------------------------------------
+         * 1. PARSE QUERY
+         * ---------------------------------------------------------------- */
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+        const skip  = (page - 1) * limit;
+
+        const assetFilter   = req.query.asset   ? String(req.query.asset).toUpperCase() : null;
+        const networkFilter = req.query.network ? String(req.query.network) : null;
+        const search        = req.query.search  ? String(req.query.search).trim() : '';
+        const fromDate      = req.query.from    ? new Date(req.query.from) : null;
+        const toDate        = req.query.to      ? new Date(req.query.to)   : null;
+
+        // Notification dispatch is ON by default. Pass ?notify=false to disable
+        // (e.g. when the admin UI is auto-polling every few seconds).
+        const shouldNotify = req.query.notify !== 'false';
+
+        /* ------------------------------------------------------------------
+         * 2. BUILD MONGO QUERY
+         * ---------------------------------------------------------------- */
+        const query = {
+            type: 'deposit',
+            status: 'pending'
+        };
+
+        if (assetFilter) {
+            query.asset = assetFilter.toLowerCase();
+        }
+
+        if (fromDate || toDate) {
+            query.createdAt = {};
+            if (fromDate) query.createdAt.$gte = fromDate;
+            if (toDate)   query.createdAt.$lte = toDate;
+        }
+
+        if (search) {
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query.$or = [
+                { reference: { $regex: escaped, $options: 'i' } },
+                { 'details.txHash': { $regex: escaped, $options: 'i' } },
+                { 'details.depositAddress': { $regex: escaped, $options: 'i' } },
+                { 'details.walletAddress': { $regex: escaped, $options: 'i' } }
+            ];
+        }
+
+        /* ------------------------------------------------------------------
+         * 3. FETCH PAGE
+         * ---------------------------------------------------------------- */
+        const [deposits, totalCount] = await Promise.all([
+            Transaction.find(query)
+                .populate('user', 'firstName lastName email status accountType')
+                .populate('processedBy', 'name email role')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            Transaction.countDocuments(query)
+        ]);
+
+        /* ------------------------------------------------------------------
+         * 4. NETWORK FILTER (post-query, network is derived)
+         * ---------------------------------------------------------------- */
+        const filteredByNetwork = networkFilter
+            ? deposits.filter((d) => {
+                const a = (d.asset || d.method || '').toUpperCase();
+                const entry = ASSET_NETWORK_MAP[a];
+                return entry && entry.network === networkFilter;
+            })
+            : deposits;
+
+        /* ------------------------------------------------------------------
+         * 5. ENRICH IN PARALLEL (fresh on-chain read; bypass list cache)
+         * ---------------------------------------------------------------- */
+        const enriched = await withConcurrency(
+            filteredByNetwork,
+            async (deposit) => {
+                const row = await buildAdminDepositRow(deposit, 'pending');
+
+                // Force-fresh on-chain read for pending rows so confirmations
+                // shown to the admin are accurate to the current block.
+                const assetUpper = (deposit.asset || deposit.method || '').toUpperCase();
+                const txHash = extractDepositTxHash(deposit);
+
+                if (txHash && ASSET_NETWORK_MAP[assetUpper]) {
+                    try {
+                        if (redis && typeof redis.del === 'function') {
+                            await redis.del(`admin:deposit:onchain:${assetUpper}:${txHash}`);
+                        }
+                        const fresh = await fetchDepositOnChainData(assetUpper, txHash);
+                        if (fresh && fresh.available) {
+                            row.onChain = {
+                                available: true,
+                                chainType: fresh.chainType,
+                                chainId: fresh.chainId,
+                                networkName: fresh.networkName,
+                                txHash: fresh.txHash || txHash,
+                                status: fresh.status,
+                                confirmations: fresh.confirmations,
+                                requiredConfirmations: fresh.requiredConfirmations,
+                                from: fresh.from || fresh.account || null,
+                                to: fresh.to || fresh.destination || null,
+                                amount: fresh.amount || fresh.value || fresh.totalOut || null,
+                                amountUsd: fresh.amountUsd ?? fresh.valueUsd ?? fresh.totalOutUsd ?? null,
+                                fee: fresh.fee || fresh.feeNative || null,
+                                feeAsset: fresh.feeAsset || null,
+                                feeUsd: fresh.feeUsd ?? null,
+                                blockNumber: fresh.blockNumber ?? fresh.blockId ?? fresh.slot ?? fresh.ledgerIndex ?? null,
+                                blockHash: fresh.blockHash || null,
+                                blockTimestamp:
+                                    fresh.blockTimestamp ||
+                                    fresh.time ||
+                                    fresh.blockTime ||
+                                    fresh.date ||
+                                    fresh.blockTimeStamp ||
+                                    null,
+                                gasUsed: fresh.gasUsed || null,
+                                gasPrice: fresh.gasPrice || null,
+                                effectiveGasPrice: fresh.effectiveGasPrice || null,
+                                maxFeePerGas: fresh.maxFeePerGas || null,
+                                maxPriorityFeePerGas: fresh.maxPriorityFeePerGas || null,
+                                nonce: fresh.nonce ?? null,
+                                data: fresh.data || null,
+                                methodId: fresh.methodId || null,
+                                logsCount: fresh.logsCount ?? null,
+                                logs: fresh.logs || null,
+                                erc20: fresh.erc20 || null,
+                                utxo: fresh.chainType === 'utxo'
+                                    ? {
+                                        inputCount: fresh.inputCount,
+                                        outputCount: fresh.outputCount,
+                                        inputTotal: fresh.inputTotal,
+                                        outputTotal: fresh.outputTotal,
+                                        size: fresh.size,
+                                        weight: fresh.weight,
+                                        virtualSize: fresh.virtualSize,
+                                        isCoinbase: fresh.isCoinbase,
+                                        isDoubleSpend: fresh.isDoubleSpend,
+                                        inputs: fresh.inputs,
+                                        outputs: fresh.outputs
+                                    }
+                                    : null,
+                                solana: fresh.chainType === 'solana'
+                                    ? {
+                                        slot: fresh.slot,
+                                        recentBlockhash: fresh.recentBlockhash,
+                                        signatures: fresh.signatures,
+                                        lamportDeltas: fresh.lamportDeltas,
+                                        receivedAccounts: fresh.receivedAccounts,
+                                        sentAccounts: fresh.sentAccounts,
+                                        preTokenBalances: fresh.preTokenBalances,
+                                        postTokenBalances: fresh.postTokenBalances,
+                                        innerInstructions: fresh.innerInstructions
+                                    }
+                                    : null,
+                                xrp: fresh.chainType === 'xrp'
+                                    ? {
+                                        ledgerIndex: fresh.ledgerIndex,
+                                        sequence: fresh.sequence,
+                                        destinationTag: fresh.destinationTag,
+                                        sourceTag: fresh.sourceTag,
+                                        amountDrops: fresh.amountDrops,
+                                        feeDrops: fresh.feeDrops,
+                                        resultCode: fresh.resultCode,
+                                        memos: fresh.memos
+                                    }
+                                    : null,
+                                tron: fresh.chainType === 'tron'
+                                    ? {
+                                        energyUsed: fresh.energyUsed,
+                                        energyFee: fresh.energyFee,
+                                        netUsage: fresh.netUsage,
+                                        netFee: fresh.netFee,
+                                        originEnergyUsage: fresh.originEnergyUsage,
+                                        contractRet: fresh.contractRet,
+                                        logs: fresh.logs
+                                    }
+                                    : null,
+                                raw: fresh
+                            };
+                        }
+                    } catch (freshErr) {
+                        console.warn('[admin/deposits/pending] fresh on-chain failed:', freshErr.message);
+                        // Keep whatever buildAdminDepositRow produced as fallback
+                    }
+                }
+
+                /* ---- Ready-for-approval flag (computed from fresh data) ---- */
+                const confirmations = row.onChain?.available
+                    ? Number(row.onChain.confirmations || 0)
+                    : Number(row.confirmations || 0);
+                const required = Number(
+                    row.onChain?.requiredConfirmations ||
+                    row.requiredConfirmations ||
+                    REQUIRED_CONFIRMATIONS[row.asset?.network] ||
+                    12
+                );
+
+                row.readyForApproval = confirmations >= required;
+                row
 
 
 
