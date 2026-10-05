@@ -29205,174 +29205,1323 @@ const startRealTimeWalletUpdates = (io) => {
 
 
 
-
-app.get('/api/admin/deposits/pending', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    const query = { 
-      type: 'deposit',
-      status: 'pending'
+/* ============================================================================
+ * estimateNetworkBlockTimeSeconds
+ * ----------------------------------------------------------------------------
+ * Returns the average seconds-per-block for a network, measured live from the
+ * chain where possible. Falls back to hardcoded defaults when measurement
+ * fails. Never throws.
+ * ========================================================================== */
+async function estimateNetworkBlockTimeSeconds(networkKey) {
+    const defaults = {
+        ETH: 12,
+        BSC: 3,
+        POLYGON: 2.1,
+        ARBITRUM: 0.26,
+        AVALANCHE: 2,
+        FANTOM: 1.1,
+        OPTIMISM: 2,
+        BASE: 2,
+        SOLANA: 0.4,
+        TRON: 3,
+        XRP: 4,
+        BTC: 600,
+        LTC: 150,
+        DOGE: 60,
+        ADA: 20,
+        DOT: 6
     };
 
-    const deposits = await Transaction.find(query)
-      .populate('user', 'firstName lastName email')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+    const fallback = defaults[networkKey] || 15;
 
-    const totalCount = await Transaction.countDocuments(query);
-    const totalPages = Math.ceil(totalCount / limit);
+    try {
+        /* ---- EVM chains: sample 10 block timestamps via RPC ---- */
+        const evmChainIds = {
+            ETH: 1,
+            BSC: 56,
+            POLYGON: 137,
+            ARBITRUM: 42161,
+            AVALANCHE: 43114,
+            FANTOM: 250,
+            OPTIMISM: 10,
+            BASE: 8453
+        };
 
-    const formattedDeposits = deposits.map(deposit => ({
-      _id: deposit._id,
-      user: {
-        _id: deposit.user?._id,
-        firstName: deposit.user?.firstName || 'Unknown',
-        lastName: deposit.user?.lastName || 'Unknown'
-      },
-      amount: deposit.amount,
-      method: deposit.method || deposit.asset || 'crypto',
-      createdAt: deposit.createdAt,
-      proof: deposit.details?.proofUrl || deposit.details?.txHash || null,
-      status: deposit.status
-    }));
+        if (evmChainIds[networkKey]) {
+            const chainId = evmChainIds[networkKey];
+            const rpcUrl = RPC_PROVIDERS[networkKey];
+            if (!rpcUrl) return fallback;
 
-    res.status(200).json({
-      status: 'success',
-      data: {
-        deposits: formattedDeposits,
-        totalCount: totalCount,
-        totalPages: totalPages,
-        currentPage: page
-      }
+            const provider = wmGetEvmProvider(chainId, rpcUrl);
+            const latest = await provider.getBlockNumber();
+            const SAMPLE = 10;
+            const blockNumbers = [];
+            for (let i = 0; i < SAMPLE; i++) {
+                if (latest - i < 0) break;
+                blockNumbers.push(latest - i);
+            }
+            if (blockNumbers.length < 2) return fallback;
+
+            const blocks = await Promise.all(
+                blockNumbers.map((bn) =>
+                    provider.getBlock(bn).catch(() => null)
+                )
+            );
+
+            const timestamps = blocks
+                .filter((b) => b && b.timestamp)
+                .map((b) => b.timestamp)
+                .sort((a, b) => a - b);
+
+            if (timestamps.length < 2) return fallback;
+
+            const first = timestamps[0];
+            const last = timestamps[timestamps.length - 1];
+            const span = last - first;
+            const intervals = timestamps.length - 1;
+
+            if (span <= 0 || intervals <= 0) return fallback;
+
+            const avg = span / intervals;
+            if (!Number.isFinite(avg) || avg <= 0) return fallback;
+
+            return Math.max(0.2, Math.min(avg, 3600));
+        }
+
+        /* ---- Bitcoin family: Blockchair blocks endpoint ---- */
+        if (networkKey === 'BTC' || networkKey === 'LTC' || networkKey === 'DOGE') {
+            const base = {
+                BTC: 'https://api.blockchair.com/bitcoin',
+                LTC: 'https://api.blockchair.com/litecoin',
+                DOGE: 'https://api.blockchair.com/dogecoin'
+            }[networkKey];
+
+            if (!base) return fallback;
+
+            const resp = await axios.get(`${base}/blocks?limit=10`, {
+                timeout: 8000
+            });
+
+            const blocks = resp.data?.data || [];
+            const times = blocks
+                .map((b) => b.time ? new Date(b.time).getTime() / 1000 : null)
+                .filter((t) => t !== null)
+                .sort((a, b) => a - b);
+
+            if (times.length < 2) return fallback;
+
+            const span = times[times.length - 1] - times[0];
+            const intervals = times.length - 1;
+            const avg = span / intervals;
+
+            if (!Number.isFinite(avg) || avg <= 0) return fallback;
+            return Math.max(0.2, Math.min(avg, 3600));
+        }
+
+        /* ---- Non-EVM: use defaults ---- */
+        return fallback;
+    } catch (err) {
+        console.warn(
+            `[estimateNetworkBlockTimeSeconds] ${networkKey} failed:`,
+            err.message
+        );
+        return fallback;
+    }
+}
+
+
+
+
+/* ============================================================================
+ * DEPOSIT ON-CHAIN ENRICHMENT HELPERS
+ * ----------------------------------------------------------------------------
+ * Every helper here is:
+ *   - safe (never throws to the caller)
+ *   - cached (short TTL, keyed by asset + txHash)
+ *   - self-describing (returns { available, error, ... } so callers can
+ *     render an "unavailable" state instead of blowing up)
+ * ========================================================================== */
+
+const DEPOSIT_ONCHAIN_CACHE_TTL = 60;              // seconds
+const DEPOSIT_ONCHAIN_CONCURRENCY  = 5;            // parallel RPC calls per page
+const DEPOSIT_ONCHAIN_RPC_TIMEOUT  = 9000;         // ms per upstream call
+
+/* ---- Redis cache wrapper -------------------------------------------------- */
+async function depositOnChainCacheGet(cacheKey) {
+    try {
+        if (!redis || typeof redis.get !== 'function') return null;
+        const raw = await redis.get(cacheKey);
+        return raw ? JSON.parse(raw) : null;
+    } catch (_) { return null; }
+}
+
+async function depositOnChainCacheSet(cacheKey, value, ttl = DEPOSIT_ONCHAIN_CACHE_TTL) {
+    try {
+        if (!redis || typeof redis.setex !== 'function') return;
+        await redis.setex(cacheKey, ttl, JSON.stringify(value));
+    } catch (_) { /* silent */ }
+}
+
+/* ---- Run an array of async workers with a concurrency cap ----------------- */
+async function withConcurrency(items, worker, concurrency = DEPOSIT_ONCHAIN_CONCURRENCY) {
+    const results = new Array(items.length);
+    let cursor = 0;
+
+    const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+        while (true) {
+            const idx = cursor++;
+            if (idx >= items.length) return;
+            try {
+                results[idx] = await worker(items[idx], idx);
+            } catch (err) {
+                results[idx] = { __error: err.message || 'worker failed' };
+            }
+        }
     });
 
-  } catch (err) {
-    console.error('Get pending deposits error:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to fetch pending deposits'
-    });
-  }
-});
+    await Promise.all(runners);
+    return results;
+}
 
+/* ---- Normalize a Transaction doc into a canonical txHash ------------------ */
+function extractDepositTxHash(deposit) {
+    return (
+        (deposit?.details && (deposit.details.txHash || deposit.details.transactionHash)) ||
+        (deposit?.metadata && deposit.metadata.txHash) ||
+        deposit?.reference ||
+        null
+    );
+}
+
+/* ---- Explorer URL builder -------------------------------------------------- */
+function buildExplorerUrl(assetUpper, txHash) {
+    if (!assetUpper || !txHash) return null;
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return null;
+
+    // entry.explorer is already a base like "https://etherscan.io/tx/"
+    if (entry.explorer) return `${entry.explorer}${txHash}`;
+
+    // Fallbacks per type
+    switch (entry.type) {
+        case 'evm':      return `${wmEvmExplorerBase(entry.chainId)}${txHash}`;
+        case 'solana':   return `https://solscan.io/tx/${txHash}`;
+        case 'xrp':      return `https://xrpscan.com/tx/${txHash}`;
+        case 'tron':     return `https://tronscan.org/#/transaction/${txHash}`;
+        case 'utxo': {
+            const lower = assetUpper.toLowerCase();
+            const base = {
+                btc:  'https://blockchair.com/bitcoin/transaction/',
+                ltc:  'https://blockchair.com/litecoin/transaction/',
+                doge: 'https://blockchair.com/dogecoin/transaction/'
+            }[lower];
+            return base ? `${base}${txHash}` : null;
+        }
+        case 'polkadot': return `https://polkadot.subscan.io/extrinsic/${txHash}`;
+        case 'cardano':  return `https://cardanoscan.io/transaction/${txHash}`;
+        default:         return null;
+    }
+}
+
+/* ============================================================================
+ * On-chain fetchers — one per chain family.
+ * Each returns a normalized object, or { available:false, error } on failure.
+ * ========================================================================== */
+
+/* ---- EVM (ETH / BSC / POLYGON / ARB / AVAX / BASE / OP / FTM) ------------- */
+async function fetchEvmOnChain(txHash, assetUpper, chainId, rpcUrl) {
+    if (!rpcUrl) return { available: false, error: 'No RPC configured' };
+
+    try {
+        const provider = wmGetEvmProvider(chainId, rpcUrl);
+
+        const [tx, receipt, network] = await Promise.all([
+            Promise.race([
+                provider.getTransaction(txHash),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+            ]),
+            Promise.race([
+                provider.getTransactionReceipt(txHash),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+            ]),
+            provider.getNetwork().catch(() => null)
+        ]);
+
+        if (!tx) return { available: false, error: 'Transaction not found on chain' };
+
+        let block = null;
+        if (receipt && receipt.blockNumber) {
+            try {
+                block = await provider.getBlock(receipt.blockNumber);
+            } catch (_) { block = null; }
+        }
+
+        const currentBlock = await provider.getBlockNumber().catch(() => null);
+        const confirmations = receipt && currentBlock
+            ? Math.max(0, currentBlock - receipt.blockNumber)
+            : 0;
+
+        const gasPriceWei = tx.gasPrice || receipt?.effectiveGasPrice || null;
+        const gasUsed = receipt?.gasUsed || null;
+        const feeWei = gasUsed && gasPriceWei ? gasUsed * gasPriceWei : null;
+
+        const nativeAsset = wmNativeAssetForChain(chainId);
+        const nativePrice = await wmUsdPrice(nativeAsset).catch(() => 0);
+
+        const valueWei = tx.value || 0n;
+        const valueNative = ethers.formatEther(valueWei);
+        const valueUsd = Number(valueNative) * (nativePrice || 0);
+
+        const feeNative = feeWei ? ethers.formatEther(feeWei) : null;
+        const feeUsd = feeNative ? Number(feeNative) * (nativePrice || 0) : 0;
+
+        /* ---- ERC-20 detection: if `tx.data` starts with transfer selector
+         *       and `to` is a known token contract, decode value & decimals.
+         * ------------------------------------------------------------------ */
+        let erc20 = null;
+        const tokenCfg = wmTokenConfig(assetUpper);
+        const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+        if (isERC20 && tx.data && tx.data !== '0x') {
+            try {
+                const iface = new ethers.Interface(WM_ERC20_ABI);
+                const parsed = iface.parseTransaction({ data: tx.data, value: tx.value });
+                if (parsed && parsed.name === 'transfer') {
+                    const rawAmount = parsed.args[1];
+                    const decimals = tokenCfg.decimals ?? 18;
+                    erc20 = {
+                        contract: tokenCfg.contract,
+                        recipient: parsed.args[0],
+                        rawValue: rawAmount.toString(),
+                        decimals,
+                        value: ethers.formatUnits(rawAmount, decimals)
+                    };
+                }
+            } catch (_) { /* not a plain transfer */ }
+        }
+
+        return {
+            available: true,
+            chainType: 'evm',
+            chainId,
+            networkName: network?.name || String(chainId),
+
+            txHash: tx.hash,
+            nonce: tx.nonce,
+            from: tx.from,
+            to: tx.to,
+            value: valueNative,
+            valueWei: valueWei.toString(),
+            valueUsd: Number(valueUsd.toFixed(2)),
+            data: tx.data,
+            dataLength: tx.data ? tx.data.length : 0,
+            methodId: tx.data && tx.data.length >= 10 ? tx.data.slice(0, 10) : null,
+            type: tx.type,
+            gasLimit: tx.gasLimit ? tx.gasLimit.toString() : null,
+            gasPrice: tx.gasPrice ? tx.gasPrice.toString() : null,
+            maxFeePerGas: tx.maxFeePerGas ? tx.maxFeePerGas.toString() : null,
+            maxPriorityFeePerGas: tx.maxPriorityFeePerGas ? tx.maxPriorityFeePerGas.toString() : null,
+
+            blockNumber: receipt?.blockNumber || null,
+            blockHash: receipt?.blockHash || null,
+            blockTimestamp: block?.timestamp
+                ? new Date(block.timestamp * 1000).toISOString()
+                : null,
+            blockMiner: block?.miner || null,
+            blockGasUsed: block?.gasUsed ? block.gasUsed.toString() : null,
+            blockGasLimit: block?.gasLimit ? block.gasLimit.toString() : null,
+            blockBaseFeePerGas: block?.baseFeePerGas ? block.baseFeePerGas.toString() : null,
+
+            status: receipt
+                ? (receipt.status === 1 ? 'success' : 'failed')
+                : 'pending',
+            confirmations,
+            requiredConfirmations:
+                REQUIRED_CONFIRMATIONS[ASSET_NETWORK_MAP[assetUpper]?.network] ||
+                REQUIRED_CONFIRMATIONS[assetUpper] || 12,
+
+            gasUsed: gasUsed ? gasUsed.toString() : null,
+            cumulativeGasUsed: receipt?.cumulativeGasUsed ? receipt.cumulativeGasUsed.toString() : null,
+            effectiveGasPrice: receipt?.effectiveGasPrice ? receipt.effectiveGasPrice.toString() : null,
+            feeNative,
+            feeUsd: Number(feeUsd.toFixed(2)),
+            feeAsset: nativeAsset,
+
+            contractAddress: receipt?.contractAddress || null,
+            logsCount: receipt?.logs ? receipt.logs.length : 0,
+            logs: (receipt?.logs || []).slice(0, 5).map((l) => ({
+                address: l.address,
+                topics: l.topics,
+                dataLength: l.data ? l.data.length : 0,
+                logIndex: l.index ?? l.logIndex
+            })),
+
+            erc20
+        };
+    } catch (err) {
+        return { available: false, error: err.message || 'EVM fetch failed' };
+    }
+}
+
+/* ---- Solana ---------------------------------------------------------------- */
+async function fetchSolanaOnChain(txHash, assetUpper, rpcUrl) {
+    if (!rpcUrl) return { available: false, error: 'No Solana RPC configured' };
+    try {
+        const connection = new Connection(rpcUrl, 'confirmed');
+        const tx = await Promise.race([
+            connection.getParsedTransaction(txHash, { maxSupportedTransactionVersion: 0 }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+        ]);
+
+        if (!tx) return { available: false, error: 'Transaction not found on chain' };
+
+        const meta = tx.meta || {};
+        const message = tx.transaction?.message || {};
+        const accountKeys = (message.accountKeys || []).map((k) =>
+            typeof k === 'string' ? k : (k.pubkey || '')
+        );
+
+        const pre = meta.preBalances || [];
+        const post = meta.postBalances || [];
+        const lamportDeltas = accountKeys.map((key, i) => ({
+            account: key,
+            pre: pre[i] ?? null,
+            post: post[i] ?? null,
+            delta: (post[i] ?? 0) - (pre[i] ?? 0)
+        }));
+
+        const received = lamportDeltas.filter((d) => d.delta > 0);
+        const sent = lamportDeltas.filter((d) => d.delta < 0);
+
+        return {
+            available: true,
+            chainType: 'solana',
+            chainId: 501,
+            networkName: 'Solana Mainnet Beta',
+
+            txHash,
+            slot: tx.slot,
+            blockTime: tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : null,
+            version: tx.version,
+
+            fee: meta.fee ? (meta.fee / 1e9).toFixed(9) : null,
+            feeLamports: meta.fee || 0,
+            feeAsset: 'SOL',
+            feeUsd: Number(((meta.fee || 0) / 1e9) * (await wmUsdPrice('SOL').catch(() => 0))).toFixed(6),
+
+            status: meta.err ? 'failed' : 'success',
+            error: meta.err || null,
+            confirmations: tx.slot ? 999999 : 0, // finalized
+            requiredConfirmations: REQUIRED_CONFIRMATIONS.SOLANA,
+
+            logMessages: meta.logMessages || [],
+            innerInstructions: meta.innerInstructions || [],
+            preTokenBalances: meta.preTokenBalances || [],
+            postTokenBalances: meta.postTokenBalances || [],
+            accountKeys,
+            lamportDeltas,
+            receivedAccounts: received,
+            sentAccounts: sent,
+            recentBlockhash: message.recentBlockhash || null,
+            signatures: tx.transaction?.signatures || []
+        };
+    } catch (err) {
+        return { available: false, error: err.message || 'Solana fetch failed' };
+    }
+}
+
+/* ---- XRP ------------------------------------------------------------------ */
+async function fetchXrpOnChain(txHash, rpcUrl) {
+    if (!rpcUrl) return { available: false, error: 'No XRP RPC configured' };
+    const client = new xrpl.Client(rpcUrl);
+    try {
+        await client.connect();
+        const resp = await Promise.race([
+            client.request({ command: 'tx', transaction: txHash, binary: false }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+        ]);
+        try { await client.disconnect(); } catch (_) {}
+
+        const tx = resp?.result;
+        if (!tx) return { available: false, error: 'Transaction not found on chain' };
+
+        const drops = typeof tx.Amount === 'string' ? Number(tx.Amount) : 0;
+        const feeDrops = Number(tx.Fee || 0);
+        const xrpPrice = await wmUsdPrice('XRP').catch(() => 0);
+
+        return {
+            available: true,
+            chainType: 'xrp',
+            chainId: 144,
+            networkName: 'XRP Ledger',
+
+            txHash: tx.hash,
+            ledgerIndex: tx.ledger_index,
+            date: tx.date ? new Date((tx.date + 946684800) * 1000).toISOString() : null,
+            type: tx.TransactionType,
+            account: tx.Account,
+            destination: tx.Destination,
+            destinationTag: tx.DestinationTag ?? null,
+            sourceTag: tx.SourceTag ?? null,
+
+            amountDrops: drops,
+            amount: (drops / 1e6).toFixed(6),
+            amountUsd: Number(((drops / 1e6) * xrpPrice).toFixed(2)),
+
+            feeDrops,
+            fee: (feeDrops / 1e6).toFixed(6),
+            feeAsset: 'XRP',
+            feeUsd: Number(((feeDrops / 1e6) * xrpPrice).toFixed(6)),
+
+            sequence: tx.Sequence,
+            signingPubKey: tx.SigningPubKey,
+            flags: tx.Flags,
+            memos: tx.Memos || [],
+
+            status: tx.meta?.TransactionResult === 'tesSUCCESS' ? 'success' : 'failed',
+            resultCode: tx.meta?.TransactionResult || 'unknown',
+            confirmations: 999999,
+            requiredConfirmations: REQUIRED_CONFIRMATIONS.XRP,
+            meta: tx.meta || null
+        };
+    } catch (err) {
+        try { await client.disconnect(); } catch (_) {}
+        return { available: false, error: err.message || 'XRP fetch failed' };
+    }
+}
+
+/* ---- TRON ----------------------------------------------------------------- */
+async function fetchTronOnChain(txHash, rpcUrl) {
+    if (!rpcUrl) return { available: false, error: 'No TRON RPC configured' };
+    try {
+        const tronWeb = new TronWeb({ fullHost: rpcUrl });
+        const info = await Promise.race([
+            tronWeb.trx.getTransactionInfo(txHash),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+        ]);
+
+        if (!info || !info.id) return { available: false, error: 'Transaction not found on chain' };
+
+        const raw = await tronWeb.trx.getTransaction(txHash).catch(() => null);
+        const contract = raw?.raw_data?.contract?.[0];
+        const param = contract?.parameter?.value || {};
+
+        const amountSun = param.amount || 0;
+        const trxPrice = await wmUsdPrice('TRX').catch(() => 0);
+
+        return {
+            available: true,
+            chainType: 'tron',
+            chainId: 195,
+            networkName: 'TRON Mainnet',
+
+            txHash: info.id,
+            blockNumber: info.blockNumber,
+            blockTimeStamp: info.blockTimeStamp
+                ? new Date(info.blockTimeStamp).toISOString()
+                : null,
+
+            from: param.owner_address || null,
+            to: param.to_address || null,
+            amountSun: amountSun,
+            amount: (amountSun / 1e6).toFixed(6),
+            amountUsd: Number(((amountSun / 1e6) * trxPrice).toFixed(2)),
+
+            fee: info.fee ? (info.fee / 1e6).toFixed(6) : null,
+            feeSun: info.fee || 0,
+            feeAsset: 'TRX',
+            feeUsd: Number(((info.fee || 0) / 1e6 * trxPrice).toFixed(6)),
+
+            energyUsed: info.receipt?.energy_usage_total || 0,
+            energyFee: info.receipt?.energy_fee || 0,
+            netUsage: info.receipt?.net_usage || 0,
+            netFee: info.receipt?.net_fee || 0,
+            originEnergyUsage: info.receipt?.origin_energy_usage || 0,
+
+            status: info.receipt?.result === 'SUCCESS' ? 'success' : 'failed',
+            resultCode: info.receipt?.result || 'unknown',
+            confirmations: 999999,
+            requiredConfirmations: REQUIRED_CONFIRMATIONS.TRON,
+            contractRet: raw?.ret?.[0]?.contractRet || null,
+            rawData: raw?.raw_data || null,
+            logs: (info.log || []).slice(0, 5)
+        };
+    } catch (err) {
+        return { available: false, error: err.message || 'TRON fetch failed' };
+    }
+}
+
+/* ---- UTXO (BTC / LTC / DOGE) --------------------------------------------- */
+async function fetchUtxoOnChain(txHash, assetUpper) {
+    const lower = assetUpper.toLowerCase();
+    const base = {
+        btc:  'https://api.blockchair.com/bitcoin',
+        ltc:  'https://api.blockchair.com/litecoin',
+        doge: 'https://api.blockchair.com/dogecoin'
+    }[lower];
+
+    if (!base) return { available: false, error: `Unsupported UTXO asset: ${assetUpper}` };
+
+    try {
+        const resp = await Promise.race([
+            axios.get(
+                `${base}/dashboards/transaction/${txHash}?transaction_details=true`,
+                { timeout: DEPOSIT_ONCHAIN_RPC_TIMEOUT }
+            ),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), DEPOSIT_ONCHAIN_RPC_TIMEOUT))
+        ]);
+
+        const detail = resp?.data?.data?.[txHash];
+        if (!detail) return { available: false, error: 'Transaction not found on chain' };
+
+        const t = detail.transaction || {};
+        const inputs = detail.inputs || [];
+        const outputs = detail.outputs || [];
+
+        const totalOutSats = outputs.reduce((sum, o) => sum + Number(o.value || 0), 0);
+        const price = await wmUsdPrice(assetUpper).catch(() => 0);
+
+        return {
+            available: true,
+            chainType: 'utxo',
+            chainId: ASSET_NETWORK_MAP[assetUpper]?.chainId || 0,
+            networkName: ASSET_NETWORK_MAP[assetUpper]?.network || assetUpper,
+
+            txHash: t.hash,
+            blockId: t.block_id,
+            blockHash: t.block_hash,
+            time: t.time ? new Date(t.time * 1000).toISOString() : null,
+            confirmations: t.confirmations || 0,
+            requiredConfirmations:
+                REQUIRED_CONFIRMATIONS[ASSET_NETWORK_MAP[assetUpper]?.network] ||
+                REQUIRED_CONFIRMATIONS[assetUpper] || 6,
+
+            version: t.version,
+            lockTime: t.lock_time,
+            size: t.size,
+            weight: t.weight,
+            virtualSize: t.virtual_size,
+
+            inputCount: t.input_count || inputs.length,
+            outputCount: t.output_count || outputs.length,
+            inputTotal: t.input_total || 0,
+            outputTotal: t.output_total || 0,
+            feeSats: t.fee || 0,
+            fee: (Number(t.fee || 0) / 1e8).toFixed(8),
+            feeAsset: assetUpper,
+            feeUsd: Number((Number(t.fee || 0) / 1e8 * price).toFixed(4)),
+
+            isCoinbase: t.is_coinbase || false,
+            isDoubleSpend: t.is_double_spend || false,
+
+            outputs: outputs.slice(0, 10).map((o) => ({
+                index: o.index,
+                recipient: o.recipient,
+                scriptHex: o.script_hex,
+                valueSats: o.value,
+                value: (Number(o.value || 0) / 1e8).toFixed(8),
+                valueUsd: Number((Number(o.value || 0) / 1e8 * price).toFixed(2)),
+                type: o.type,
+                spent: o.spending_tx_id ? true : false
+            })),
+            inputs: inputs.slice(0, 10).map((i) => ({
+                index: i.index,
+                recipient: i.recipient,
+                valueSats: i.value,
+                value: (Number(i.value || 0) / 1e8).toFixed(8),
+                spendingTxId: i.spending_tx_id || null
+            })),
+
+            status: t.confirmations > 0 ? 'confirmed' : 'pending',
+            totalOutSats,
+            totalOut: (totalOutSats / 1e8).toFixed(8),
+            totalOutUsd: Number((totalOutSats / 1e8 * price).toFixed(2))
+        };
+    } catch (err) {
+        return { available: false, error: err.message || 'UTXO fetch failed' };
+    }
+}
+
+/* ---- Polkadot / Cardano (best-effort fallback) ---------------------------- */
+async function fetchPolkadotOnChain(txHash) {
+    try {
+        const api = await wmGetPolkadotApi();
+        const blockHash = await api.rpc.chain.getBlockHash();
+        return {
+            available: false,
+            error: 'Polkadot per-tx enrichment not implemented yet',
+            hint: { txHash, blockHash: blockHash.toString() }
+        };
+    } catch (err) {
+        return { available: false, error: err.message };
+    }
+}
+
+async function fetchCardanoOnChain() {
+    return { available: false, error: 'Cardano per-tx enrichment not implemented yet' };
+}
+
+/* ============================================================================
+ * DISPATCHER — picks the right fetcher, applies Redis cache.
+ * ========================================================================== */
+async function fetchDepositOnChainData(assetUpper, txHash) {
+    if (!assetUpper || !txHash) {
+        return { available: false, error: 'Missing asset or txHash' };
+    }
+
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) {
+        return { available: false, error: `Unsupported asset: ${assetUpper}` };
+    }
+
+    const cacheKey = `admin:deposit:onchain:${assetUpper}:${txHash}`;
+    const cached = await depositOnChainCacheGet(cacheKey);
+    if (cached) return cached;
+
+    const rpcUrl = RPC_PROVIDERS[entry.network];
+    let result;
+
+    switch (entry.type) {
+        case 'evm':
+            result = await fetchEvmOnChain(txHash, assetUpper, entry.chainId, rpcUrl);
+            break;
+        case 'solana':
+            result = await fetchSolanaOnChain(txHash, assetUpper, rpcUrl);
+            break;
+        case 'xrp':
+            result = await fetchXrpOnChain(txHash, rpcUrl);
+            break;
+        case 'tron':
+            result = await fetchTronOnChain(txHash, rpcUrl);
+            break;
+        case 'utxo':
+            result = await fetchUtxoOnChain(txHash, assetUpper);
+            break;
+        case 'polkadot':
+            result = await fetchPolkadotOnChain(txHash);
+            break;
+        case 'cardano':
+            result = await fetchCardanoOnChain();
+            break;
+        default:
+            result = { available: false, error: `Unsupported chain type: ${entry.type}` };
+    }
+
+    if (result && result.available) {
+        await depositOnChainCacheSet(cacheKey, result, DEPOSIT_ONCHAIN_CACHE_TTL);
+    }
+
+    return result;
+}
+
+/* ============================================================================
+ * BUILD THE COMPLETE ADMIN DEPOSIT ROW
+ * ----------------------------------------------------------------------------
+ * Merges:
+ *   - User info (name, email, id)
+ *   - Transaction doc (amount, status, reference, timestamps)
+ *   - DepositAsset doc (if present)
+ *   - Frozen admin metadata (approvedBy / rejectedBy / notes)
+ *   - Live on-chain enrichment
+ *   - Asset logo (server's getCryptoLogo)
+ *   - Explorer URL
+ * ========================================================================== */
+async function buildAdminDepositRow(deposit, mode /* 'approved' | 'rejected' */) {
+    const assetUpper = (deposit.asset || deposit.method || '').toUpperCase();
+    const assetLower = assetUpper.toLowerCase();
+
+    const txHash = extractDepositTxHash(deposit);
+    const explorerUrl = buildExplorerUrl(assetUpper, txHash);
+
+    /* ---- Asset descriptor ------------------------------------------------- */
+    const entry = ASSET_NETWORK_MAP[assetUpper] || null;
+    const asset = {
+        symbol: assetUpper,
+        name: entry
+            ? (WM_ASSET_NAMES[assetUpper] || assetUpper)
+            : assetUpper,
+        logoUrl: getCryptoLogo(assetUpper),                 // ← server-side logo
+        network: entry?.network || deposit.network || 'unknown',
+        chainId: entry?.chainId || deposit.details?.chainId || null,
+        type: entry?.type || 'unknown',
+        contract: entry?.contract || deposit.details?.contractAddress || null,
+        decimals: entry ? platformWallet.getTokenDecimals(assetUpper) : null,
+        isERC20: !!(entry && entry.contract)
+    };
+
+    /* ---- User ------------------------------------------------------------- */
+    const u = deposit.user || {};
+    const user = {
+        _id: u._id || deposit.user || null,
+        firstName: u.firstName || 'Unknown',
+        lastName:  u.lastName  || 'Unknown',
+        fullName:  `${u.firstName || ''} ${u.lastName || ''}`.trim() || 'Unknown',
+        email:     u.email || null
+    };
+
+    /* ---- Amounts ---------------------------------------------------------- */
+    const amountUSD = Number(deposit.amount || 0);
+    const assetAmount = Number(deposit.assetAmount || deposit.amount || 0);
+    const exchangeRate = Number(
+        deposit.exchangeRateAtTime ||
+        deposit.details?.exchangeRate ||
+        (assetAmount > 0 ? amountUSD / assetAmount : 0)
+    );
+
+    /* ---- Admin processing info -------------------------------------------- */
+    const processedByDoc = deposit.processedBy || null;
+    const approvedBy = processedByDoc
+        ? (processedByDoc.name || processedByDoc.email || 'Admin')
+        : (deposit.details?.adminApprovedBy || null);
+
+    /* ---- On-chain enrichment --------------------------------------------- */
+    let onChain = null;
+    if (txHash) {
+        onChain = await fetchDepositOnChainData(assetUpper, txHash);
+    } else {
+        onChain = { available: false, error: 'No transaction hash on record' };
+    }
+
+    /* ---- Assemble the final row ------------------------------------------ */
+    const row = {
+        _id: deposit._id,
+
+        /* --- core --- */
+        type: 'deposit',
+        status: deposit.status,
+        reference: deposit.reference || null,
+
+        /* --- user --- */
+        user,
+
+        /* --- asset + logo --- */
+        asset,
+        assetSymbol: assetUpper,
+        assetLogoUrl: asset.logoUrl,
+        network: asset.network,
+        chainId: asset.chainId,
+        method: deposit.method || assetUpper,
+        currency: deposit.currency || 'USD',
+
+        /* --- amounts --- */
+        amount: amountUSD,
+        amountFormatted: amountUSD.toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2
+        }),
+        assetAmount,
+        assetAmountFormatted: assetAmount.toLocaleString(undefined, {
+            minimumFractionDigits: 8, maximumFractionDigits: 8
+        }),
+        exchangeRate,
+        exchangeRateFormatted: exchangeRate.toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2
+        }),
+        fee: Number(deposit.fee || 0),
+        netAmount: Number(deposit.netAmount || amountUSD),
+
+        /* --- chain identity --- */
+        txHash: txHash || null,
+        explorerUrl,
+        confirmations: Number(deposit.details?.confirmations || 0),
+        requiredConfirmations:
+            Number(deposit.details?.requiredConfirmations) ||
+            REQUIRED_CONFIRMATIONS[asset.network] ||
+            12,
+
+        /* --- timestamps --- */
+        createdAt: deposit.createdAt,
+        updatedAt: deposit.updatedAt,
+        submittedAt: deposit.details?.submittedAt || deposit.createdAt,
+        processedAt: deposit.processedAt || null,
+
+        /* --- admin processing --- */
+        processedBy: processedByDoc
+            ? {
+                _id: processedByDoc._id || null,
+                name: processedByDoc.name || null,
+                email: processedByDoc.email || null
+            }
+            : null,
+        approvedBy,
+        approvedAt:
+            mode === 'approved'
+                ? (deposit.processedAt || deposit.updatedAt || null)
+                : null,
+        rejectedBy:
+            mode === 'rejected'
+                ? (deposit.processedBy?.name || deposit.details?.rejectedBy || 'System')
+                : null,
+        rejectedAt:
+            mode === 'rejected'
+                ? (deposit.processedAt || deposit.updatedAt || null)
+                : null,
+        rejectionReason:
+            mode === 'rejected'
+                ? (deposit.adminNotes ||
+                   deposit.details?.rejectionReason ||
+                   deposit.metadata?.rejectionReason ||
+                   'No reason provided')
+                : null,
+        adminNotes: deposit.adminNotes || null,
+
+        /* --- source-level metadata snapshot from DB --- */
+        metadata: {
+            depositAddress: deposit.details?.depositAddress || null,
+            walletAddress:
+                deposit.details?.walletAddress ||
+                deposit.btcAddress ||
+                null,
+            fromAddress:
+                deposit.details?.fromAddress ||
+                deposit.metadata?.fromAddress ||
+                null,
+            toAddress:
+                deposit.details?.toAddress ||
+                deposit.metadata?.toAddress ||
+                null,
+            submittedBy: deposit.details?.submittedBy || null,
+            requestIp: deposit.details?.requestIp || null,
+            requiresAdminApproval: !!deposit.details?.requiresAdminApproval,
+            adminApproved: !!deposit.details?.adminApproved,
+            onChainAmountVerified: !!deposit.details?.onChainAmountVerified
+        },
+
+        /* --- full on-chain transaction payload --- */
+        onChain: onChain && onChain.available
+            ? {
+                available: true,
+                chainType: onChain.chainType,
+                chainId: onChain.chainId,
+                networkName: onChain.networkName,
+                txHash: onChain.txHash || txHash,
+                status: onChain.status,
+                confirmations: onChain.confirmations,
+                requiredConfirmations: onChain.requiredConfirmations,
+
+                from: onChain.from || onChain.account || null,
+                to: onChain.to || onChain.destination || null,
+
+                amount: onChain.amount || onChain.value || onChain.totalOut || null,
+                amountUsd: onChain.amountUsd ?? onChain.valueUsd ?? onChain.totalOutUsd ?? null,
+
+                fee: onChain.fee || onChain.feeNative || null,
+                feeAsset: onChain.feeAsset || null,
+                feeUsd: onChain.feeUsd ?? null,
+
+                blockNumber: onChain.blockNumber ?? onChain.blockId ?? onChain.slot ?? onChain.ledgerIndex ?? null,
+                blockHash: onChain.blockHash || null,
+                blockTimestamp:
+                    onChain.blockTimestamp ||
+                    onChain.time ||
+                    onChain.blockTime ||
+                    onChain.date ||
+                    onChain.blockTimeStamp ||
+                    null,
+
+                gasUsed: onChain.gasUsed || null,
+                gasPrice: onChain.gasPrice || null,
+                effectiveGasPrice: onChain.effectiveGasPrice || null,
+                maxFeePerGas: onChain.maxFeePerGas || null,
+                maxPriorityFeePerGas: onChain.maxPriorityFeePerGas || null,
+
+                nonce: onChain.nonce ?? null,
+                data: onChain.data || null,
+                methodId: onChain.methodId || null,
+                logsCount: onChain.logsCount ?? null,
+                logs: onChain.logs || null,
+                erc20: onChain.erc20 || null,
+
+                utxo: onChain.chainType === 'utxo'
+                    ? {
+                        inputCount: onChain.inputCount,
+                        outputCount: onChain.outputCount,
+                        inputTotal: onChain.inputTotal,
+                        outputTotal: onChain.outputTotal,
+                        size: onChain.size,
+                        weight: onChain.weight,
+                        virtualSize: onChain.virtualSize,
+                        isCoinbase: onChain.isCoinbase,
+                        isDoubleSpend: onChain.isDoubleSpend,
+                        inputs: onChain.inputs,
+                        outputs: onChain.outputs
+                    }
+                    : null,
+
+                solana: onChain.chainType === 'solana'
+                    ? {
+                        slot: onChain.slot,
+                        recentBlockhash: onChain.recentBlockhash,
+                        signatures: onChain.signatures,
+                        lamportDeltas: onChain.lamportDeltas,
+                        receivedAccounts: onChain.receivedAccounts,
+                        sentAccounts: onChain.sentAccounts,
+                        preTokenBalances: onChain.preTokenBalances,
+                        postTokenBalances: onChain.postTokenBalances,
+                        innerInstructions: onChain.innerInstructions
+                    }
+                    : null,
+
+                xrp: onChain.chainType === 'xrp'
+                    ? {
+                        ledgerIndex: onChain.ledgerIndex,
+                        sequence: onChain.sequence,
+                        destinationTag: onChain.destinationTag,
+                        sourceTag: onChain.sourceTag,
+                        amountDrops: onChain.amountDrops,
+                        feeDrops: onChain.feeDrops,
+                        resultCode: onChain.resultCode,
+                        memos: onChain.memos
+                    }
+                    : null,
+
+                tron: onChain.chainType === 'tron'
+                    ? {
+                        energyUsed: onChain.energyUsed,
+                        energyFee: onChain.energyFee,
+                        netUsage: onChain.netUsage,
+                        netFee: onChain.netFee,
+                        originEnergyUsage: onChain.originEnergyUsage,
+                        contractRet: onChain.contractRet,
+                        logs: onChain.logs
+                    }
+                    : null,
+
+                /* everything else the fetcher returned, untouched */
+                raw: onChain
+            }
+            : {
+                available: false,
+                error: onChain?.error || 'On-chain data unavailable',
+                txHash: txHash || null,
+                explorerUrl
+            },
+
+        /* --- frozen DepositAsset snapshot (if any) --- */
+        depositAsset: deposit.details?.depositId
+            ? {
+                _id: deposit.details.depositId,
+                status: deposit.status,
+                metadata: deposit.details
+            }
+            : null
+    };
+
+    return row;
+}
+
+/* ============================================================================
+ * GET /api/admin/deposits/approved
+ * ----------------------------------------------------------------------------
+ * Returns every completed deposit, fully enriched with live on-chain data,
+ * the asset's server-side logo, full user info, admin processing info,
+ * explorer URL, and the complete raw on-chain transaction payload.
+ *
+ * Query params:
+ *   page, limit        — pagination
+ *   asset              — filter by asset symbol (e.g. "ETH")
+ *   network            — filter by network key (e.g. "ETH", "BSC")
+ *   search             — substring on txHash / reference / user email / address
+ *   from, to           — ISO date range on createdAt
+ * ========================================================================== */
 app.get('/api/admin/deposits/approved', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const startedAt = Date.now();
 
-    const query = { 
-      type: 'deposit',
-      status: 'completed'
-    };
+    try {
+        /* ------------------------------------------------------------------
+         * 1. PARSE + SANITIZE QUERY
+         * ---------------------------------------------------------------- */
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+        const skip  = (page - 1) * limit;
 
-    const deposits = await Transaction.find(query)
-      .populate('user', 'firstName lastName email')
-      .populate('processedBy', 'name email')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+        const assetFilter   = req.query.asset   ? String(req.query.asset).toUpperCase() : null;
+        const networkFilter = req.query.network ? String(req.query.network) : null;
+        const search        = req.query.search  ? String(req.query.search).trim() : '';
+        const fromDate      = req.query.from    ? new Date(req.query.from) : null;
+        const toDate        = req.query.to      ? new Date(req.query.to)   : null;
 
-    const totalCount = await Transaction.countDocuments(query);
-    const totalPages = Math.ceil(totalCount / limit);
+        /* ------------------------------------------------------------------
+         * 2. BUILD MONGO QUERY
+         * ---------------------------------------------------------------- */
+        const query = {
+            type: 'deposit',
+            status: 'completed'
+        };
 
-    const formattedDeposits = deposits.map(deposit => ({
-      _id: deposit._id,
-      user: {
-        _id: deposit.user?._id,
-        firstName: deposit.user?.firstName || 'Unknown',
-        lastName: deposit.user?.lastName || 'Unknown'
-      },
-      amount: deposit.amount,
-      method: deposit.method || deposit.asset || 'crypto',
-      createdAt: deposit.createdAt,
-      approvedBy: deposit.processedBy?.name || 'System',
-      approvedAt: deposit.processedAt || deposit.updatedAt,
-      status: deposit.status
-    }));
+        if (assetFilter) {
+            query.asset = assetFilter.toLowerCase();
+        }
 
-    res.status(200).json({
-      status: 'success',
-      data: {
-        deposits: formattedDeposits,
-        totalCount: totalCount,
-        totalPages: totalPages,
-        currentPage: page
-      }
-    });
+        if (fromDate || toDate) {
+            query.createdAt = {};
+            if (fromDate) query.createdAt.$gte = fromDate;
+            if (toDate)   query.createdAt.$lte = toDate;
+        }
 
-  } catch (err) {
-    console.error('Get approved deposits error:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to fetch approved deposits'
-    });
-  }
+        if (search) {
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query.$or = [
+                { reference: { $regex: escaped, $options: 'i' } },
+                { 'details.txHash': { $regex: escaped, $options: 'i' } },
+                { 'details.depositAddress': { $regex: escaped, $options: 'i' } },
+                { 'details.walletAddress': { $regex: escaped, $options: 'i' } },
+                { 'btcAddress': { $regex: escaped, $options: 'i' } }
+            ];
+        }
+
+        /* ------------------------------------------------------------------
+         * 3. FETCH PAGE FROM DB (raw, unpopulated for speed first)
+         * ---------------------------------------------------------------- */
+        const [deposits, totalCount] = await Promise.all([
+            Transaction.find(query)
+                .populate('user', 'firstName lastName email')
+                .populate('processedBy', 'name email')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            Transaction.countDocuments(query)
+        ]);
+
+        /* ------------------------------------------------------------------
+         * 4. NETWORK FILTER (post-query, because network is derived)
+         * ---------------------------------------------------------------- */
+        const filteredByNetwork = networkFilter
+            ? deposits.filter((d) => {
+                const a = (d.asset || d.method || '').toUpperCase();
+                const entry = ASSET_NETWORK_MAP[a];
+                return entry && entry.network === networkFilter;
+            })
+            : deposits;
+
+        /* ------------------------------------------------------------------
+         * 5. ENRICH ALL DEPOSITS IN PARALLEL (with concurrency cap)
+         * ---------------------------------------------------------------- */
+        const enriched = await withConcurrency(
+            filteredByNetwork,
+            (deposit) => buildAdminDepositRow(deposit, 'approved'),
+            DEPOSIT_ONCHAIN_CONCURRENCY
+        );
+
+        const rows = enriched.filter((r) => r && !r.__error);
+
+        /* ------------------------------------------------------------------
+         * 6. RESPOND
+         * ---------------------------------------------------------------- */
+        const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                deposits: rows,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    totalItems: totalCount,
+                    itemsPerPage: limit,
+                    hasNextPage: page < totalPages,
+                    hasPrevPage: page > 1
+                },
+                filters: {
+                    asset: assetFilter,
+                    network: networkFilter,
+                    search,
+                    from: fromDate ? fromDate.toISOString() : null,
+                    to: toDate ? toDate.toISOString() : null
+                },
+                meta: {
+                    enrichedCount: rows.length,
+                    onChainAvailable: rows.filter((r) => r.onChain && r.onChain.available).length,
+                    onChainUnavailable: rows.filter((r) => r.onChain && !r.onChain.available).length,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('[admin/deposits/approved] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'admin_deposits_approved_error',
+                entity: 'Transaction',
+                performedBy: req.admin?._id || null,
+                performedByModel: 'Admin',
+                performedByEmail: req.admin?.email || null,
+                performedByName: req.admin?.name || null,
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    query: req.query,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (_) { /* audit failure must not mask the original error */ }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch approved deposits'
+        });
+    }
 });
 
+/* ============================================================================
+ * GET /api/admin/deposits/rejected
+ * ----------------------------------------------------------------------------
+ * Returns every failed deposit, fully enriched with:
+ *   - live on-chain data (so admins can verify the tx still exists on chain)
+ *   - the rejection reason (adminNotes, details.rejectionReason, or metadata)
+ *   - the admin who rejected it, and when
+ *   - the asset's server-side logo
+ *   - the complete raw on-chain payload
+ * ========================================================================== */
 app.get('/api/admin/deposits/rejected', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const startedAt = Date.now();
 
-    const query = { 
-      type: 'deposit',
-      status: 'failed'
-    };
+    try {
+        /* ------------------------------------------------------------------
+         * 1. PARSE + SANITIZE QUERY
+         * ---------------------------------------------------------------- */
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+        const skip  = (page - 1) * limit;
 
-    const deposits = await Transaction.find(query)
-      .populate('user', 'firstName lastName email')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+        const assetFilter   = req.query.asset   ? String(req.query.asset).toUpperCase() : null;
+        const networkFilter = req.query.network ? String(req.query.network) : null;
+        const search        = req.query.search  ? String(req.query.search).trim() : '';
+        const fromDate      = req.query.from    ? new Date(req.query.from) : null;
+        const toDate        = req.query.to      ? new Date(req.query.to)   : null;
 
-    const totalCount = await Transaction.countDocuments(query);
-    const totalPages = Math.ceil(totalCount / limit);
+        /* ------------------------------------------------------------------
+         * 2. BUILD MONGO QUERY
+         * ---------------------------------------------------------------- */
+        const query = {
+            type: 'deposit',
+            status: 'failed'
+        };
 
-    const formattedDeposits = deposits.map(deposit => ({
-      _id: deposit._id,
-      user: {
-        _id: deposit.user?._id,
-        firstName: deposit.user?.firstName || 'Unknown',
-        lastName: deposit.user?.lastName || 'Unknown'
-      },
-      amount: deposit.amount,
-      method: deposit.method || deposit.asset || 'crypto',
-      createdAt: deposit.createdAt,
-      reason: deposit.adminNotes || deposit.details?.rejectionReason || 'No reason provided',
-      status: deposit.status
-    }));
+        if (assetFilter) {
+            query.asset = assetFilter.toLowerCase();
+        }
 
-    res.status(200).json({
-      status: 'success',
-      data: {
-        deposits: formattedDeposits,
-        totalCount: totalCount,
-        totalPages: totalPages,
-        currentPage: page
-      }
-    });
+        if (fromDate || toDate) {
+            query.createdAt = {};
+            if (fromDate) query.createdAt.$gte = fromDate;
+            if (toDate)   query.createdAt.$lte = toDate;
+        }
 
-  } catch (err) {
-    console.error('Get rejected deposits error:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to fetch rejected deposits'
-    });
-  }
+        if (search) {
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query.$or = [
+                { reference: { $regex: escaped, $options: 'i' } },
+                { 'details.txHash': { $regex: escaped, $options: 'i' } },
+                { 'details.depositAddress': { $regex: escaped, $options: 'i' } },
+                { 'details.walletAddress': { $regex: escaped, $options: 'i' } },
+                { 'adminNotes': { $regex: escaped, $options: 'i' } }
+            ];
+        }
+
+        /* ------------------------------------------------------------------
+         * 3. FETCH PAGE FROM DB
+         * ---------------------------------------------------------------- */
+        const [deposits, totalCount] = await Promise.all([
+            Transaction.find(query)
+                .populate('user', 'firstName lastName email')
+                .populate('processedBy', 'name email')
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+            Transaction.countDocuments(query)
+        ]);
+
+        /* ------------------------------------------------------------------
+         * 4. NETWORK FILTER (post-query)
+         * ---------------------------------------------------------------- */
+        const filteredByNetwork = networkFilter
+            ? deposits.filter((d) => {
+                const a = (d.asset || d.method || '').toUpperCase();
+                const entry = ASSET_NETWORK_MAP[a];
+                return entry && entry.network === networkFilter;
+            })
+            : deposits;
+
+        /* ------------------------------------------------------------------
+         * 5. ENRICH ALL REJECTED DEPOSITS IN PARALLEL
+         * ---------------------------------------------------------------- */
+        const enriched = await withConcurrency(
+            filteredByNetwork,
+            (deposit) => buildAdminDepositRow(deposit, 'rejected'),
+            DEPOSIT_ONCHAIN_CONCURRENCY
+        );
+
+        const rows = enriched.filter((r) => r && !r.__error);
+
+        /* ------------------------------------------------------------------
+         * 6. RESPOND
+         * ---------------------------------------------------------------- */
+        const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                deposits: rows,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    totalItems: totalCount,
+                    itemsPerPage: limit,
+                    hasNextPage: page < totalPages,
+                    hasPrevPage: page > 1
+                },
+                filters: {
+                    asset: assetFilter,
+                    network: networkFilter,
+                    search,
+                    from: fromDate ? fromDate.toISOString() : null,
+                    to: toDate ? toDate.toISOString() : null
+                },
+                meta: {
+                    enrichedCount: rows.length,
+                    onChainAvailable: rows.filter((r) => r.onChain && r.onChain.available).length,
+                    onChainUnavailable: rows.filter((r) => r.onChain && !r.onChain.available).length,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('[admin/deposits/rejected] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'admin_deposits_rejected_error',
+                entity: 'Transaction',
+                performedBy: req.admin?._id || null,
+                performedByModel: 'Admin',
+                performedByEmail: req.admin?.email || null,
+                performedByName: req.admin?.name || null,
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    query: req.query,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (_) { /* silent */ }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch rejected deposits'
+        });
+    }
 });
-
-
-
-
 
 
 
@@ -30926,68 +32075,479 @@ app.get('/api/admin/restrictions', adminProtect, restrictTo('super'), async (req
 
 
 
-
-
+/* ============================================================================
+ * GET /api/admin/deposits/:id
+ * ----------------------------------------------------------------------------
+ * Returns the FULL detail view of a single deposit transaction.
+ *
+ * Resolution strategy (in order):
+ *   1. If :id is a valid ObjectId, try Transaction.findById(id)
+ *   2. If not found (or if :id is not an ObjectId), try DepositAsset.findById(id)
+ *      and follow its .transactionId back to the Transaction
+ *   3. If still not found, try Transaction.findOne({ reference: id })
+ *      (so admins can look up by the deterministic reference string)
+ *
+ * Response includes:
+ *   - Full DB row (all Transaction fields, unfiltered)
+ *   - Populated user + processedBy + any related docs
+ *   - Asset descriptor with the server-side logo (getCryptoLogo)
+ *   - Explorer URL
+ *   - The complete live on-chain transaction payload (same shape as the list
+ *     endpoints, but with no truncation and no caching short-circuit — this is
+ *     the admin's "verify now" view, so we always re-fetch)
+ *   - Related sibling docs: DepositAsset, matching Web3DepositAddress,
+ *     any SystemLog entries that reference this txHash
+ *   - A "consistency" block that flags drift between DB and chain
+ * ========================================================================== */
 app.get('/api/admin/deposits/:id', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
-  try {
-    const { id } = req.params;
+    const startedAt = Date.now();
+    const rawId = String(req.params.id || '').trim();
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Invalid deposit ID format'
-      });
+    try {
+        if (!rawId) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A deposit id or reference is required'
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 1. RESOLVE THE TRANSACTION DOCUMENT
+         *    Support lookup by ObjectId, by DepositAsset ObjectId, or by
+         *    the deterministic `reference` string.
+         * ---------------------------------------------------------------- */
+        let deposit = null;
+        let resolvedBy = null;
+
+        if (mongoose.Types.ObjectId.isValid(rawId)) {
+            deposit = await Transaction.findOne({
+                _id: rawId,
+                type: 'deposit'
+            })
+                .populate('user', 'firstName lastName email status accountType')
+                .populate('processedBy', 'name email role')
+                .lean();
+
+            if (deposit) resolvedBy = 'transaction_id';
+        }
+
+        /* ---- Fallback: id belongs to a DepositAsset → follow the link ---- */
+        if (!deposit && mongoose.Types.ObjectId.isValid(rawId)) {
+            const assetDoc = await DepositAsset.findById(rawId)
+                .populate('user', 'firstName lastName email status accountType')
+                .lean();
+
+            if (assetDoc && assetDoc.transactionId) {
+                deposit = await Transaction.findOne({
+                    _id: assetDoc.transactionId,
+                    type: 'deposit'
+                })
+                    .populate('user', 'firstName lastName email status accountType')
+                    .populate('processedBy', 'name email role')
+                    .lean();
+
+                if (deposit) resolvedBy = 'deposit_asset_id';
+            }
+        }
+
+        /* ---- Fallback: lookup by deterministic reference string ---------- */
+        if (!deposit) {
+            deposit = await Transaction.findOne({
+                reference: rawId,
+                type: 'deposit'
+            })
+                .populate('user', 'firstName lastName email status accountType')
+                .populate('processedBy', 'name email role')
+                .lean();
+
+            if (deposit) resolvedBy = 'reference';
+        }
+
+        if (!deposit) {
+            return res.status(404).json({
+                status: 'fail',
+                message: 'Deposit not found'
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 2. ENRICH WITH THE SHARED ROW BUILDER
+         *    Mode is derived from the deposit's status so the row carries
+         *    the correct approvedBy/rejectedBy fields.
+         * ---------------------------------------------------------------- */
+        const mode =
+            deposit.status === 'completed' ? 'approved' :
+            deposit.status === 'failed'    ? 'rejected' :
+            'pending';
+
+        const enriched = await buildAdminDepositRow(deposit, mode);
+
+        /* ------------------------------------------------------------------
+         * 3. FORCE A FRESH ON-CHAIN READ
+         *    The list endpoints use a 60s Redis cache. For the detail view we
+         *    want the admin to see the current block height, so we re-fetch
+         *    and overwrite the cached on-chain block.
+         * ---------------------------------------------------------------- */
+        const assetUpper = (deposit.asset || deposit.method || '').toUpperCase();
+        const txHash = extractDepositTxHash(deposit);
+
+        if (txHash && ASSET_NETWORK_MAP[assetUpper]) {
+            try {
+                // Bust the cache and re-fetch
+                try {
+                    if (redis && typeof redis.del === 'function') {
+                        await redis.del(`admin:deposit:onchain:${assetUpper}:${txHash}`);
+                    }
+                } catch (_) { /* silent */ }
+
+                const freshOnChain = await fetchDepositOnChainData(assetUpper, txHash);
+
+                if (freshOnChain && freshOnChain.available) {
+                    enriched.onChain = {
+                        available: true,
+                        chainType: freshOnChain.chainType,
+                        chainId: freshOnChain.chainId,
+                        networkName: freshOnChain.networkName,
+                        txHash: freshOnChain.txHash || txHash,
+                        status: freshOnChain.status,
+                        confirmations: freshOnChain.confirmations,
+                        requiredConfirmations: freshOnChain.requiredConfirmations,
+
+                        from: freshOnChain.from || freshOnChain.account || null,
+                        to: freshOnChain.to || freshOnChain.destination || null,
+
+                        amount: freshOnChain.amount || freshOnChain.value || freshOnChain.totalOut || null,
+                        amountUsd: freshOnChain.amountUsd ?? freshOnChain.valueUsd ?? freshOnChain.totalOutUsd ?? null,
+
+                        fee: freshOnChain.fee || freshOnChain.feeNative || null,
+                        feeAsset: freshOnChain.feeAsset || null,
+                        feeUsd: freshOnChain.feeUsd ?? null,
+
+                        blockNumber: freshOnChain.blockNumber ?? freshOnChain.blockId ?? freshOnChain.slot ?? freshOnChain.ledgerIndex ?? null,
+                        blockHash: freshOnChain.blockHash || null,
+                        blockTimestamp:
+                            freshOnChain.blockTimestamp ||
+                            freshOnChain.time ||
+                            freshOnChain.blockTime ||
+                            freshOnChain.date ||
+                            freshOnChain.blockTimeStamp ||
+                            null,
+
+                        gasUsed: freshOnChain.gasUsed || null,
+                        gasPrice: freshOnChain.gasPrice || null,
+                        effectiveGasPrice: freshOnChain.effectiveGasPrice || null,
+                        maxFeePerGas: freshOnChain.maxFeePerGas || null,
+                        maxPriorityFeePerGas: freshOnChain.maxPriorityFeePerGas || null,
+
+                        nonce: freshOnChain.nonce ?? null,
+                        data: freshOnChain.data || null,
+                        methodId: freshOnChain.methodId || null,
+                        logsCount: freshOnChain.logsCount ?? null,
+                        logs: freshOnChain.logs || null,
+                        erc20: freshOnChain.erc20 || null,
+
+                        utxo: freshOnChain.chainType === 'utxo'
+                            ? {
+                                inputCount: freshOnChain.inputCount,
+                                outputCount: freshOnChain.outputCount,
+                                inputTotal: freshOnChain.inputTotal,
+                                outputTotal: freshOnChain.outputTotal,
+                                size: freshOnChain.size,
+                                weight: freshOnChain.weight,
+                                virtualSize: freshOnChain.virtualSize,
+                                isCoinbase: freshOnChain.isCoinbase,
+                                isDoubleSpend: freshOnChain.isDoubleSpend,
+                                inputs: freshOnChain.inputs,
+                                outputs: freshOnChain.outputs
+                            }
+                            : null,
+
+                        solana: freshOnChain.chainType === 'solana'
+                            ? {
+                                slot: freshOnChain.slot,
+                                recentBlockhash: freshOnChain.recentBlockhash,
+                                signatures: freshOnChain.signatures,
+                                lamportDeltas: freshOnChain.lamportDeltas,
+                                receivedAccounts: freshOnChain.receivedAccounts,
+                                sentAccounts: freshOnChain.sentAccounts,
+                                preTokenBalances: freshOnChain.preTokenBalances,
+                                postTokenBalances: freshOnChain.postTokenBalances,
+                                innerInstructions: freshOnChain.innerInstructions
+                            }
+                            : null,
+
+                        xrp: freshOnChain.chainType === 'xrp'
+                            ? {
+                                ledgerIndex: freshOnChain.ledgerIndex,
+                                sequence: freshOnChain.sequence,
+                                destinationTag: freshOnChain.destinationTag,
+                                sourceTag: freshOnChain.sourceTag,
+                                amountDrops: freshOnChain.amountDrops,
+                                feeDrops: freshOnChain.feeDrops,
+                                resultCode: freshOnChain.resultCode,
+                                memos: freshOnChain.memos
+                            }
+                            : null,
+
+                        tron: freshOnChain.chainType === 'tron'
+                            ? {
+                                energyUsed: freshOnChain.energyUsed,
+                                energyFee: freshOnChain.energyFee,
+                                netUsage: freshOnChain.netUsage,
+                                netFee: freshOnChain.netFee,
+                                originEnergyUsage: freshOnChain.originEnergyUsage,
+                                contractRet: freshOnChain.contractRet,
+                                logs: freshOnChain.logs
+                            }
+                            : null,
+
+                        raw: freshOnChain
+                    };
+                } else {
+                    enriched.onChain = {
+                        available: false,
+                        error: freshOnChain?.error || 'On-chain data unavailable',
+                        txHash,
+                        explorerUrl: buildExplorerUrl(assetUpper, txHash)
+                    };
+                }
+            } catch (freshErr) {
+                console.warn('[admin/deposits/:id] fresh on-chain fetch failed:', freshErr.message);
+                // Keep the enriched.onChain from buildAdminDepositRow as fallback
+            }
+        }
+
+        /* ------------------------------------------------------------------
+         * 4. ATTACH RELATED DOCUMENTS
+         *    - DepositAsset (sibling record, if the tx came from the manual
+         *      confirm path)
+         *    - Web3DepositAddress (if the deposit address is wallet-linked)
+         *    - SystemLog entries that reference this txHash
+         * ---------------------------------------------------------------- */
+        const related = {
+            depositAsset: null,
+            web3DepositAddress: null,
+            systemLogs: [],
+            balanceSnapshot: null
+        };
+
+        /* ---- 4a. DepositAsset ---- */
+        try {
+            const depositAssetQuery = {
+                user: deposit.user?._id || deposit.user
+            };
+
+            if (txHash) {
+                depositAssetQuery['metadata.txHash'] = txHash;
+            } else if (deposit.details?.depositId) {
+                depositAssetQuery._id = deposit.details.depositId;
+            } else {
+                depositAssetQuery._id = new mongoose.Types.ObjectId(); // matches nothing
+            }
+
+            related.depositAsset = await DepositAsset.findOne(depositAssetQuery).lean();
+        } catch (err) {
+            console.warn('[admin/deposits/:id] depositAsset lookup failed:', err.message);
+        }
+
+        /* ---- 4b. Web3DepositAddress (only if the address is wallet-linked) ---- */
+        const depositAddress =
+            deposit.details?.depositAddress ||
+            deposit.details?.toAddress ||
+            deposit.btcAddress ||
+            null;
+
+        if (depositAddress) {
+            try {
+                related.web3DepositAddress = await Web3DepositAddress.findOne({
+                    asset: assetUpper,
+                    address: depositAddress.toLowerCase(),
+                    isActive: true
+                }).lean();
+            } catch (err) {
+                console.warn('[admin/deposits/:id] web3DepositAddress lookup failed:', err.message);
+            }
+        }
+
+        /* ---- 4c. SystemLog entries referencing this tx ---- */
+        if (txHash) {
+            try {
+                related.systemLogs = await SystemLog.find({
+                    $or: [
+                        { 'metadata.txHash': txHash },
+                        { 'financial.reference': txHash },
+                        { entityId: deposit._id }
+                    ]
+                })
+                    .sort({ createdAt: -1 })
+                    .limit(25)
+                    .select('action entity status errorMessage ip userAgent location createdAt metadata')
+                    .lean();
+            } catch (err) {
+                console.warn('[admin/deposits/:id] systemLog lookup failed:', err.message);
+            }
+        }
+
+        /* ---- 4d. Balance snapshot for the owning user ---- */
+        try {
+            const userDoc = await User.findById(deposit.user?._id || deposit.user)
+                .select('balances')
+                .lean();
+
+            if (userDoc && userDoc.balances) {
+                const { mainUSD, activeUSD, maturedUSD } =
+                    await calculateRealWalletBalances({ balances: userDoc.balances });
+
+                related.balanceSnapshot = {
+                    mainUSD: Number(mainUSD.toFixed(2)),
+                    activeUSD: Number(activeUSD.toFixed(2)),
+                    maturedUSD: Number(maturedUSD.toFixed(2)),
+                    totalUSD: Number((mainUSD + activeUSD + maturedUSD).toFixed(2)),
+                    capturedAt: new Date().toISOString()
+                };
+            }
+        } catch (err) {
+            console.warn('[admin/deposits/:id] balance snapshot failed:', err.message);
+        }
+
+        /* ------------------------------------------------------------------
+         * 5. CONSISTENCY BLOCK
+         *    Flags any drift between what the DB says and what the chain says.
+         *    This is the "is this row trustworthy?" signal for admins.
+         * ---------------------------------------------------------------- */
+        const dbAmount = Number(deposit.assetAmount || deposit.amount || 0);
+        const chainAmount =
+            enriched.onChain?.available && enriched.onChain.amount != null
+                ? Number(enriched.onChain.amount)
+                : null;
+
+        const dbStatus = deposit.status;
+        const chainStatus = enriched.onChain?.available ? enriched.onChain.status : null;
+
+        const chainConfirmations = enriched.onChain?.available
+            ? Number(enriched.onChain.confirmations || 0)
+            : 0;
+        const requiredConfirmations = Number(
+            enriched.onChain?.requiredConfirmations ||
+            deposit.details?.requiredConfirmations ||
+            REQUIRED_CONFIRMATIONS[enriched.asset.network] ||
+            12
+        );
+
+        const amountDriftPercent =
+            (chainAmount !== null && chainAmount > 0)
+                ? Number((Math.abs(chainAmount - dbAmount) / chainAmount * 100).toFixed(4))
+                : null;
+
+        const consistency = {
+            amountMatchesChain:
+                chainAmount === null ? null : amountDriftPercent <= 0.5,
+            amountDriftPercent,
+
+            statusMatchesChain:
+                chainStatus === null
+                    ? null
+                    : (dbStatus === 'completed' && chainStatus === 'success') ||
+                      (dbStatus === 'failed' && chainStatus === 'failed') ||
+                      (dbStatus === 'pending' && (chainStatus === 'pending' || chainStatus === 'success')),
+
+            confirmationsSufficient: chainConfirmations >= requiredConfirmations,
+            confirmations: chainConfirmations,
+            requiredConfirmations,
+
+            onChainVerified: !!enriched.onChain?.available,
+
+            flags: (() => {
+                const out = [];
+                if (enriched.onChain?.available === false) {
+                    out.push('ONCHAIN_UNAVAILABLE');
+                }
+                if (amountDriftPercent !== null && amountDriftPercent > 0.5) {
+                    out.push('AMOUNT_DRIFT');
+                }
+                if (dbStatus === 'completed' && chainStatus === 'failed') {
+                    out.push('DB_COMPLETED_BUT_CHAIN_FAILED');
+                }
+                if (dbStatus === 'failed' && chainStatus === 'success') {
+                    out.push('DB_FAILED_BUT_CHAIN_SUCCESS');
+                }
+                if (dbStatus === 'pending' && chainConfirmations >= requiredConfirmations) {
+                    out.push('READY_FOR_APPROVAL');
+                }
+                if (dbStatus === 'pending' && chainConfirmations > 0 && chainConfirmations < requiredConfirmations) {
+                    out.push('AWAITING_CONFIRMATIONS');
+                }
+                return out;
+            })()
+        };
+
+        /* ------------------------------------------------------------------
+         * 6. RESPOND
+         * ---------------------------------------------------------------- */
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                deposit: {
+                    ...enriched,
+
+                    /* --- full raw DB snapshot (nothing stripped) --- */
+                    raw: {
+                        transaction: deposit,
+                        depositAsset: related.depositAsset,
+                        web3DepositAddress: related.web3DepositAddress
+                    },
+
+                    /* --- related docs --- */
+                    related: {
+                        depositAsset: related.depositAsset,
+                        web3DepositAddress: related.web3DepositAddress,
+                        systemLogs: related.systemLogs,
+                        balanceSnapshot: related.balanceSnapshot
+                    },
+
+                    /* --- drift / trust signal --- */
+                    consistency
+                },
+                meta: {
+                    resolvedBy,
+                    processingTimeMs: Date.now() - startedAt,
+                    onChainFresh: !!enriched.onChain?.available,
+                    onChainCacheKey: txHash
+                        ? `admin:deposit:onchain:${assetUpper}:${txHash}`
+                        : null,
+                    generatedAt: new Date().toISOString()
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('[admin/deposits/:id] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'admin_deposit_detail_error',
+                entity: 'Transaction',
+                performedBy: req.admin?._id || null,
+                performedByModel: 'Admin',
+                performedByEmail: req.admin?.email || null,
+                performedByName: req.admin?.name || null,
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    requestedId: rawId,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (_) { /* silent */ }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch deposit details'
+        });
     }
-
-    const deposit = await Transaction.findOne({
-      _id: id,
-      type: 'deposit'
-    })
-    .populate('user', 'firstName lastName email phone')
-    .lean();
-
-    if (!deposit) {
-      return res.status(404).json({
-        status: 'fail',
-        message: 'Deposit not found'
-      });
-    }
-
-    const formattedDeposit = {
-      _id: deposit._id,
-      user: {
-        _id: deposit.user?._id,
-        firstName: deposit.user?.firstName || 'Unknown',
-        lastName: deposit.user?.lastName || 'Unknown',
-        email: deposit.user?.email || 'Unknown'
-      },
-      amount: deposit.amount,
-      method: deposit.method || deposit.asset || 'crypto',
-      createdAt: deposit.createdAt,
-      proof: deposit.details?.proofUrl || deposit.details?.txHash || deposit.reference,
-      status: deposit.status,
-      asset: deposit.asset,
-      assetAmount: deposit.assetAmount,
-      network: deposit.details?.network || deposit.network,
-      exchangeRate: deposit.exchangeRateAtTime || deposit.details?.exchangeRate,
-      transactionHash: deposit.details?.txHash || deposit.details?.transactionHash,
-      walletAddress: deposit.btcAddress || deposit.details?.toAddress
-    };
-
-    res.status(200).json({
-      status: 'success',
-      data: {
-        deposit: formattedDeposit
-      }
-    });
-
-  } catch (err) {
-    console.error('Get deposit by ID error:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to fetch deposit details'
-    });
-  }
 });
 
 
@@ -40989,65 +42549,71 @@ app.delete('/api/users/wallets/remove', protect, async (req, res) => {
 
 
 
-
+/* ============================================================================
+ * POST /api/deposit/confirm
+ * ----------------------------------------------------------------------------
+ * User submits a txHash + depositAddress after sending crypto on-chain.
+ *
+ * Guarantees:
+ *   1. The chain is the source of truth for amount and confirmations.
+ *   2. A given (asset, txHash) can only ever produce ONE completed credit,
+ *      regardless of how many times the client retries or how the auto-watcher
+ *      and this route race each other.
+ *   3. Failed credits can be retried; completed credits cannot.
+ *   4. The HTTP response returns immediately after the DB writes; emails and
+ *      realtime notifications are dispatched asynchronously.
+ * ========================================================================== */
 app.post('/api/deposit/confirm', protect, async (req, res) => {
+    const userId = req.user._id;
+    const startTime = Date.now();
+
+    let lockKey = null;      // Redis lock, released in finally
+    let lockAcquired = false;
+    let transactionDoc = null;
+    let depositAssetDoc = null;
+
     try {
+        /* ------------------------------------------------------------------
+         * 1. INPUT VALIDATION
+         * ---------------------------------------------------------------- */
         const {
             txHash,
             asset,
-            amount,
+            amount,            // client-claimed amount (untrusted)
             walletAddress,
             depositAddress,
             network,
             chainId
-        } = req.body;
+        } = req.body || {};
 
-        const userId = req.user._id;
-        const user = await User.findById(userId);
-        
-        if (!user) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'User not found'
-            });
-        }
-
-        if (!txHash || !asset || !amount || !depositAddress) {
+        if (!txHash || typeof txHash !== 'string' || txHash.trim().length < 16) {
             return res.status(400).json({
                 status: 'fail',
-                message: 'Missing required fields: txHash, asset, amount, depositAddress'
+                message: 'A valid txHash is required'
             });
         }
 
+        if (!asset || typeof asset !== 'string') {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'Asset is required'
+            });
+        }
+
+        if (!depositAddress || typeof depositAddress !== 'string' || depositAddress.trim().length < 10) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A valid depositAddress is required'
+            });
+        }
+
+        const normalizedTxHash = txHash.trim();
         const assetUpper = asset.toUpperCase();
         const assetLower = asset.toLowerCase();
 
-        const currentPrice = await getCryptoPrice(assetUpper);
-        if (!currentPrice || currentPrice <= 0) {
-            return res.status(503).json({
-                status: 'error',
-                message: 'Unable to fetch current price. Please try again later.'
-            });
-        }
-
-        const usdValue = amount * currentPrice;
-
-        if (usdValue < DEPOSIT_LIMITS.minUSD) {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Minimum deposit is $${DEPOSIT_LIMITS.minUSD} USD. You sent $${usdValue.toFixed(2)} USD.`,
-                minUSD: DEPOSIT_LIMITS.minUSD
-            });
-        }
-
-        if (usdValue > DEPOSIT_LIMITS.maxUSD) {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Maximum deposit is $${DEPOSIT_LIMITS.maxUSD} USD per transaction. You sent $${usdValue.toFixed(2)} USD.`,
-                maxUSD: DEPOSIT_LIMITS.maxUSD
-            });
-        }
-
+        /* ------------------------------------------------------------------
+         * 2. ASSET SUPPORT
+         * ---------------------------------------------------------------- */
         if (!platformWallet.isAssetSupported(assetUpper)) {
             return res.status(400).json({
                 status: 'fail',
@@ -41055,12 +42621,40 @@ app.post('/api/deposit/confirm', protect, async (req, res) => {
             });
         }
 
+        const networkInfo = ASSET_NETWORK_MAP[assetUpper] || null;
+        if (!networkInfo) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `No network configuration found for ${assetUpper}`
+            });
+        }
+
+        const chainIdNum = Number(chainId) || networkInfo.chainId || 1;
+
+        /* ------------------------------------------------------------------
+         * 3. LOAD USER
+         * ---------------------------------------------------------------- */
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ status: 'fail', message: 'User not found' });
+        }
+        if (user.status !== 'active') {
+            return res.status(403).json({
+                status: 'fail',
+                message: 'Your account is not active'
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 4. VERIFY DEPOSIT ADDRESS OWNERSHIP
+         *    (do this BEFORE touching prices or the chain to fail fast)
+         * ---------------------------------------------------------------- */
         const depositRecord = await DepositAddress.findOne({
-            userId: userId,
+            userId,
             asset: assetLower,
             address: depositAddress,
             isActive: true
-        });
+        }).lean();
 
         if (!depositRecord) {
             return res.status(400).json({
@@ -41069,357 +42663,629 @@ app.post('/api/deposit/confirm', protect, async (req, res) => {
             });
         }
 
-        const existingTransaction = await Transaction.findOne({
-            'details.txHash': txHash,
-            type: 'deposit'
-        });
+        /* ------------------------------------------------------------------
+         * 5. DETERMINISTIC IDEMPOTENCY KEY
+         *    Same (asset, txHash) always produces the same reference.
+         *    The auto-watcher's makeDepositReference() uses a different prefix
+         *    (DEP-AUTO-), so we check BOTH forms below before proceeding.
+         * ---------------------------------------------------------------- */
+        const shortHash = normalizedTxHash.slice(-24);
+        const manualReference = `DEP-MAN-${assetUpper}-${shortHash}`;
+        const autoReference = `DEP-AUTO-${assetUpper}-${depositAddress.slice(-10)}-${shortHash}`;
 
-        if (existingTransaction) {
+        /* ---- 5a. Hard dedupe: has this tx already been credited? ---- */
+        const alreadyCredited = await Transaction.findOne({
+            $or: [
+                { reference: manualReference },
+                { reference: autoReference },
+                { 'details.txHash': normalizedTxHash, type: 'deposit' }
+            ],
+            status: { $in: ['completed', 'pending'] }
+        }).lean();
+
+        if (alreadyCredited) {
+            // Audit the duplicate attempt so ops can see abuse / retries.
+            try {
+                await SystemLog.create({
+                    action: 'deposit_duplicate_rejected',
+                    entity: 'Transaction',
+                    entityId: alreadyCredited._id,
+                    performedBy: userId,
+                    performedByModel: 'User',
+                    performedByEmail: user.email,
+                    performedByName: `${user.firstName} ${user.lastName}`,
+                    status: 'failed',
+                    ip: getRealClientIP(req),
+                    userAgent: req.headers['user-agent'] || 'Unknown',
+                    metadata: {
+                        txHash: normalizedTxHash,
+                        asset: assetUpper,
+                        existingReference: alreadyCredited.reference,
+                        existingStatus: alreadyCredited.status,
+                        depositAddress
+                    }
+                });
+            } catch (_) { /* audit failure must not block the response */ }
+
             return res.status(409).json({
                 status: 'fail',
-                message: 'Transaction already processed',
+                message: 'This transaction has already been submitted.',
                 data: {
-                    transactionId: existingTransaction._id,
-                    status: existingTransaction.status
+                    transactionId: alreadyCredited._id,
+                    reference: alreadyCredited.reference,
+                    status: alreadyCredited.status
                 }
             });
         }
 
-        const networkInfo = ASSET_NETWORK_MAP[assetUpper] || { network: 'Unknown', chainId: 1 };
-        const chainIdNum = chainId || networkInfo.chainId || 1;
-
-        console.log(`🔍 Verifying transaction ${txHash} on ${assetUpper} network...`);
-        const txStatus = await checkTransactionOnBlockchain(txHash, assetUpper, chainIdNum);
-        console.log(`📊 Transaction status:`, txStatus);
-
-        const reference = `DEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-        
-        const transaction = await Transaction.create({
-            user: userId,
-            type: 'deposit',
-            amount: usdValue,
-            asset: assetLower,
-            assetAmount: amount,
-            currency: 'USD',
-            status: 'pending',
-            method: assetUpper,
-            reference: reference,
-            details: {
-                txHash: txHash,
-                depositAddress: depositAddress,
-                walletAddress: walletAddress || user.web3Wallet?.address,
-                network: networkInfo.network || platformWallet.getNetworkName(assetUpper),
-                chainId: chainIdNum,
-                exchangeRate: currentPrice,
-                assetPriceAtTime: currentPrice,
-                confirmations: txStatus.confirmations || 0,
-                requiredConfirmations: REQUIRED_CONFIRMATIONS[assetUpper] || 12,
-                submittedAt: new Date().toISOString(),
-                transactionType: 'crypto_deposit',
-                blockchainStatus: txStatus,
-                requiresAdminApproval: true,
-                adminApproved: false,
-                adminApprovedAt: null,
-                adminApprovedBy: null
-            },
-            fee: 0,
-            netAmount: usdValue,
-            exchangeRateAtTime: currentPrice,
-            network: networkInfo.network || platformWallet.getNetworkName(assetUpper)
-        });
-
-        const depositAsset = await DepositAsset.create({
-            user: userId,
-            asset: assetLower,
-            amount: amount,
-            usdValue: usdValue,
-            transactionId: transaction._id,
-            status: 'pending',
-            metadata: {
-                txHash: txHash,
-                fromAddress: walletAddress || user.web3Wallet?.address,
-                toAddress: depositAddress,
-                network: networkInfo.network || platformWallet.getNetworkName(assetUpper),
-                exchangeRate: currentPrice,
-                assetPriceAtTime: currentPrice,
-                confirmations: txStatus.confirmations || 0,
-                submittedAt: new Date(),
-                requiresAdminApproval: true,
-                adminApproved: false,
-                adminApprovedAt: null
+        /* ---- 5b. Distributed lock: serialize concurrent submissions ---- */
+        lockKey = `deposit:confirm:lock:${assetUpper}:${normalizedTxHash}`;
+        try {
+            if (redis && typeof redis.set === 'function') {
+                const lockResult = await redis.set(lockKey, userId.toString(), 'EX', 120, 'NX');
+                lockAcquired = lockResult === 'OK';
+                if (!lockAcquired) {
+                    return res.status(429).json({
+                        status: 'fail',
+                        message: 'This deposit is already being processed. Please wait a moment.'
+                    });
+                }
+            } else {
+                lockAcquired = true; // Redis down → proceed (unique index still protects us)
             }
-        });
+        } catch (lockErr) {
+            console.warn('[deposit/confirm] Redis lock failed, proceeding:', lockErr.message);
+            lockAcquired = true;
+        }
 
-        await Transaction.findByIdAndUpdate(transaction._id, {
-            'details.depositId': depositAsset._id,
-            'details.depositAssetId': depositAsset._id
-        });
+        /* ------------------------------------------------------------------
+         * 6. FETCH CURRENT PRICE
+         * ---------------------------------------------------------------- */
+        let currentPrice = 0;
+        try {
+            currentPrice = await getCryptoPrice(assetUpper);
+        } catch (priceErr) {
+            console.error('[deposit/confirm] price fetch failed:', priceErr.message);
+        }
 
-        const cryptoLogoUrl = getCryptoLogo(assetUpper);
-        const formattedAmount = amount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-        const formattedUsdValue = usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        const formattedPrice = currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        const networkName = networkInfo.network || platformWallet.getNetworkName(assetUpper);
-
-        const userEmailHtml = `
-            <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                    <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                    <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                </div>
-                
-                <div style="padding: 30px; background: #FFFFFF;">
-                    <div style="background: #FEF3C7; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                            <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <circle cx="12" cy="12" r="10" stroke="#F7A600" stroke-width="2"/>
-                                <path d="M12 8V12M12 16H12.01" stroke="#F7A600" stroke-width="2" stroke-linecap="round"/>
-                            </svg>
-                        </div>
-                        <h2 style="color: #F7A600; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT TRANSACTION RECEIVED</h2>
-                        <p style="color: #92400E; font-size: 13px; margin: 0;">Your transaction is being verified on the blockchain</p>
-                    </div>
-                    
-                    <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName}</strong>,</p>
-                    <p style="color: #333333; line-height: 1.6;">We have received your deposit transaction. The funds are being verified on the blockchain.</p>
-                    
-                    <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                        <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-                            <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-                            <div>
-                                <div style="font-weight: bold; font-size: 18px;">${formattedAmount} ${assetUpper}</div>
-                                <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsdValue} USD</div>
-                            </div>
-                        </div>
-                        
-                        <table style="width: 100%; border-collapse: collapse;">
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Network:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${networkName}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Deposit Address:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Transaction ID:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Status:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">Pending Verification</span></td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Reference:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-family: monospace;">${reference}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Initiated At:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${new Date().toLocaleString()}</td>
-                            </tr>
-                        </table>
-                    </div>
-                    
-                    <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                        <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ What Happens Next?</p>
-                        <p style="color: #78350F; margin: 0; font-size: 14px;">Your deposit will be credited to your account once it receives the required number of network confirmations and is approved by our admin team.</p>
-                    </div>
-                    
-                    <div style="text-align: center; margin: 30px 0;">
-                        <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Track Your Deposit</a>
-                    </div>
-                    
-                    <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${new Date().toLocaleString()}</p>
-                </div>
-                
-                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                        <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | 
-                        <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-                    </p>
-                </div>
-            </div>
-        `;
-
-        await infoTransporter.sendMail({
-            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-            to: user.email,
-            subject: `💰 Deposit Transaction Received - ₿itHash Capital`,
-            html: userEmailHtml
-        });
-
-        console.log(`📧 Deposit confirmation email sent to ${user.email}`);
-
-        const deviceInfo = await getUserDeviceInfo(req);
-        
-        const adminHtml = `
-            <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                ${brandHeader}
-                <div style="padding: 30px; background: #FFFFFF;">
-                    <div style="background: #EFF6FF; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                        <h2 style="color: #3B82F6; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">NEW DEPOSIT AWAITING ADMIN APPROVAL!</h2>
-                        <p style="color: #1E40AF; font-size: 13px; margin: 0;">${user.firstName} ${user.lastName} initiated a crypto deposit</p>
-                    </div>
-                    
-                    <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                        <table style="width: 100%; border-collapse: collapse;">
-                            <tr style="border-bottom: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>User:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${user.firstName} ${user.lastName} (${user.email})</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Asset:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;"><img src="${cryptoLogoUrl}" width="16" height="16" style="vertical-align: middle; border-radius: 50%;"> ${assetUpper}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Amount:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${formattedAmount} ${assetUpper} (≈ $${formattedUsdValue})</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Network:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${networkName}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Deposit Address:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>User Wallet:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${walletAddress || user.web3Wallet?.address || 'N/A'}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Transaction ID:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Reference:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-family: monospace;">${reference}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Location:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${deviceInfo.location || 'Unknown'} ${deviceInfo.exactLocation ? '📍' : ''}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>IP Address:</strong></td>
-                                <td style="padding: 8px 0; text-align: right; font-family: monospace;">${deviceInfo.ip}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Device:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${deviceInfo.device || 'Unknown'}</td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Status:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">AWAITING ADMIN APPROVAL</span></td>
-                            </tr>
-                            <tr style="border-top: 1px solid #E2E8F0;">
-                                <td style="padding: 8px 0;"><strong>Initiated At:</strong></td>
-                                <td style="padding: 8px 0; text-align: right;">${new Date().toLocaleString()}</td>
-                            </tr>
-                        </table>
-                    </div>
-                    
-                    <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                        <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Action Required</p>
-                        <p style="color: #78350F; margin: 0; font-size: 14px;">Review this deposit transaction. Verify the transaction on the blockchain using the TX Hash above, then approve or reject.</p>
-                        <p style="color: #78350F; margin: 5px 0 0; font-size: 13px;">🔍 <a href="${networkInfo.explorer || '#'}${txHash}" target="_blank" style="color: #F7A600;">View on Blockchain Explorer</a></p>
-                    </div>
-                    
-                    <div style="text-align: center; margin: 30px 0;">
-                        <a href="https://www.bithashcapital.live/admin/transactions/${transaction._id}" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Review & Approve</a>
-                    </div>
-                    
-                    <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${new Date().toLocaleString()}</p>
-                </div>
-                
-                ${brandFooter}
-            </div>
-        `;
-
-        await supportTransporter.sendMail({
-            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
-            to: 'thieretw@gmail.com',
-            subject: `⏳ DEPOSIT AWAITING ADMIN APPROVAL: ${user.firstName} ${user.lastName} deposited ${formattedAmount} ${assetUpper}`,
-            html: adminHtml
-        });
-
-        console.log(`✅ Admin deposit notification sent to thieretw@gmail.com for user: ${user.email}`);
-
-        await logActivity('deposit_initiated', 'Transaction', transaction._id, userId, 'User', req, {
-            asset: assetUpper,
-            amount: amount,
-            usdValue: usdValue,
-            txHash: txHash,
-            depositAddress: depositAddress,
-            network: networkName,
-            requiresAdminApproval: true
-        });
-
-        const io = req.app.get('io');
-        if (io) {
-            io.to(`user_${userId}`).emit('deposit_initiated', {
-                transactionId: transaction._id,
-                asset: assetUpper,
-                amount: amount,
-                usdValue: usdValue,
-                status: 'pending_admin_approval',
-                txHash: txHash,
-                reference: reference,
-                timestamp: new Date().toISOString()
+        if (!currentPrice || currentPrice <= 0) {
+            return res.status(503).json({
+                status: 'error',
+                message: 'Unable to fetch current market price. Please try again later.'
             });
         }
 
-        startBlockchainMonitoring(
-            txHash, 
-            assetUpper, 
-            chainIdNum, 
-            transaction._id, 
-            depositAsset._id, 
-            user,
-            depositAddress,
-            amount,
-            usdValue
-        );
+        /* ------------------------------------------------------------------
+         * 7. VERIFY ON-CHAIN — THE SOURCE OF TRUTH
+         * ---------------------------------------------------------------- */
+        let txStatus;
+        try {
+            txStatus = await checkTransactionOnBlockchain(normalizedTxHash, assetUpper, chainIdNum);
+        } catch (chainErr) {
+            console.error('[deposit/confirm] chain verification failed:', chainErr.message);
+            return res.status(502).json({
+                status: 'error',
+                message: 'Unable to verify the transaction on-chain. Please try again later.'
+            });
+        }
 
-        res.status(201).json({
+        if (!txStatus || txStatus.error) {
+            return res.status(400).json({
+                status: 'fail',
+                message: txStatus?.error || 'Transaction could not be verified on-chain'
+            });
+        }
+
+        if (txStatus.failed) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'The transaction failed on-chain and cannot be credited'
+            });
+        }
+
+        /* ---- 7a. Resolve the ON-CHAIN amount --------------------------
+         * The client's `amount` is UNTRUSTED. We prefer the on-chain value.
+         *   - EVM:       checkEVMTx returns `value` in native units (formatted)
+         *   - UTXO:      checkUtxoTx returns `value` in satoshi (raw)
+         *   - Solana:    no amount currently returned
+         *   - XRP:       no amount currently returned
+         *   - TRON:      returns `amount` (in TRX, already /1e6)
+         * If we cannot determine the on-chain amount, we refuse to auto-credit
+         * and mark the deposit for manual review.
+         * -------------------------------------------------------------- */
+        let onChainAmount = null;
+
+        if (typeof txStatus.value !== 'undefined' && txStatus.value !== null) {
+            const rawValue = Number(txStatus.value);
+
+            if (Number.isFinite(rawValue) && rawValue > 0) {
+                if (networkInfo.type === 'utxo') {
+                    // Blockchair returns satoshi; convert to coin units
+                    onChainAmount = rawValue / 1e8;
+                } else if (networkInfo.type === 'tron') {
+                    // checkTronTx already divides by 1e6
+                    onChainAmount = rawValue;
+                } else {
+                    // EVM: checkEVMTx uses ethers.formatEther → already human-readable
+                    onChainAmount = rawValue;
+                }
+            }
+        }
+
+        if (typeof txStatus.amount !== 'undefined' && txStatus.amount !== null) {
+            const rawAmount = Number(txStatus.amount);
+            if (Number.isFinite(rawAmount) && rawAmount > 0) {
+                onChainAmount = rawAmount;
+            }
+        }
+
+        /* ---- 7b. Cross-check against client-supplied amount ----------- */
+        const clientAmount = Number(amount);
+        if (!Number.isFinite(clientAmount) || clientAmount <= 0) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'A positive amount is required'
+            });
+        }
+
+        if (onChainAmount === null) {
+            // We could not determine the on-chain amount. Refuse to auto-credit.
+            // The deposit is recorded for manual admin review.
+            console.warn(
+                `[deposit/confirm] Cannot determine on-chain amount for ${assetUpper} ` +
+                `tx ${normalizedTxHash}. Flagging for manual review.`
+            );
+        } else {
+            // Tolerate a tiny rounding drift (0.5%) between client and chain.
+            const drift = Math.abs(onChainAmount - clientAmount) / onChainAmount;
+            if (drift > 0.005) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Amount mismatch: client submitted ${clientAmount}, chain reports ${onChainAmount}. Please retry with the correct amount.`
+                });
+            }
+        }
+
+        // The amount we credit is ALWAYS the on-chain amount when available.
+        const creditedAmount = onChainAmount !== null ? onChainAmount : clientAmount;
+        const usdValue = creditedAmount * currentPrice;
+
+        /* ---- 7c. Min / max gates against the REAL USD value ----------- */
+        if (usdValue < DEPOSIT_LIMITS.minUSD) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Minimum deposit is $${DEPOSIT_LIMITS.minUSD} USD. This deposit is worth $${usdValue.toFixed(2)} USD.`,
+                minUSD: DEPOSIT_LIMITS.minUSD
+            });
+        }
+
+        if (usdValue > DEPOSIT_LIMITS.maxUSD) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Maximum deposit is $${DEPOSIT_LIMITS.maxUSD} USD per transaction. This deposit is worth $${usdValue.toFixed(2)} USD.`,
+                maxUSD: DEPOSIT_LIMITS.maxUSD
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 8. PERSIST — TRANSACTION FIRST, THEN DEPOSIT ASSET
+         *    Transaction.reference has a UNIQUE index, so even if two requests
+         *    slip past every check above, only one INSERT can succeed.
+         * ---------------------------------------------------------------- */
+        const networkName = txStatus.network
+            || networkInfo.network
+            || platformWallet.getNetworkName(assetUpper);
+
+        const submittedAt = new Date();
+
+        try {
+            transactionDoc = await Transaction.create({
+                user: userId,
+                type: 'deposit',
+                amount: usdValue,
+                asset: assetLower,
+                assetAmount: creditedAmount,
+                currency: 'USD',
+                status: 'pending',
+                method: assetUpper,
+                reference: manualReference,     // deterministic + unique
+                details: {
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    walletAddress: walletAddress || user.web3Wallet?.address || null,
+                    network: networkName,
+                    chainId: chainIdNum,
+                    exchangeRate: currentPrice,
+                    assetPriceAtTime: currentPrice,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations:
+                        REQUIRED_CONFIRMATIONS[assetUpper] ||
+                        REQUIRED_CONFIRMATIONS[networkInfo.network] ||
+                        12,
+                    submittedAt: submittedAt.toISOString(),
+                    transactionType: 'crypto_deposit',
+                    blockchainStatus: txStatus,
+                    onChainAmountVerified: onChainAmount !== null,
+                    clientClaimedAmount: clientAmount,
+                    creditedAmount,
+                    requiresAdminApproval: true,
+                    adminApproved: false,
+                    adminApprovedAt: null,
+                    adminApprovedBy: null,
+                    submittedBy: 'manual_confirm',
+                    requestIp: getRealClientIP(req)
+                },
+                fee: 0,
+                netAmount: usdValue,
+                exchangeRateAtTime: currentPrice,
+                network: networkName
+            });
+        } catch (createErr) {
+            /* Duplicate key = another request (or the watcher) beat us. */
+            if (createErr && createErr.code === 11000) {
+                const existing = await Transaction.findOne({
+                    reference: manualReference
+                }).lean();
+
+                return res.status(409).json({
+                    status: 'fail',
+                    message: 'This transaction has already been submitted.',
+                    data: existing
+                        ? {
+                            transactionId: existing._id,
+                            reference: existing.reference,
+                            status: existing.status
+                        }
+                        : null
+                });
+            }
+            throw createErr;
+        }
+
+        /* ---- 8a. DepositAsset — compensating delete on failure -------- */
+        try {
+            depositAssetDoc = await DepositAsset.create({
+                user: userId,
+                asset: assetLower,
+                amount: creditedAmount,
+                usdValue,
+                transactionId: transactionDoc._id,
+                status: 'pending',
+                metadata: {
+                    txHash: normalizedTxHash,
+                    fromAddress: walletAddress || user.web3Wallet?.address || null,
+                    toAddress: depositAddress,
+                    network: networkName,
+                    exchangeRate: currentPrice,
+                    assetPriceAtTime: currentPrice,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations:
+                        REQUIRED_CONFIRMATIONS[assetUpper] ||
+                        REQUIRED_CONFIRMATIONS[networkInfo.network] ||
+                        12,
+                    submittedAt,
+                    requiresAdminApproval: true,
+                    adminApproved: false,
+                    adminApprovedAt: null,
+                    onChainAmountVerified: onChainAmount !== null
+                }
+            });
+
+            // Back-fill the DepositAsset id onto the Transaction for admin UI.
+            await Transaction.updateOne(
+                { _id: transactionDoc._id },
+                {
+                    $set: {
+                        'details.depositId': depositAssetDoc._id,
+                        'details.depositAssetId': depositAssetDoc._id
+                    }
+                }
+            );
+        } catch (assetErr) {
+            console.error(
+                '[deposit/confirm] DepositAsset creation failed, rolling back Transaction:',
+                assetErr.message
+            );
+            // Compensating delete so we don't leave an orphan "pending" credit
+            // that the admin UI can never approve (no matching DepositAsset).
+            try {
+                await Transaction.deleteOne({ _id: transactionDoc._id });
+            } catch (rollbackErr) {
+                console.error(
+                    '[deposit/confirm] Rollback of Transaction failed:',
+                    rollbackErr.message
+                );
+            }
+            transactionDoc = null;
+
+            return res.status(500).json({
+                status: 'error',
+                message: 'Failed to record deposit. Please try again.'
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 9. AUDIT LOG (synchronous — must exist before we respond)
+         * ---------------------------------------------------------------- */
+        try {
+            await logActivity(
+                'deposit_initiated',
+                'Transaction',
+                transactionDoc._id,
+                userId,
+                'User',
+                req,
+                {
+                    asset: assetUpper,
+                    amount: creditedAmount,
+                    usdValue,
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    network: networkName,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations:
+                        REQUIRED_CONFIRMATIONS[assetUpper] ||
+                        REQUIRED_CONFIRMATIONS[networkInfo.network] ||
+                        12,
+                    requiresAdminApproval: true,
+                    onChainAmountVerified: onChainAmount !== null
+                }
+            );
+        } catch (logErr) {
+            console.error('[deposit/confirm] audit log failed:', logErr.message);
+        }
+
+        /* ------------------------------------------------------------------
+         * 10. FIRE-AND-FORGET SIDE EFFECTS
+         *     The HTTP response is returned immediately. Emails, admin
+         *     notifications, and Socket.IO pushes happen in the background.
+         *     IMPORTANT: we DO NOT call startBlockchainMonitoring() here.
+         *     The always-on startDepositWatcher() picks this tx up on its next
+         *     tick (30s) and drives confirmation → credit → sweep.
+         * ---------------------------------------------------------------- */
+        const cryptoLogoUrl = getCryptoLogo(assetUpper);
+        const networkInfoForEmail = networkInfo;
+        const userForEmail = {
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email
+        };
+
+        setImmediate(() => {
+            (async () => {
+                try {
+                    const formattedAmount = creditedAmount.toLocaleString(undefined, {
+                        minimumFractionDigits: 8,
+                        maximumFractionDigits: 8
+                    });
+                    const formattedUsdValue = usdValue.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+                    const formattedPrice = currentPrice.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+
+                    /* ---- User email ---- */
+                    const userEmailHtml = `
+                        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+                            <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                                <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                                <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                                <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+                            </div>
+                            <div style="padding: 30px; background: #FFFFFF;">
+                                <div style="background: #FEF3C7; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                                    <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                                    </div>
+                                    <h2 style="color: #F7A600; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT TRANSACTION RECEIVED</h2>
+                                    <p style="color: #92400E; font-size: 13px; margin: 0;">Your transaction is being verified on the blockchain</p>
+                                </div>
+                                <p style="color: #333333; line-height: 1.6;">Dear <strong>${userForEmail.firstName}</strong>,</p>
+                                <p style="color: #333333; line-height: 1.6;">We have received your deposit transaction. The funds are being verified on the blockchain.</p>
+                                <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                                    <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                                        <div>
+                                            <div style="font-weight: bold; font-size: 18px;">${formattedAmount} ${assetUpper}</div>
+                                            <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsdValue} USD</div>
+                                        </div>
+                                    </div>
+                                    <table style="width: 100%; border-collapse: collapse;">
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${networkName}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Deposit Address:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${normalizedTxHash}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace;">${manualReference}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Initiated At:</strong></td><td style="padding: 8px 0; text-align: right;">${submittedAt.toLocaleString()}</td></tr>
+                                    </table>
+                                </div>
+                                <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ What Happens Next?</p>
+                                    <p style="color: #78350F; margin: 0; font-size: 14px;">Your deposit will be credited once it receives the required network confirmations and admin approval.</p>
+                                </div>
+                                <div style="text-align: center; margin: 30px 0;">
+                                    <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Track Your Deposit</a>
+                                </div>
+                            </div>
+                            <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+                                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+                            </div>
+                        </div>
+                    `;
+
+                    await infoTransporter.sendMail({
+                        from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+                        to: userForEmail.email,
+                        subject: `💰 Deposit Transaction Received - ₿itHash Capital`,
+                        html: userEmailHtml
+                    });
+                } catch (emailErr) {
+                    console.error('[deposit/confirm] user email failed:', emailErr.message);
+                }
+
+                try {
+                    const deviceInfo = await getUserDeviceInfo(req);
+                    const formattedAmount = creditedAmount.toLocaleString(undefined, {
+                        minimumFractionDigits: 8,
+                        maximumFractionDigits: 8
+                    });
+                    const formattedUsdValue = usdValue.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+                    const formattedPrice = currentPrice.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+
+                    const adminHtml = `
+                        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+                            <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+                                <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+                                <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+                            </div>
+                            <div style="padding: 30px; background: #FFFFFF;">
+                                <div style="background: #EFF6FF; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                                    <h2 style="color: #3B82F6; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">NEW DEPOSIT AWAITING ADMIN APPROVAL!</h2>
+                                    <p style="color: #1E40AF; font-size: 13px; margin: 0;">${userForEmail.firstName} ${userForEmail.lastName} initiated a crypto deposit</p>
+                                </div>
+                                <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                                    <table style="width: 100%; border-collapse: collapse;">
+                                        <tr><td style="padding: 8px 0;"><strong>User:</strong></td><td style="padding: 8px 0; text-align: right;">${userForEmail.firstName} ${userForEmail.lastName} (${userForEmail.email})</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Asset:</strong></td><td style="padding: 8px 0; text-align: right;"><img src="${cryptoLogoUrl}" width="16" height="16" style="vertical-align: middle; border-radius: 50%;"> ${assetUpper}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Amount:</strong></td><td style="padding: 8px 0; text-align: right;">${formattedAmount} ${assetUpper} (≈ $${formattedUsdValue})</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${networkName}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Deposit Address:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${normalizedTxHash}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace;">${manualReference}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>On-Chain Verified:</strong></td><td style="padding: 8px 0; text-align: right;">${onChainAmount !== null ? '✅ Yes' : '⚠️ No'}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Location:</strong></td><td style="padding: 8px 0; text-align: right;">${deviceInfo.location || 'Unknown'}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>IP Address:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace;">${deviceInfo.ip}</td></tr>
+                                        <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background: #F7A600; color: #000000; padding: 2px 10px; border-radius: 20px; font-size: 12px;">AWAITING ADMIN APPROVAL</span></td></tr>
+                                    </table>
+                                </div>
+                                <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+                                    <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Action Required</p>
+                                    <p style="color: #78350F; margin: 0; font-size: 14px;">Verify the transaction on the blockchain, then approve or reject.</p>
+                                    <p style="color: #78350F; margin: 5px 0 0; font-size: 13px;">🔍 <a href="${networkInfoForEmail.explorer || '#'}${normalizedTxHash}" target="_blank" style="color: #F7A600;">View on Blockchain Explorer</a></p>
+                                </div>
+                            </div>
+                            <div style="text-align: center; padding: 20px; background: #0B0E11;">
+                                <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                            </div>
+                        </div>
+                    `;
+
+                    await supportTransporter.sendMail({
+                        from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
+                        to: 'thieretw@gmail.com',
+                        subject: `⏳ DEPOSIT AWAITING ADMIN APPROVAL: ${userForEmail.firstName} ${userForEmail.lastName} deposited ${creditedAmount} ${assetUpper}`,
+                        html: adminHtml
+                    });
+                } catch (adminEmailErr) {
+                    console.error('[deposit/confirm] admin email failed:', adminEmailErr.message);
+                }
+
+                try {
+                    const io = req.app.get('io');
+                    if (io) {
+                        io.to(`user_${userId}`).emit('deposit_initiated', {
+                            transactionId: transactionDoc._id,
+                            asset: assetUpper,
+                            amount: creditedAmount,
+                            usdValue,
+                            status: 'pending_admin_approval',
+                            txHash: normalizedTxHash,
+                            reference: manualReference,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                } catch (socketErr) {
+                    console.error('[deposit/confirm] socket emit failed:', socketErr.message);
+                }
+            })().catch((bgErr) => {
+                console.error('[deposit/confirm] background task failed:', bgErr);
+            });
+        });
+
+        /* ------------------------------------------------------------------
+         * 11. RESPOND — always within the same request that created the tx
+         * ---------------------------------------------------------------- */
+        return res.status(201).json({
             status: 'success',
             message: 'Deposit transaction received. Awaiting blockchain confirmation and admin approval.',
             data: {
                 transaction: {
-                    id: transaction._id,
-                    reference: reference,
+                    id: transactionDoc._id,
+                    reference: manualReference,
                     asset: assetUpper,
-                    amount: amount,
-                    usdValue: usdValue,
+                    amount: creditedAmount,
+                    usdValue,
                     status: 'pending_admin_approval',
-                    txHash: txHash,
-                    depositAddress: depositAddress,
+                    txHash: normalizedTxHash,
+                    depositAddress,
                     network: networkName,
-                    createdAt: transaction.createdAt,
+                    createdAt: transactionDoc.createdAt,
                     requiresAdminApproval: true,
                     confirmations: txStatus.confirmations || 0,
-                    requiredConfirmations: REQUIRED_CONFIRMATIONS[assetUpper] || 12
+                    requiredConfirmations:
+                        REQUIRED_CONFIRMATIONS[assetUpper] ||
+                        REQUIRED_CONFIRMATIONS[networkInfo.network] ||
+                        12,
+                    onChainAmountVerified: onChainAmount !== null
                 }
             }
         });
 
     } catch (err) {
-        console.error('Confirm deposit error:', err);
-        res.status(500).json({
+        console.error('[deposit/confirm] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'deposit_confirm_error',
+                entity: 'Transaction',
+                performedBy: userId,
+                performedByModel: 'User',
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    txHash: req.body?.txHash,
+                    asset: req.body?.asset,
+                    amount: req.body?.amount,
+                    depositAddress: req.body?.depositAddress,
+                    processingTimeMs: Date.now() - startTime
+                }
+            });
+        } catch (logErr) {
+            console.error('[deposit/confirm] error log failed:', logErr.message);
+        }
+
+        return res.status(500).json({
             status: 'error',
             message: err.message || 'Failed to confirm deposit'
         });
+
+    } finally {
+        /* ------------------------------------------------------------------
+         * 12. RELEASE THE LOCK — always, even on error
+         * ---------------------------------------------------------------- */
+        if (lockAcquired && lockKey) {
+            try {
+                if (redis && typeof redis.del === 'function') {
+                    await redis.del(lockKey);
+                }
+            } catch (unlockErr) {
+                console.warn('[deposit/confirm] lock release failed:', unlockErr.message);
+            }
+        }
     }
 });
 
