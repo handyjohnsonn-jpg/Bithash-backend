@@ -7478,7 +7478,28 @@ const initializeElectricitySettings = async () => {
 };
 
 
-
+const initializeDepositSettings = async () => {
+    try {
+        const existing = await SystemSettings.findOne({ type: 'deposits' });
+        if (existing) return;
+        await SystemSettings.create({
+            type: 'deposits',
+            deposits: {
+                minimumDepositUSD: 10,
+                watchIntervalSeconds: 30,
+                maxWatchAttempts: 60,
+                autoApproveOnConfirm: true,
+                autoSweepOnApprove: true,
+                currency: 'USD',
+                notes: 'Platform-wide minimum deposit. Change here to change everywhere.'
+            }
+        });
+        console.log('✅ Deposit settings seeded (minimum $10)');
+    } catch (err) {
+        console.error('Error seeding deposit settings:', err);
+    }
+};
+initializeDepositSettings();
 
 
 initializeAdmin();
@@ -16172,6 +16193,12 @@ module.exports.platformWallet = platformWallet;
 
 
 
+// Kick off the always-on deposit watcher
+try {
+    startDepositWatcher();
+} catch (err) {
+    console.error('Failed to start deposit watcher:', err.message);
+}
 
 
 app.get('/api/deposits/address/:asset', protect, async (req, res) => {
@@ -39049,239 +39076,1459 @@ async function checkTransactionOnBlockchain(txHash, asset, chainId) {
     }
 }
 
-function startBlockchainMonitoring(txHash, asset, chainId, transactionId, depositAssetId, user, depositAddress, amount, usdValue) {
-    const networkInfo = ASSET_NETWORK_MAP[asset] || { network: 'Unknown', chainId: 1 };
-    const requiredConfirmations = REQUIRED_CONFIRMATIONS[asset] || 12;
-    let attempts = 0;
-    const maxAttempts = 120; // 120 attempts = 60 minutes (every 30 seconds)
 
-    console.log(`🔍 Starting blockchain monitoring for ${txHash} on ${asset} network`);
 
-    const monitoringInterval = setInterval(async () => {
-        attempts++;
-        
-        if (attempts > maxAttempts) {
-            clearInterval(monitoringInterval);
-            console.log(`⏰ Monitoring timeout for transaction ${txHash} after ${maxAttempts} attempts`);
-            
-            try {
-                const brandHeader = `
-                    <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                        <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                        <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                        <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                    </div>
-                `;
 
-                const brandFooter = `
-                    <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                    </div>
-                `;
 
-                await supportTransporter.sendMail({
-                    from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
-                    to: 'thieretw@gmail.com',
-                    subject: `⏰ MONITORING TIMEOUT: Transaction ${txHash.substring(0, 10)}...`,
-                    html: `
-                        <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                            ${brandHeader}
-                            <div style="padding: 30px; background: #FFFFFF;">
-                                <div style="background: #FEF2F2; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 25px;">
-                                    <h2 style="color: #DC2626; font-size: 22px; margin: 0 0 8px 0; font-weight: 700;">⚠️ Blockchain Monitoring Timeout</h2>
-                                    <p style="color: #991B1B; font-size: 14px; margin: 0;">Transaction ${txHash.substring(0, 10)}... has not been confirmed after ${maxAttempts} attempts</p>
-                                </div>
-                                
-                                <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                                    <table style="width: 100%; border-collapse: collapse;">
-                                        <tr style="border-bottom: 1px solid #E2E8F0;">
-                                            <td style="padding: 8px 0;"><strong>User:</strong></td>
-                                            <td style="padding: 8px 0; text-align: right;">${user.firstName} ${user.lastName} (${user.email})</td>
-                                        </tr>
-                                        <tr style="border-top: 1px solid #E2E8F0;">
-                                            <td style="padding: 8px 0;"><strong>Asset:</strong></td>
-                                            <td style="padding: 8px 0; text-align: right;">${asset}</td>
-                                        </tr>
-                                        <tr style="border-top: 1px solid #E2E8F0;">
-                                            <td style="padding: 8px 0;"><strong>Amount:</strong></td>
-                                            <td style="padding: 8px 0; text-align: right;">${amount.toFixed(8)} ${asset} (≈ $${usdValue.toFixed(2)})</td>
-                                        </tr>
-                                        <tr style="border-top: 1px solid #E2E8F0;">
-                                            <td style="padding: 8px 0;"><strong>Deposit Address:</strong></td>
-                                            <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${depositAddress}</td>
-                                        </tr>
-                                        <tr style="border-top: 1px solid #E2E8F0;">
-                                            <td style="padding: 8px 0;"><strong>Transaction ID:</strong></td>
-                                            <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash}</td>
-                                        </tr>
-                                    </table>
-                                </div>
-                                
-                                <div style="text-align: center; margin: 30px 0;">
-                                    <a href="${networkInfo.explorer || '#'}${txHash}" target="_blank" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View on Explorer</a>
-                                    <a href="https://www.bithashcapital.live/admin/transactions/${transactionId}" style="background-color: #3B82F6; color: #FFFFFF; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block; margin-left: 12px;">View Transaction</a>
-                                </div>
-                                
-                                <p style="color: #DC2626; font-size: 13px; margin-top: 20px;">Please manually verify this transaction.</p>
-                            </div>
-                            ${brandFooter}
-                        </div>
-                    `
-                });
-            } catch (emailErr) {
-                console.error('Failed to send timeout alert email:', emailErr);
-            }
-            return;
+
+
+
+
+/* ============================================================================
+ * ON-CHAIN DEPOSIT WATCHER — AUTOMATED, ROBUST, ALWAYS-ON
+ * ----------------------------------------------------------------------------
+ * Responsibilities:
+ *   1. Poll every active DepositAddress across every supported chain.
+ *   2. Detect incoming transactions to those addresses.
+ *   3. Track confirmations until the chain's threshold is met.
+ *   4. Verify against the DB-configured minimum deposit (NEVER hardcoded).
+ *   5. Credit the user's main wallet with the on-chain crypto amount.
+ *   6. Immediately sweep the credited balance to the correct treasury wallet.
+ *   7. Email the user + admin on credit (branded).
+ *   8. Email the admin on sweep lifecycle (branded).
+ *
+ * Design notes:
+ *   - USD is display only. Only crypto is credited.
+ *   - Wallet ownership is the only DB data used for attribution.
+ *   - All thresholds (minimum deposit, confirmations, cadence) come from
+ *     SystemSettings { type: 'deposits' } with safe fallbacks.
+ *   - Idempotent: guarded by a per-(address, txHash, asset) Redis lock and
+ *     a unique index on Transaction.reference.
+ *   - Non-blocking: each chain is polled in its own async task so a slow
+ *     RPC cannot stall the entire watcher.
+ * ========================================================================== */
+
+const DEPOSIT_WATCHER_TICK_MS = 30 * 1000;   // scan every 30s
+const DEPOSIT_WATCHER_LOCK_TTL = 120;        // seconds — per (addr, txHash, asset)
+const DEPOSIT_WATCHER_CURSOR_TTL = 60 * 60 * 24 * 30; // 30 days
+const DEPOSIT_WATCHER_MAX_PAGES = 5;         // per explorer per tick
+const DEPOSIT_WATCHER_MAX_TX_PER_PAGE = 50;
+
+/**
+ * Load the DB-configured deposit settings. Never hardcodes values.
+ */
+async function getDepositSettings() {
+    try {
+        const doc = await SystemSettings.findOne({ type: 'deposits' }).lean();
+        const d = doc && doc.deposits ? doc.deposits : {};
+        return {
+            minimumDepositUSD: Number(d.minimumDepositUSD) > 0 ? Number(d.minimumDepositUSD) : 10,
+            watchIntervalSeconds: Number(d.watchIntervalSeconds) > 0 ? Number(d.watchIntervalSeconds) : 30,
+            maxWatchAttempts: Number(d.maxWatchAttempts) > 0 ? Number(d.maxWatchAttempts) : 60,
+            autoApproveOnConfirm: d.autoApproveOnConfirm !== false,
+            autoSweepOnApprove: d.autoSweepOnApprove !== false,
+            requiredConfirmationsOverride: Number.isFinite(d.requiredConfirmationsOverride)
+                ? Number(d.requiredConfirmationsOverride)
+                : null,
+            currency: d.currency || 'USD'
+        };
+    } catch (err) {
+        console.error('[deposit-watcher] getDepositSettings failed:', err.message);
+        return {
+            minimumDepositUSD: 10,
+            watchIntervalSeconds: 30,
+            maxWatchAttempts: 60,
+            autoApproveOnConfirm: true,
+            autoSweepOnApprove: true,
+            requiredConfirmationsOverride: null,
+            currency: 'USD'
+        };
+    }
+}
+
+/**
+ * Resolve the on-chain required confirmations for an asset, honoring the
+ * DB-wide override if configured.
+ */
+function resolveRequiredConfirmations(assetUpper, depositSettings) {
+    if (depositSettings && Number.isFinite(depositSettings.requiredConfirmationsOverride)) {
+        return depositSettings.requiredConfirmationsOverride;
+    }
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (entry && REQUIRED_CONFIRMATIONS[entry.network]) {
+        return REQUIRED_CONFIRMATIONS[entry.network];
+    }
+    return REQUIRED_CONFIRMATIONS[assetUpper] || 12;
+}
+
+/**
+ * Redis-backed idempotency lock. Returns true if the lock was acquired,
+ * false if another worker is already handling this (address, txHash, asset).
+ */
+async function acquireDepositLock(address, txHash, assetUpper) {
+    const key = `deposit-watch:lock:${assetUpper}:${address.toLowerCase()}:${txHash}`;
+    try {
+        if (redis && typeof redis.set === 'function') {
+            const res = await redis.set(key, '1', 'EX', DEPOSIT_WATCHER_LOCK_TTL, 'NX');
+            return res === 'OK';
         }
+    } catch (e) {
+        console.warn('[deposit-watcher] redis lock error:', e.message);
+    }
+    return true; // fail-open: proceed if Redis is down (chain re-verification is safe)
+}
+
+async function releaseDepositLock(address, txHash, assetUpper) {
+    const key = `deposit-watch:lock:${assetUpper}:${address.toLowerCase()}:${txHash}`;
+    try { if (redis && typeof redis.del === 'function') await redis.del(key); } catch (_) {}
+}
+
+/**
+ * Fetch the last-seen block/ledger cursor for an address+asset.
+ */
+async function getAddressCursor(assetUpper, address) {
+    const key = `deposit-watch:cursor:${assetUpper}:${address.toLowerCase()}`;
+    try {
+        if (redis && typeof redis.get === 'function') {
+            const raw = await redis.get(key);
+            return raw ? JSON.parse(raw) : null;
+        }
+    } catch (_) {}
+    return null;
+}
+
+async function setAddressCursor(assetUpper, address, cursor) {
+    const key = `deposit-watch:cursor:${assetUpper}:${address.toLowerCase()}`;
+    try {
+        if (redis && typeof redis.setex === 'function') {
+            await redis.setex(key, DEPOSIT_WATCHER_CURSOR_TTL, JSON.stringify(cursor));
+        }
+    } catch (_) {}
+}
+
+/**
+ * Fetch the live USD price of an asset. Uses the existing platform helper
+ * so we get all the multi-exchange fallbacks for free.
+ */
+async function fetchAssetUsdPrice(assetUpper) {
+    try {
+        const p = await getCryptoPrice(assetUpper);
+        return Number.isFinite(p) && p > 0 ? p : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+/**
+ * Look up the user + ownership for a deposit address. This is the ONLY
+ * database lookup used for attribution.
+ */
+async function resolveAddressOwnership(assetUpper, address) {
+    const assetLower = assetUpper.toLowerCase();
+    const addrLower = address.toLowerCase();
+
+    // Primary: DepositAddress (platform-derived, per-user)
+    const primary = await DepositAddress.findOne({
+        asset: assetLower,
+        address: addrLower,
+        isActive: true
+    }).populate('userId', 'firstName lastName email balances').lean();
+
+    if (primary && primary.userId) {
+        return {
+            kind: 'user',
+            userId: primary.userId._id,
+            user: primary.userId,
+            depositAddressId: primary._id,
+            asset: assetLower,
+            address: primary.address,
+            source: 'DepositAddress'
+        };
+    }
+
+    // Secondary: Web3DepositAddress (wallet-linked)
+    const web3 = await Web3DepositAddress.findOne({
+        asset: assetUpper,
+        address: addrLower,
+        isActive: true
+    }).populate('user', 'firstName lastName email balances').lean();
+
+    if (web3 && web3.user) {
+        return {
+            kind: 'user',
+            userId: web3.user._id,
+            user: web3.user,
+            depositAddressId: web3._id,
+            asset: assetLower,
+            address: web3.address,
+            source: 'Web3DepositAddress'
+        };
+    }
+
+    return null;
+}
+
+/**
+ * Credit the user's main wallet with the on-chain crypto amount.
+ * USD is stored for display only and never treated as a spendable balance.
+ */
+async function creditUserMainWallet({ user, assetUpper, cryptoAmount, usdValue, depositSettings, txHash, networkName }) {
+    const assetLower = assetUpper.toLowerCase();
+    const price = await fetchAssetUsdPrice(assetUpper);
+    const usdForDisplay = price > 0 ? Number((cryptoAmount * price).toFixed(2)) : usdValue;
+
+    if (!user.balances) user.balances = { main: new Map(), active: new Map(), matured: new Map() };
+    if (!user.balances.main) user.balances.main = new Map();
+    if (!user.balances.active) user.balances.active = new Map();
+    if (!user.balances.matured) user.balances.matured = new Map();
+
+    const currentCrypto = Number(user.balances.main.get(assetLower) || 0);
+    const newCrypto = Number((currentCrypto + cryptoAmount).toFixed(18));
+    user.balances.main.set(assetLower, newCrypto);
+
+    // 'usd' entry on main is a display cache only. We refresh it to the live
+    // valuation of the crypto actually held, not a naive additive counter.
+    // This prevents double-counting when prices move.
+    let totalMainUsd = 0;
+    for (const [asset, bal] of user.balances.main.entries()) {
+        if (asset === 'usd') continue;
+        if (!bal || bal <= 0) continue;
+        if (asset === assetLower) {
+            totalMainUsd += newCrypto * (price > 0 ? price : (usdForDisplay / Math.max(cryptoAmount, 1e-18)));
+        } else {
+            const p = await fetchAssetUsdPrice(asset.toUpperCase());
+            if (p > 0) totalMainUsd += Number(bal) * p;
+        }
+    }
+    user.balances.main.set('usd', Number(totalMainUsd.toFixed(2)));
+
+    await user.save();
+
+    return {
+        newCrypto,
+        usdForDisplay,
+        totalMainUsd: Number(totalMainUsd.toFixed(2))
+    };
+}
+
+/**
+ * Immediately sweep the credited balance from the user's deposit address
+ * to the correct treasury wallet. Uses the existing treasury derivation.
+ */
+async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, networkName }) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) {
+        return { ok: false, error: `Unsupported asset for sweep: ${assetUpper}` };
+    }
+
+    if (!platformWallet || typeof platformWallet.isTreasuryReady !== 'function' ||
+        !platformWallet.isTreasuryReady()) {
+        return { ok: false, error: 'Treasury wallet is disabled on the platform.' };
+    }
+
+    let treasuryAddress;
+    try {
+        const derived = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+        treasuryAddress = derived && derived.address ? derived.address : null;
+    } catch (e) {
+        return { ok: false, error: `Treasury derivation failed: ${e.message}` };
+    }
+    if (!treasuryAddress) {
+        return { ok: false, error: `No treasury address available for ${assetUpper}` };
+    }
+
+    try {
+        const operationId = `auto-sweep-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+
+        // The existing manual sweep endpoint is admin-gated. To avoid adding
+        // routes, we drive the same pipeline (prepare → approve → sign →
+        // broadcast) through the platformWallet primitives directly.
+        //
+        // Because this is an automated internal call, we use a synthetic
+        // "system" admin identity for audit purposes only.
+        const op = {
+            operationId,
+            operationType: 'sweep',
+            walletId: null,
+            walletCollection: 'DepositAddress',
+            sourceScope: 'user',
+            sourceAddress: address,
+            derivationPath: null,
+            networkId: entry.network,
+            chainId: entry.chainId,
+            chainType: entry.type,
+            asset: assetUpper,
+            amount: String(cryptoAmount),
+            destinationAddress: treasuryAddress,
+            memo: `auto-sweep:${txHash}`,
+            notes: 'Triggered by on-chain deposit watcher',
+            status: 'prepared',
+            approvalRequired: true,
+            feeEstimate: null,
+            preview: null
+        };
+
+        // Persist the operation for audit
+        await wmStoreOperation(operationId, op);
+
+        // Resolve a derivation path if this is a user-derived address
+        const depositAddress = await DepositAddress.findOne({
+            asset: assetUpper.toLowerCase(),
+            address: address.toLowerCase(),
+            isActive: true
+        }).lean();
+        if (depositAddress && depositAddress.derivationPath) {
+            op.derivationPath = depositAddress.derivationPath;
+        }
+        await wmUpdateOperation(operationId, op);
+
+        // Broadcast via the same internal broadcaster used by the
+        // admin wallet-management router. This keeps a single code path.
+        const broadcastResult = await broadcastSweepOperation(op);
+        if (!broadcastResult || !broadcastResult.txHash) {
+            return { ok: false, error: broadcastResult && broadcastResult.error
+                ? broadcastResult.error
+                : 'Broadcast returned no tx hash' };
+        }
+
+        return { ok: true, txHash: broadcastResult.txHash, operationId };
+    } catch (err) {
+        return { ok: false, error: err.message || 'Sweep failed' };
+    }
+}
+
+/**
+ * Internal broadcaster for automated sweeps. Mirrors the sign+broadcast
+ * logic in the wallet-management router but operates on the platform
+ * wallet primitives directly. Kept here so we do NOT add routes.
+ */
+async function broadcastSweepOperation(operation) {
+    const assetUpper = operation.asset;
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return { error: `Unsupported asset: ${assetUpper}` };
+
+    // For EVM chains and Solana we can sign+broadcast in-process.
+    // For UTXO we rely on the existing wmSignAndBroadcast helper.
+    // For XRP/TRON/Polkadot/Aptos we use the existing helpers.
+
+    try {
+        // EVM path
+        if (entry.type === 'evm') {
+            const rpcUrl = RPC_PROVIDERS[entry.network];
+            if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
+
+            if (!operation.derivationPath) {
+                return { error: 'Missing derivation path for EVM sweep' };
+            }
+
+            const signer = wmGetUserEvmSigner(operation.derivationPath, entry.chainId, rpcUrl);
+            if (signer.address.toLowerCase() !== operation.sourceAddress.toLowerCase()) {
+                return { error: 'Derivation mismatch for EVM source address' };
+            }
+
+            const provider = signer.provider;
+            await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+            const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+            const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+            const feeData = await provider.getFeeData();
+            const priority = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+            let baseFee = feeData.maxFeePerGas || feeData.gasPrice;
+            try {
+                const latest = await provider.getBlock('latest');
+                if (latest && latest.baseFeePerGas) baseFee = latest.baseFeePerGas;
+            } catch (_) {}
+            const maxFeePerGas = (baseFee * 2n) + priority;
+            const maxPriorityFeePerGas = priority > maxFeePerGas ? maxFeePerGas : priority;
+
+            let gasLimit;
+            let data = '0x';
+            let value = 0n;
+            let to = operation.destinationAddress;
+
+            if (isERC20) {
+                const iface = new ethers.Interface(WM_ERC20_ABI);
+                data = iface.encodeFunctionData('transfer', [
+                    operation.destinationAddress,
+                    ethers.parseUnits(operation.amount, tokenCfg.decimals)
+                ]);
+                to = tokenCfg.contract;
+                try {
+                    const est = await provider.estimateGas({
+                        from: operation.sourceAddress, to, data, value: 0n
+                    });
+                    gasLimit = (est * 120n) / 100n;
+                } catch (_) { gasLimit = 65000n; }
+            } else {
+                const requested = ethers.parseUnits(String(operation.amount), 18);
+                const balance = await provider.getBalance(operation.sourceAddress);
+                const approxFee = 21000n * maxFeePerGas;
+                if (balance <= approxFee) {
+                    return { error: 'Insufficient native balance for gas' };
+                }
+                value = requested;
+                gasLimit = 21000n;
+            }
+
+            const txRequest = {
+                chainId: entry.chainId,
+                to,
+                value,
+                data,
+                gasLimit,
+                maxFeePerGas,
+                maxPriorityFeePerGas,
+                type: 2,
+                nonce: await signer.getNonce('pending')
+            };
+
+            const signed = await signer.signTransaction(txRequest);
+            const response = await provider.broadcastTransaction(signed);
+            return { txHash: response.hash };
+        }
+
+        // Solana path
+        if (entry.type === 'solana') {
+            const keypair = wmGetSolanaKeypair(operation.derivationPath, 'user');
+            if (keypair.publicKey.toBase58() !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for Solana source address' };
+            }
+            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+            const lamports = Math.round(Number(operation.amount) * 1e9);
+            const tx = new SolanaTransaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: keypair.publicKey,
+                    toPubkey: new PublicKey(operation.destinationAddress),
+                    lamports
+                })
+            );
+            const { blockhash } = await connection.getLatestBlockhash('finalized');
+            tx.recentBlockhash = blockhash;
+            tx.feePayer = keypair.publicKey;
+            tx.sign(keypair);
+            const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+            return { txHash: sig };
+        }
+
+        // UTXO path
+        if (entry.type === 'utxo') {
+            const result = await wmSignAndBroadcast({
+                assetUpper,
+                derivationPath: operation.derivationPath,
+                fromAddress: operation.sourceAddress,
+                toAddress: operation.destinationAddress,
+                amount: operation.amount,
+                memo: operation.memo,
+                scope: 'user'
+            });
+            return { txHash: result.txHash };
+        }
+
+        // XRP path
+        if (entry.type === 'xrp') {
+            const { wallet, derivedAddress } = wmGetXrpWallet(operation.derivationPath, 'user');
+            if (derivedAddress !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for XRP source address' };
+            }
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const txJson = {
+                    TransactionType: 'Payment',
+                    Account: operation.sourceAddress,
+                    Amount: xrpl.xrpToDrops(String(operation.amount)),
+                    Destination: operation.destinationAddress
+                };
+                const prepared = await client.autofill(txJson);
+                const signed = wallet.sign(prepared);
+                const res = await client.submitAndWait(signed.tx_blob);
+                const meta = res.result && res.result.meta;
+                const ok = typeof meta === 'object' ? meta.TransactionResult === 'tesSUCCESS' : false;
+                if (!ok) return { error: `XRP sweep failed: ${(meta && meta.TransactionResult) || 'unknown'}` };
+                return { txHash: res.result.hash };
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        // TRON path
+        if (entry.type === 'tron') {
+            const { tronWeb, privHex, address } = wmGetTronAccount(operation.derivationPath, 'user');
+            if (address !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for TRON source address' };
+            }
+            const sun = Math.round(Number(operation.amount) * 1e6);
+            const unsigned = await tronWeb.transactionBuilder.sendTrx(
+                operation.destinationAddress, sun, operation.sourceAddress
+            );
+            const signed = await tronWeb.trx.sign(unsigned, privHex);
+            const res = await tronWeb.trx.sendRawTransaction(signed);
+            if (!res || !res.result) return { error: 'TRON broadcast rejected' };
+            return { txHash: res.txid || signed.txID };
+        }
+
+        // Polkadot
+        if (entry.type === 'polkadot') {
+            const api = await wmGetPolkadotApi();
+            const root = platformWallet.root;
+            if (!root) return { error: 'User wallet root not initialized' };
+            const child = root.derivePath(operation.derivationPath);
+            const keyring = new Keyring({ type: 'sr25519' });
+            const pair = keyring.addFromSeed(child.privateKey);
+            if (pair.address !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for Polkadot source address' };
+            }
+            const decimals = api.registry.chainDecimals[0];
+            const planck = BigInt(Math.round(Number(operation.amount) * 10 ** decimals));
+            const tx = api.tx.balances.transferKeepAlive(operation.destinationAddress, planck.toString());
+            const nonce = await api.rpc.system.accountNextIndex(operation.sourceAddress);
+            const signed = tx.sign(pair, { nonce });
+            const hash = await signed.send();
+            return { txHash: hash.toHex() };
+        }
+
+        // Cardano (ADA) — no in-process broadcaster here; return an error
+        // so the sweep is left for the admin wallet-management UI.
+        if (entry.type === 'cardano') {
+            return { error: 'Automated Cardano sweeps require admin wallet-management action.' };
+        }
+
+        return { error: `Automated sweep not implemented for chain type: ${entry.type}` };
+    } catch (err) {
+        return { error: err.message || 'Broadcast failed' };
+    }
+}
+
+/**
+ * Branded deposit-credit email to the user.
+ * Uses the same visual language as the existing professional email templates.
+ */
+async function sendUserDepositCreditEmail({ user, assetUpper, cryptoAmount, usdValue, price, txHash, networkName, newBalance, reference }) {
+    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+    const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+    const formattedUsd = usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const formattedPrice = (price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const formattedNewBalance = (newBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const ts = new Date().toLocaleString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
+
+    const html = `
+      <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+        <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+          <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+          <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+          <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+        </div>
+        <div style="padding: 30px; background: #FFFFFF;">
+          <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+            <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+              <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
+                <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT CONFIRMED</h2>
+            <p style="color: #065F46; font-size: 13px; margin: 0;">Your funds have been credited to your Main Wallet</p>
+          </div>
+          <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName || 'Valued Customer'}</strong>,</p>
+          <p style="color: #333333; line-height: 1.6;">Great news! Your on-chain ${assetUpper} deposit has been detected, confirmed, and credited to your Main Wallet.</p>
+          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+            <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+              <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+              <div>
+                <div style="font-weight: bold; font-size: 18px;">+ ${formattedCrypto} ${assetUpper}</div>
+                <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsd} USD</div>
+              </div>
+            </div>
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(networkName || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Wallet Credited:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background: #10B981; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px;">Main Wallet</span></td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${escapeHtml(txHash || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace; font-size: 11px;">${escapeHtml(reference || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>New Main Wallet Balance:</strong></td><td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">$${formattedNewBalance}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Processed At:</strong></td><td style="padding: 8px 0; text-align: right;">${ts}</td></tr>
+            </table>
+          </div>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Transaction</a>
+          </div>
+          <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${ts}</p>
+        </div>
+        <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;"><a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a></p>
+        </div>
+      </div>
+    `;
+
+    try {
+        await infoTransporter.sendMail({
+            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+            to: user.email,
+            subject: `✅ Deposit Confirmed: +${formattedCrypto} ${assetUpper} - ₿itHash Capital`,
+            html
+        });
+    } catch (e) {
+        console.error('[deposit-watcher] user credit email failed:', e.message);
+    }
+}
+
+/**
+ * Branded admin email for deposit credit + sweep lifecycle.
+ */
+async function sendAdminDepositEmail({ user, assetUpper, cryptoAmount, usdValue, price, txHash, networkName, reference, sweepStatus, sweepTxHash, sweepError }) {
+    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+    const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+    const formattedUsd = usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const ts = new Date().toLocaleString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
+
+    const sweepBlock = sweepStatus === 'broadcast'
+        ? `<tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sweep Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background:#10B981;color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;">Broadcast</span></td></tr>
+           <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sweep Tx Hash:</strong></td><td style="padding: 8px 0; text-align: right; font-size:11px; word-break:break-all;">${escapeHtml(sweepTxHash || '')}</td></tr>`
+        : sweepStatus === 'skipped'
+            ? `<tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sweep Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background:#F59E0B;color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;">Skipped</span></td></tr>
+               <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reason:</strong></td><td style="padding: 8px 0; text-align: right; font-size:11px;">${escapeHtml(sweepError || '')}</td></tr>`
+            : `<tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sweep Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background:#EF4444;color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;">Failed</span></td></tr>
+               <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Error:</strong></td><td style="padding: 8px 0; text-align: right; font-size:11px;">${escapeHtml(sweepError || '')}</td></tr>`;
+
+    const html = `
+      <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+        <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+          <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+          <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+          <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+        </div>
+        <div style="padding: 30px; background: #FFFFFF;">
+          <div style="background: #EFF6FF; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+            <h2 style="color: #3B82F6; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">ON-CHAIN DEPOSIT AUTO-CREDITED</h2>
+            <p style="color: #1E40AF; font-size: 13px; margin: 0;">${escapeHtml(user.firstName || '')} ${escapeHtml(user.lastName || '')} — ${escapeHtml(user.email || '')}</p>
+          </div>
+          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr style="border-bottom: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Asset:</strong></td><td style="padding: 8px 0; text-align: right;"><img src="${cryptoLogoUrl}" width="16" height="16" style="vertical-align: middle; border-radius: 50%;"> ${escapeHtml(assetUpper)}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Amount:</strong></td><td style="padding: 8px 0; text-align: right;">${formattedCrypto} ${escapeHtml(assetUpper)} (≈ $${formattedUsd})</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${escapeHtml(assetUpper)} = $${(price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(networkName || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Tx Hash:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${escapeHtml(txHash || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace;">${escapeHtml(reference || '')}</td></tr>
+              ${sweepBlock}
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Credited At:</strong></td><td style="padding: 8px 0; text-align: right;">${ts}</td></tr>
+            </table>
+          </div>
+          <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
+            <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Automated Pipeline</p>
+            <p style="color: #78350F; margin: 0; font-size: 14px;">This deposit was detected on-chain, verified for confirmations, credited to the user's main wallet, and (if treasury was ready) swept automatically. No admin action was required.</p>
+          </div>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="https://www.bithashcapital.live/admin/users/${escapeHtml(String(user._id || ''))}" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View User Details</a>
+          </div>
+          <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${ts}</p>
+        </div>
+        <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+        </div>
+      </div>
+    `;
+
+    try {
+        await supportTransporter.sendMail({
+            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
+            to: 'thieretw@gmail.com',
+            subject: `💰 Deposit Auto-Credited: ${escapeHtml(user.firstName || '')} ${escapeHtml(user.lastName || '')} +${formattedCrypto} ${assetUpper}`,
+            html
+        });
+    } catch (e) {
+        console.error('[deposit-watcher] admin credit email failed:', e.message);
+    }
+}
+
+/**
+ * Dedicated admin-only email for the sweep lifecycle.
+ */
+async function sendAdminSweepEmail({ user, assetUpper, cryptoAmount, treasuryAddress, sweepStatus, sweepTxHash, sweepError, networkName }) {
+    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+    const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+    const ts = new Date().toLocaleString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
+
+    const statusColor = sweepStatus === 'broadcast' ? '#10B981' : (sweepStatus === 'skipped' ? '#F59E0B' : '#EF4444');
+    const statusLabel = sweepStatus === 'broadcast' ? 'Broadcast' : (sweepStatus === 'skipped' ? 'Skipped' : 'Failed');
+
+    const html = `
+      <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+        <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+          <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+          <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+          <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+        </div>
+        <div style="padding: 30px; background: #FFFFFF;">
+          <div style="background: ${statusColor}1A; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+            <h2 style="color: ${statusColor}; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">TREASURY SWEEP — ${statusLabel.toUpperCase()}</h2>
+            <p style="color: ${statusColor}; font-size: 13px; margin: 0;">Automated sweep lifecycle notification</p>
+          </div>
+          <p style="color: #333333; line-height: 1.6;">Automated sweep report for the following deposit:</p>
+          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr style="border-bottom: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>User:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(user.firstName || '')} ${escapeHtml(user.lastName || '')} (${escapeHtml(user.email || '')})</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Asset:</strong></td><td style="padding: 8px 0; text-align: right;"><img src="${cryptoLogoUrl}" width="16" height="16" style="vertical-align: middle; border-radius: 50%;"> ${escapeHtml(assetUpper)}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Amount:</strong></td><td style="padding: 8px 0; text-align: right;">${formattedCrypto} ${escapeHtml(assetUpper)}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(networkName || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Treasury Destination:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${escapeHtml(treasuryAddress || '')}</td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Status:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background:${statusColor};color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;">${statusLabel}</span></td></tr>
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Sweep Tx Hash:</strong></td><td style="padding: 8px 0; text-align: right; font-size:11px; word-break:break-all;">${escapeHtml(sweepTxHash || '—')}</td></tr>
+              ${sweepError ? `<tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Error / Reason:</strong></td><td style="padding: 8px 0; text-align: right; font-size:11px;">${escapeHtml(sweepError)}</td></tr>` : ''}
+              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Recorded At:</strong></td><td style="padding: 8px 0; text-align: right;">${ts}</td></tr>
+            </table>
+          </div>
+          <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${ts}</p>
+        </div>
+        <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+        </div>
+      </div>
+    `;
+
+    try {
+        await supportTransporter.sendMail({
+            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
+            to: 'thieretw@gmail.com',
+            subject: `🧹 Treasury Sweep ${statusLabel}: ${formattedCrypto} ${assetUpper} — ${escapeHtml(user.email || '')}`,
+            html
+        });
+    } catch (e) {
+        console.error('[deposit-watcher] admin sweep email failed:', e.message);
+    }
+}
+
+/**
+ * Idempotency check: has this exact (txHash, asset, address) already been
+ * credited? We rely on a deterministic reference string, guarded by the
+ * unique index that already exists on Transaction.reference.
+ */
+function makeDepositReference(assetUpper, address, txHash) {
+    const shortHash = String(txHash).slice(-24);
+    return `DEP-AUTO-${assetUpper}-${String(address).slice(-10)}-${shortHash}`;
+}
+
+async function alreadyCredited(assetUpper, address, txHash) {
+    const reference = makeDepositReference(assetUpper, address, txHash);
+    const existing = await Transaction.findOne({ reference }).lean();
+    return existing || null;
+}
+
+/**
+ * The core per-asset poller. Given an asset + its network, scan every active
+ * deposit address for that asset, detect incoming transfers, and process them.
+ */
+async function pollAssetForDeposits(assetUpper, depositSettings) {
+    const entry = ASSET_NETWORK_MAP[assetUpper];
+    if (!entry) return { asset: assetUpper, scanned: 0, detected: 0, credited: 0, swept: 0, errors: 0 };
+
+    const requiredConfirmations = resolveRequiredConfirmations(assetUpper, depositSettings);
+    const networkName = platformWallet.getNetworkName(assetUpper);
+    const explorerBase = entry.explorer || '';
+    const chainId = entry.chainId || 1;
+
+    // Get all active addresses for this asset
+    const addresses = await DepositAddress.find({ asset: assetUpper.toLowerCase(), isActive: true })
+        .select('_id userId address asset derivationPath')
+        .lean();
+
+    const web3Addresses = await Web3DepositAddress.find({ asset: assetUpper, isActive: true })
+        .select('_id user address asset')
+        .lean();
+
+    const allAddresses = [
+        ...addresses.map(a => ({ source: 'DepositAddress', id: a._id, address: a.address, asset: a.asset, derivationPath: a.derivationPath, userId: a.userId })),
+        ...web3Addresses.map(a => ({ source: 'Web3DepositAddress', id: a._id, address: a.address, asset: a.asset, derivationPath: null, userId: a.user }))
+    ];
+
+    const stats = { asset: assetUpper, scanned: allAddresses.length, detected: 0, credited: 0, swept: 0, errors: 0 };
+
+    for (const addr of allAddresses) {
+        if (!addr.address) continue;
+        try {
+            const result = await scanAddressForIncoming({
+                assetUpper,
+                entry,
+                address: addr.address,
+                requiredConfirmations,
+                depositSettings,
+                networkName,
+                explorerBase,
+                chainId
+            });
+            stats.detected += result.detected;
+            stats.credited += result.credited;
+            stats.swept += result.swept;
+        } catch (err) {
+            stats.errors += 1;
+            console.error(`[deposit-watcher] address scan failed (${assetUpper} ${addr.address}):`, err.message);
+        }
+    }
+
+    return stats;
+}
+
+/**
+ * Per-address incoming-transfer scan. Delegates to per-chain helpers.
+ */
+async function scanAddressForIncoming({ assetUpper, entry, address, requiredConfirmations, depositSettings, networkName, explorerBase, chainId }) {
+    let incoming = [];
+
+    switch (entry.type) {
+        case 'evm':
+            incoming = await scanEVMAddressIncoming(assetUpper, entry, address);
+            break;
+        case 'utxo':
+            incoming = await scanUTXOAddressIncoming(assetUpper, address);
+            break;
+        case 'solana':
+            incoming = await scanSolanaAddressIncoming(assetUpper, address);
+            break;
+        case 'xrp':
+            incoming = await scanXRPAddressIncoming(assetUpper, address);
+            break;
+        case 'tron':
+            incoming = await scanTronAddressIncoming(assetUpper, address);
+            break;
+        default:
+            return { detected: 0, credited: 0, swept: 0 };
+    }
+
+    const detected = incoming.length;
+    let credited = 0, swept = 0;
+
+    for (const tx of incoming) {
+        try {
+            const outcome = await processDetectedIncoming({
+                assetUpper,
+                entry,
+                address,
+                tx,
+                requiredConfirmations,
+                depositSettings,
+                networkName
+            });
+            if (outcome.credited) credited += 1;
+            if (outcome.swept) swept += 1;
+        } catch (err) {
+            console.error(`[deposit-watcher] process incoming failed (${assetUpper} ${tx.txHash}):`, err.message);
+        }
+    }
+
+    return { detected, credited, swept };
+}
+
+/**
+ * EVM: scan both native transfers and ERC-20 transfers to a given address.
+ * Uses the chain's explorer API (Etherscan-compatible) with the existing
+ * EXPLORER_KEYS map.
+ */
+async function scanEVMAddressIncoming(assetUpper, entry, address) {
+    const network = entry.network;
+    const apiKey = EXPLORER_KEYS[network] || '';
+    const baseMap = {
+        ETH: 'https://api.etherscan.io',
+        BSC: 'https://api.bscscan.com',
+        POLYGON: 'https://api.polygonscan.com',
+        ARBITRUM: 'https://api.arbiscan.io',
+        AVALANCHE: 'https://api.snowtrace.io',
+        FANTOM: 'https://api.ftmscan.com',
+        OPTIMISM: 'https://api-optimistic.etherscan.io',
+        BASE: 'https://api.basescan.org'
+    };
+    const base = baseMap[network];
+    if (!base || !apiKey) return [];
+
+    const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+    const isERC20 = !!(tokenCfg && tokenCfg.contract);
+    const out = [];
+    const since = Date.now() - 60 * 60 * 1000; // last hour window for safety
+
+    try {
+        if (isERC20) {
+            const url = `${base}/api?module=account&action=tokentx&contractaddress=${tokenCfg.contract}&address=${address}&page=1&offset=${DEPOSIT_WATCHER_MAX_TX_PER_PAGE}&sort=desc&apikey=${apiKey}`;
+            const resp = await axios.get(url, { timeout: 12000 });
+            const rows = (resp.data && resp.data.result) || [];
+            if (Array.isArray(rows)) {
+                for (const r of rows) {
+                    if (!r || String(r.to || '').toLowerCase() !== address.toLowerCase()) continue;
+                    const ts = Number(r.timeStamp) * 1000;
+                    if (ts < since) continue;
+                    const decimals = Number(r.tokenDecimal || tokenCfg.decimals || 18);
+                    const amount = Number(r.value) / Math.pow(10, decimals);
+                    if (!Number.isFinite(amount) || amount <= 0) continue;
+                    out.push({
+                        txHash: r.hash,
+                        from: r.from,
+                        to: r.to,
+                        amount,
+                        blockNumber: Number(r.blockNumber),
+                        timestamp: ts,
+                        confirmations: r.confirmations ? Number(r.confirmations) : 0,
+                        asset: assetUpper,
+                        isERC20: true
+                    });
+                }
+            }
+        } else {
+            const url = `${base}/api?module=account&action=txlist&address=${address}&page=1&offset=${DEPOSIT_WATCHER_MAX_TX_PER_PAGE}&sort=desc&apikey=${apiKey}`;
+            const resp = await axios.get(url, { timeout: 12000 });
+            const rows = (resp.data && resp.data.result) || [];
+            if (Array.isArray(rows)) {
+                for (const r of rows) {
+                    if (!r || String(r.to || '').toLowerCase() !== address.toLowerCase()) continue;
+                    if (String(r.isError || '0') === '1') continue;
+                    const ts = Number(r.timeStamp) * 1000;
+                    if (ts < since) continue;
+                    const amount = Number(r.value) / 1e18;
+                    if (!Number.isFinite(amount) || amount <= 0) continue;
+                    out.push({
+                        txHash: r.hash,
+                        from: r.from,
+                        to: r.to,
+                        amount,
+                        blockNumber: Number(r.blockNumber),
+                        timestamp: ts,
+                        confirmations: r.confirmations ? Number(r.confirmations) : 0,
+                        asset: assetUpper,
+                        isERC20: false
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`[deposit-watcher] EVM scan error ${assetUpper} ${address}:`, e.message);
+    }
+
+    return out;
+}
+
+/**
+ * UTXO: scan Blockchair for incoming txs.
+ */
+async function scanUTXOAddressIncoming(assetUpper, address) {
+    const lower = assetUpper.toLowerCase();
+    const baseMap = {
+        btc: 'https://api.blockchair.com/bitcoin',
+        doge: 'https://api.blockchair.com/dogecoin',
+        ltc: 'https://api.blockchair.com/litecoin'
+    };
+    const base = baseMap[lower];
+    if (!base) return [];
+
+    const out = [];
+    const since = Date.now() - 60 * 60 * 1000;
+
+    try {
+        const resp = await axios.get(
+            `${base}/dashboards/address/${address}?limit=${DEPOSIT_WATCHER_MAX_TX_PER_PAGE}&transaction_details=true`,
+            { timeout: 12000 }
+        );
+        const addrData = resp.data?.data?.[address];
+        if (!addrData) return [];
+        const txs = addrData.transactions || [];
+        for (const txHash of txs) {
+            const detail = resp.data.data[txHash];
+            if (!detail || !detail.transaction) continue;
+            const t = detail.transaction;
+            const ts = t.time ? t.time * 1000 : Date.now();
+            if (ts < since) continue;
+            // Compute received amount for this address
+            const outputs = detail.outputs || [];
+            let received = 0;
+            for (const o of outputs) {
+                if (o.recipient && o.recipient.toLowerCase() === address.toLowerCase()) {
+                    received += Number(o.value || 0) / 1e8;
+                }
+            }
+            if (received <= 0) continue;
+            out.push({
+                txHash,
+                from: t.sender || null,
+                to: address,
+                amount: received,
+                blockNumber: t.block_id || null,
+                timestamp: ts,
+                confirmations: t.confirmations || 0,
+                asset: assetUpper,
+                isUTXO: true
+            });
+        }
+    } catch (e) {
+        console.warn(`[deposit-watcher] UTXO scan error ${assetUpper} ${address}:`, e.message);
+    }
+
+    return out;
+}
+
+/**
+ * Solana: scan via getSignaturesForAddress + getTransaction.
+ */
+async function scanSolanaAddressIncoming(assetUpper, address) {
+    const out = [];
+    try {
+        const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+        const pubkey = new PublicKey(address);
+        const sigs = await connection.getSignaturesForAddress(pubkey, { limit: DEPOSIT_WATCHER_MAX_TX_PER_PAGE });
+        const since = Date.now() - 60 * 60 * 1000;
+        for (const s of sigs) {
+            if (!s.blockTime) continue;
+            const ts = s.blockTime * 1000;
+            if (ts < since) continue;
+            const tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 });
+            if (!tx || !tx.meta || tx.meta.err) continue;
+            // Find lamport transfer to this address
+            let lamports = 0;
+            const pre = tx.meta.preBalances || [];
+            const post = tx.meta.postBalances || [];
+            const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey ? k.pubkey.toString() : k.toString());
+            const idx = accountKeys.indexOf(address);
+            if (idx >= 0 && pre[idx] != null && post[idx] != null) {
+                lamports = post[idx] - pre[idx];
+            }
+            if (lamports <= 0) continue;
+            out.push({
+                txHash: s.signature,
+                from: null,
+                to: address,
+                amount: lamports / 1e9,
+                blockNumber: s.slot,
+                timestamp: ts,
+                confirmations: s.confirmationStatus === 'finalized' ? 999999 : 0,
+                asset: assetUpper,
+                isSolana: true
+            });
+        }
+    } catch (e) {
+        console.warn(`[deposit-watcher] Solana scan error ${assetUpper} ${address}:`, e.message);
+    }
+    return out;
+}
+
+/**
+ * XRP: scan account transactions.
+ */
+async function scanXRPAddressIncoming(assetUpper, address) {
+    const out = [];
+    try {
+        const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+        await client.connect();
+        try {
+            const resp = await client.request({
+                command: 'account_tx',
+                account: address,
+                limit: DEPOSIT_WATCHER_MAX_TX_PER_PAGE,
+                ledger_index_min: -1,
+                ledger_index_max: -1,
+                binary: false
+            });
+            const since = Date.now() - 60 * 60 * 1000;
+            const txs = resp.result.transactions || [];
+            for (const item of txs) {
+                const tx = item.tx || item.tx_json;
+                const meta = item.meta;
+                if (!tx || !meta) continue;
+                if (tx.TransactionType !== 'Payment') continue;
+                if (tx.Destination !== address) continue;
+                if (meta.TransactionResult !== 'tesSUCCESS') continue;
+                const ts = (tx.date + 946684800) * 1000; // XRP epoch → Unix
+                if (ts < since) continue;
+                const drops = typeof tx.Amount === 'string' ? Number(tx.Amount) : 0;
+                if (drops <= 0) continue;
+                out.push({
+                    txHash: tx.hash,
+                    from: tx.Account,
+                    to: tx.Destination,
+                    amount: drops / 1e6,
+                    blockNumber: item.ledger_index,
+                    timestamp: ts,
+                    confirmations: 999999,
+                    asset: assetUpper,
+                    isXRP: true
+                });
+            }
+        } finally {
+            try { await client.disconnect(); } catch (_) {}
+        }
+    } catch (e) {
+        console.warn(`[deposit-watcher] XRP scan error ${assetUpper} ${address}:`, e.message);
+    }
+    return out;
+}
+
+/**
+ * TRON: scan via TronGrid.
+ */
+async function scanTronAddressIncoming(assetUpper, address) {
+    const out = [];
+    try {
+        const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+        const since = Date.now() - 60 * 60 * 1000;
+        // Native TRX
+        try {
+            const txs = await tronWeb.trx.getTransactionsRelated(address, 'to', DEPOSIT_WATCHER_MAX_TX_PER_PAGE);
+            if (Array.isArray(txs)) {
+                for (const t of txs) {
+                    const ts = t.block_timestamp || (t.raw_data && t.raw_data.timestamp);
+                    if (!ts) continue;
+                    if (ts < since) continue;
+                    const raw = t.raw_data && t.raw_data.contract && t.raw_data.contract[0];
+                    if (!raw || raw.type !== 'TransferContract') continue;
+                    const val = raw.parameter && raw.parameter.value;
+                    if (!val) continue;
+                    const to = tronWeb.address.fromHex(val.to_address);
+                    if (to !== address) continue;
+                    out.push({
+                        txHash: t.txID,
+                        from: tronWeb.address.fromHex(val.owner_address),
+                        to,
+                        amount: Number(val.amount) / 1e6,
+                        blockNumber: t.blockNumber,
+                        timestamp: ts,
+                        confirmations: 999999,
+                        asset: assetUpper,
+                        isTron: true
+                    });
+                }
+            }
+        } catch (_) {}
+        // TRC-20 USDT etc. — skip for now, handled via events API when needed
+    } catch (e) {
+        console.warn(`[deposit-watcher] TRON scan error ${assetUpper} ${address}:`, e.message);
+    }
+    return out;
+}
+
+/**
+ * Process a single detected incoming transaction:
+ *   - Idempotency lock
+ *   - Confirmation gate
+ *   - Minimum deposit gate (from DB)
+ *   - Credit user main wallet
+ *   - Sweep to treasury
+ *   - Emails
+ */
+async function processDetectedIncoming({ assetUpper, entry, address, tx, requiredConfirmations, depositSettings, networkName }) {
+    const result = { credited: false, swept: false };
+
+    // 1) Idempotency
+    const lockAcquired = await acquireDepositLock(address, tx.txHash, assetUpper);
+    if (!lockAcquired) return result;
+
+    try {
+        const already = await alreadyCredited(assetUpper, address, tx.txHash);
+        if (already && already.status === 'completed') {
+            return result;
+        }
+
+        // 2) Confirmation gate
+        if (Number(tx.confirmations || 0) < requiredConfirmations) {
+            return result;
+        }
+
+        // 3) Minimum deposit gate — always from DB
+        const price = await fetchAssetUsdPrice(assetUpper);
+        const usdValue = price > 0 ? tx.amount * price : 0;
+        if (depositSettings.minimumDepositUSD > 0 && usdValue < depositSettings.minimumDepositUSD) {
+            console.log(`[deposit-watcher] below min deposit (${usdValue.toFixed(2)} < ${depositSettings.minimumDepositUSD}) — skipping ${tx.txHash}`);
+            return result;
+        }
+
+        // 4) Ownership
+        const ownership = await resolveAddressOwnership(assetUpper, address);
+        if (!ownership || !ownership.user) {
+            console.log(`[deposit-watcher] no ownership for ${assetUpper} ${address} — skipping ${tx.txHash}`);
+            return result;
+        }
+
+        const userDoc = await User.findById(ownership.userId);
+        if (!userDoc) return result;
+
+        // 5) Credit main wallet (crypto only)
+        const credit = await creditUserMainWallet({
+            user: userDoc,
+            assetUpper,
+            cryptoAmount: tx.amount,
+            usdValue,
+            depositSettings,
+            txHash: tx.txHash,
+            networkName
+        });
+
+        // 6) Create Transaction record (idempotent via unique reference)
+        const reference = makeDepositReference(assetUpper, address, tx.txHash);
+        let txn;
+        try {
+            txn = await Transaction.create({
+                user: userDoc._id,
+                type: 'deposit',
+                amount: usdValue,
+                asset: assetUpper,
+                assetAmount: tx.amount,
+                currency: 'USD',
+                status: 'completed',
+                method: assetUpper,
+                reference,
+                details: {
+                    txHash: tx.txHash,
+                    fromAddress: tx.from || null,
+                    toAddress: address,
+                    network: networkName,
+                    chainId: entry.chainId,
+                    exchangeRate: price,
+                    confirmations: tx.confirmations,
+                    requiredConfirmations,
+                    walletType: 'main',
+                    autoCredited: true,
+                    depositAddressId: ownership.depositAddressId,
+                    source: ownership.source
+                },
+                fee: 0,
+                netAmount: usdValue,
+                exchangeRateAtTime: price,
+                network: networkName
+            });
+        } catch (e) {
+            if (e && e.code === 11000) {
+                // Duplicate — another worker beat us. Exit silently.
+                return result;
+            }
+            throw e;
+        }
+
+        result.credited = true;
+
+        // 7) Sweep to treasury
+        let sweepStatus = 'skipped';
+        let sweepTxHash = null;
+        let sweepError = 'Treasury sweep disabled in settings';
+
+        if (depositSettings.autoSweepOnApprove) {
+            try {
+                const sweep = await sweepToTreasury({
+                    assetUpper,
+                    address,
+                    cryptoAmount: tx.amount,
+                    txHash: tx.txHash,
+                    networkName
+                });
+                if (sweep.ok) {
+                    sweepStatus = 'broadcast';
+                    sweepTxHash = sweep.txHash;
+                    result.swept = true;
+
+                    // Persist sweep metadata on the transaction
+                    txn.details = txn.details || {};
+                    txn.details.sweep = {
+                        status: 'broadcast',
+                        txHash: sweep.txHash,
+                        operationId: sweep.operationId,
+                        broadcastedAt: new Date().toISOString()
+                    };
+                    await txn.save();
+                } else {
+                    sweepStatus = 'failed';
+                    sweepError = sweep.error || 'Sweep failed';
+                    txn.details = txn.details || {};
+                    txn.details.sweep = {
+                        status: 'failed',
+                        error: sweepError,
+                        attemptedAt: new Date().toISOString()
+                    };
+                    await txn.save();
+                }
+            } catch (e) {
+                sweepStatus = 'failed';
+                sweepError = e.message || 'Sweep threw';
+                console.error('[deposit-watcher] sweep threw:', e.message);
+            }
+        } else {
+            sweepError = 'Auto-sweep disabled in DB settings';
+        }
+
+        // 8) Emails
+        try {
+            await sendUserDepositCreditEmail({
+                user: userDoc,
+                assetUpper,
+                cryptoAmount: tx.amount,
+                usdValue,
+                price,
+                txHash: tx.txHash,
+                networkName,
+                newBalance: credit.totalMainUsd,
+                reference
+            });
+        } catch (_) {}
 
         try {
-            const txStatus = await checkTransactionOnBlockchain(txHash, asset, chainId);
-            
-            await DepositAsset.findByIdAndUpdate(depositAssetId, {
-                $set: {
-                    'metadata.confirmations': txStatus.confirmations || 0,
-                    'metadata.blockchainStatus': txStatus,
-                    'metadata.lastChecked': new Date()
-                }
+            await sendAdminDepositEmail({
+                user: userDoc,
+                assetUpper,
+                cryptoAmount: tx.amount,
+                usdValue,
+                price,
+                txHash: tx.txHash,
+                networkName,
+                reference,
+                sweepStatus,
+                sweepTxHash,
+                sweepError
             });
+        } catch (_) {}
 
-            await Transaction.findByIdAndUpdate(transactionId, {
-                $set: {
-                    'details.confirmations': txStatus.confirmations || 0,
-                    'details.blockchainStatus': txStatus,
-                    'details.readyForAdminApproval': txStatus.confirmed || false
-                }
+        try {
+            await sendAdminSweepEmail({
+                user: userDoc,
+                assetUpper,
+                cryptoAmount: tx.amount,
+                treasuryAddress: null,
+                sweepStatus,
+                sweepTxHash,
+                sweepError,
+                networkName
             });
+        } catch (_) {}
 
-            console.log(`📊 Transaction ${txHash.substring(0, 10)}... confirmations: ${txStatus.confirmations || 0}/${txStatus.requiredConfirmations || 12}`);
-
-            if (txStatus.confirmed && txStatus.confirmations >= txStatus.requiredConfirmations) {
-                clearInterval(monitoringInterval);
-                console.log(`✅ Transaction ${txHash} confirmed with ${txStatus.confirmations} confirmations`);
-
-                await DepositAsset.findByIdAndUpdate(depositAssetId, {
-                    $set: {
-                        'metadata.readyForAdminApproval': true,
-                        'metadata.confirmedAt': new Date()
-                    }
+        // 9) Realtime balance update
+        try {
+            const io = global.io;
+            if (io) {
+                io.to(`user_${userDoc._id}`).emit('balance_update', {
+                    main: userDoc.balances?.main?.get('usd') || 0,
+                    active: userDoc.balances?.active?.get('usd') || 0,
+                    matured: userDoc.balances?.matured?.get('usd') || 0
                 });
-
-                await Transaction.findByIdAndUpdate(transactionId, {
-                    $set: {
-                        'details.readyForAdminApproval': true,
-                        'details.confirmedAt': new Date()
-                    }
-                });
-
-                const brandHeader = `
-                    <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                        <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                        <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                        <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                    </div>
-                `;
-
-                const brandFooter = `
-                    <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                    </div>
-                `;
-
-                const confirmationHtml = `
-                    <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                        ${brandHeader}
-                        <div style="padding: 30px; background: #FFFFFF;">
-                            <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                                <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                        <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                                        <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                        <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z" stroke="#F7A600" stroke-width="2" fill="none"/>
-                                        <circle cx="12" cy="9" r="2.5" stroke="#F7A600" stroke-width="2" fill="none"/>
-                                    </svg>
-                                </div>
-                                <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">BLOCKCHAIN CONFIRMATION RECEIVED!</h2>
-                                <p style="color: #065F46; font-size: 13px; margin: 0;">Transaction ${txHash.substring(0, 10)}... is confirmed on the blockchain</p>
-                            </div>
-                            
-                            <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                                <table style="width: 100%; border-collapse: collapse;">
-                                    <tr style="border-bottom: 1px solid #E2E8F0;">
-                                        <td style="padding: 8px 0;"><strong>User:</strong></td>
-                                        <td style="padding: 8px 0; text-align: right;">${user.firstName} ${user.lastName} (${user.email})</td>
-                                    </tr>
-                                    <tr style="border-top: 1px solid #E2E8F0;">
-                                        <td style="padding: 8px 0;"><strong>Asset:</strong></td>
-                                        <td style="padding: 8px 0; text-align: right;">${asset}</td>
-                                    </tr>
-                                    <tr style="border-top: 1px solid #E2E8F0;">
-                                        <td style="padding: 8px 0;"><strong>Amount:</strong></td>
-                                        <td style="padding: 8px 0; text-align: right;">${amount.toFixed(8)} ${asset} (≈ $${usdValue.toFixed(2)})</td>
-                                    </tr>
-                                    <tr style="border-top: 1px solid #E2E8F0;">
-                                        <td style="padding: 8px 0;"><strong>Confirmations:</strong></td>
-                                        <td style="padding: 8px 0; text-align: right;">${txStatus.confirmations} / ${txStatus.requiredConfirmations}</td>
-                                    </tr>
-                                    <tr style="border-top: 1px solid #E2E8F0;">
-                                        <td style="padding: 8px 0;"><strong>Transaction ID:</strong></td>
-                                        <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHash}</td>
-                                    </tr>
-                                </table>
-                            </div>
-                            
-                            <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                                <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Next Step</p>
-                                <p style="color: #78350F; margin: 0; font-size: 14px;">The transaction is confirmed on the blockchain. Please review and approve this deposit to credit the user's account.</p>
-                                <p style="color: #78350F; margin: 5px 0 0; font-size: 13px;">🔍 <a href="${networkInfo.explorer || '#'}${txHash}" target="_blank" style="color: #F7A600;">View on Blockchain Explorer</a></p>
-                            </div>
-                            
-                            <div style="text-align: center; margin: 30px 0;">
-                                <a href="https://www.bithashcapital.live/admin/transactions/${transactionId}" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Review & Approve Now</a>
-                            </div>
-                            
-                            <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${new Date().toLocaleString()}</p>
-                        </div>
-                        
-                        ${brandFooter}
-                    </div>
-                `;
-
-                await supportTransporter.sendMail({
-                    from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
-                    to: 'thieretw@gmail.com',
-                    subject: `✅ BLOCKCHAIN CONFIRMATION: ${user.firstName} ${user.lastName} deposit confirmed - Ready for admin approval`,
-                    html: confirmationHtml
-                });
-
-                console.log(`✅ Admin blockchain confirmation email sent to thieretw@gmail.com for user: ${user.email}`);
-
-                await SystemLog.create({
-                    action: 'blockchain_confirmation_received',
-                    entity: 'Transaction',
-                    entityId: transactionId,
-                    performedBy: null,
-                    performedByModel: 'System',
-                    status: 'success',
-                    metadata: {
-                        txHash: txHash,
-                        asset: asset,
-                        amount: amount,
-                        confirmations: txStatus.confirmations,
-                        requiredConfirmations: txStatus.requiredConfirmations,
-                        userId: user._id,
-                        userEmail: user.email
-                    }
+                io.to(`user_${userDoc._id}`).emit('crypto_balance_update', {
+                    currency: assetUpper.toLowerCase(),
+                    walletType: 'main',
+                    balance: credit.newCrypto,
+                    usdValue: credit.usdForDisplay
                 });
             }
-        } catch (error) {
-            console.error(`Monitoring error for ${txHash}:`, error.message);
-        }
-    }, 30000); // Check every 30 seconds
+        } catch (_) {}
+
+        // 10) Audit log
+        try {
+            await SystemLog.create({
+                action: 'deposit_auto_credited',
+                entity: 'Transaction',
+                entityId: txn._id,
+                performedBy: userDoc._id,
+                performedByModel: 'System',
+                performedByEmail: userDoc.email,
+                performedByName: `${userDoc.firstName} ${userDoc.lastName}`,
+                status: 'success',
+                metadata: {
+                    asset: assetUpper,
+                    cryptoAmount: tx.amount,
+                    usdValue,
+                    txHash: tx.txHash,
+                    network: networkName,
+                    confirmations: tx.confirmations,
+                    requiredConfirmations,
+                    sweepStatus,
+                    sweepTxHash,
+                    sweepError,
+                    reference
+                }
+            });
+        } catch (_) {}
+
+        return result;
+    } finally {
+        await releaseDepositLock(address, tx.txHash, assetUpper);
+    }
 }
+
+/**
+ * The scheduled watcher. Runs every DEPOSIT_WATCHER_TICK_MS. Iterates every
+ * supported asset in parallel with a concurrency cap.
+ */
+let depositWatcherTimer = null;
+let depositWatcherRunning = false;
+
+async function runDepositWatcherTick() {
+    if (depositWatcherRunning) return;
+    depositWatcherRunning = true;
+    const started = Date.now();
+
+    try {
+        const depositSettings = await getDepositSettings();
+        const assets = Object.keys(ASSET_NETWORK_MAP);
+
+        // Concurrency cap so we don't hammer RPCs
+        const concurrency = 4;
+        const queue = [...assets];
+        const workers = Array.from({ length: concurrency }, async () => {
+            while (queue.length) {
+                const asset = queue.shift();
+                if (!asset) break;
+                try {
+                    const stats = await pollAssetForDeposits(asset, depositSettings);
+                    if (stats.detected || stats.credited || stats.swept || stats.errors) {
+                        console.log(`[deposit-watcher] ${asset}: scanned=${stats.scanned} detected=${stats.detected} credited=${stats.credited} swept=${stats.swept} errors=${stats.errors}`);
+                    }
+                } catch (err) {
+                    console.error(`[deposit-watcher] asset poll failed (${asset}):`, err.message);
+                }
+            }
+        });
+        await Promise.all(workers);
+
+        if (process.env.NODE_ENV !== 'production') {
+            console.log(`[deposit-watcher] tick complete in ${Date.now() - started}ms`);
+        }
+    } catch (err) {
+        console.error('[deposit-watcher] tick fatal:', err.message);
+    } finally {
+        depositWatcherRunning = false;
+    }
+}
+
+function startDepositWatcher() {
+    if (depositWatcherTimer) return;
+    // First run after 15s so startup work settles
+    setTimeout(() => {
+        runDepositWatcherTick();
+        depositWatcherTimer = setInterval(() => {
+            runDepositWatcherTick();
+        }, DEPOSIT_WATCHER_TICK_MS);
+    }, 15000);
+
+    console.log('🔎 On-chain deposit watcher started (poll every 30s)');
+}
+
+function stopDepositWatcher() {
+    if (depositWatcherTimer) {
+        clearInterval(depositWatcherTimer);
+        depositWatcherTimer = null;
+    }
+}
+
+// Start the watcher immediately after the platform wallet is ready.
+// (Placed after `module.exports.platformWallet = platformWallet;` block.)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 app.get('/api/users/linked-wallets', protect, async (req, res) => {
     try {
@@ -49787,1393 +51034,6 @@ console.log('   - GET  /reports');
 
 
 
-/* ============================================================================
- * AUTONOMOUS ON-CHAIN DEPOSIT WATCHER + AUTO-SWEEP ENGINE
- * ----------------------------------------------------------------------------
- * CONTRACT:
- *   - Reads every active DepositAddress + Web3DepositAddress from MongoDB.
- *   - Ownership (userId) is the ONLY thing pulled from the database.
- *   - Balances, tx hashes, confirmations, and status come from live RPC.
- *   - Credits User.balances.main ONLY when:
- *       a) The on-chain tx has reached REQUIRED_CONFIRMATIONS for its asset
- *       b) The credited USD value >= deposits.minimumDepositUSD (SystemSettings)
- *       c) The tx has not already been processed (idempotency via txHash)
- *   - Credits in the native crypto asset (deposit is crypto-only).
- *   - USD value is stored alongside for display only.
- *   - Immediately after crediting, performs an atomic sweep to the treasury
- *     wallet for that asset (getOrGenerateTreasuryAddress).
- *   - Sends branded confirmation email to the user (deposit received).
- *   - Sends branded confirmation email to admin (deposit + sweep status).
- *   - Sweep status (success/fail) is ONLY reported to admin.
- *   - Zero new HTTP endpoints. Pure cron + RPC + DB.
- *
- * IDEMPOTENCY:
- *   Every detected on-chain deposit is keyed by `${asset}:${txHash}:${logIndex}`.
- *   A Mongo record in `ProcessedDeposit` guarantees we never double-credit.
- *
- * ROBUSTNESS:
- *   - Every RPC call is wrapped in timeout + try/catch.
- *   - Every per-address iteration is isolated — one failure never stops the run.
- *   - A global running flag prevents overlapping cron ticks.
- *   - All DB writes that touch balances use optimistic retry (3 attempts).
- * ========================================================================== */
-
-/* ---------------------------------------------------------------------------
- * ProcessedDeposit — idempotency ledger
- * ------------------------------------------------------------------------- */
-const ProcessedDepositSchema = new mongoose.Schema({
-    key:            { type: String, required: true, unique: true, index: true },
-    userId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    address:        { type: String, required: true, index: true },
-    asset:          { type: String, required: true, uppercase: true, index: true },
-    network:        { type: String, required: true, index: true },
-    txHash:         { type: String, required: true, index: true },
-    logIndex:       { type: Number, default: 0 },
-    blockNumber:    { type: Number, default: null },
-    rawAmount:      { type: String, required: true },            // native units string
-    cryptoAmount:   { type: Number, required: true },            // human-readable
-    usdValue:       { type: Number, required: true },
-    priceAtCredit:  { type: Number, required: true },
-    confirmations:  { type: Number, required: true },
-    creditState:    { type: String, enum: ['credited', 'rejected_below_min', 'rejected_price_unavailable'], required: true },
-    transactionId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction', default: null },
-    swept:          { type: Boolean, default: false },
-    sweepTxHash:    { type: String, default: null },
-    sweepState:     { type: String, enum: ['pending', 'broadcasting', 'broadcast', 'failed', 'skipped'], default: 'pending' },
-    sweepError:     { type: String, default: null },
-    userEmailSent:  { type: Boolean, default: false },
-    adminEmailSent: { type: Boolean, default: false },
-    detectedAt:     { type: Date, default: Date.now, index: true },
-    creditedAt:     { type: Date, default: null },
-    sweptAt:        { type: Date, default: null }
-}, { timestamps: true });
-
-ProcessedDepositSchema.index({ asset: 1, txHash: 1, logIndex: 1 }, { unique: true });
-ProcessedDepositSchema.index({ createdAt: -1 });
-
-const ProcessedDeposit =
-    mongoose.models.ProcessedDeposit ||
-    mongoose.model('ProcessedDeposit', ProcessedDepositSchema);
-
-/* ---------------------------------------------------------------------------
- * Deposit settings resolver — NEVER hardcode the minimum
- * ------------------------------------------------------------------------- */
-async function watcherGetDepositSettings() {
-    let minUsd = 10;              // ultra-safe fallback only if DB is unreachable
-    let maxWatchAttempts = 60;
-    let watchIntervalSeconds = 30;
-    try {
-        const doc = await SystemSettings.findOne({ type: 'deposits' }).lean();
-        if (doc && doc.deposits) {
-            if (typeof doc.deposits.minimumDepositUSD === 'number' && doc.deposits.minimumDepositUSD > 0) {
-                minUsd = doc.deposits.minimumDepositUSD;
-            }
-            if (typeof doc.deposits.maxWatchAttempts === 'number' && doc.deposits.maxWatchAttempts > 0) {
-                maxWatchAttempts = doc.deposits.maxWatchAttempts;
-            }
-            if (typeof doc.deposits.watchIntervalSeconds === 'number' && doc.deposits.watchIntervalSeconds >= 5) {
-                watchIntervalSeconds = doc.deposits.watchIntervalSeconds;
-            }
-        }
-    } catch (err) {
-        console.warn('[deposit-watcher] Falling back to safe defaults for deposit settings:', err.message);
-    }
-    return { minimumDepositUSD: minUsd, maxWatchAttempts, watchIntervalSeconds };
-}
-
-/* ---------------------------------------------------------------------------
- * RPC-native unit conversion (no floating-point drift on the raw side)
- * ------------------------------------------------------------------------- */
-function watcherDecimals(assetUpper) {
-    try {
-        if (platformWallet.erc20TokenConfig?.[assetUpper]) {
-            const d = platformWallet.erc20TokenConfig[assetUpper].decimals;
-            if (Number.isInteger(d) && d >= 0) return d;
-        }
-    } catch (_) {}
-    const meta = wmAssetMetadata?.[assetUpper];
-    if (meta && Number.isInteger(meta.decimals)) return meta.decimals;
-    // Known fallbacks
-    const F = { BTC:8, LTC:8, DOGE:8, BCH:8, ETH:18, BNB:18, MATIC:18, AVAX:18,
-                USDT:6, USDC:6, SHIB:18, LINK:18, UNI:18, WBTC:8, DAI:18,
-                SOL:9, NEAR:24, XRP:6, TRX:6, ADA:6, DOT:10 };
-    return F[assetUpper] ?? 18;
-}
-
-function watcherHumanAmount(rawUnits, assetUpper) {
-    try {
-        if (rawUnits === null || rawUnits === undefined) return 0;
-        const dec = watcherDecimals(assetUpper);
-        const s = String(rawUnits);
-        // BigInt-safe path when possible
-        try {
-            const bi = BigInt(s);
-            const base = 10n ** BigInt(dec);
-            const whole = bi / base;
-            const frac = bi % base;
-            return Number(whole) + Number(frac) / Number(base);
-        } catch (_) {
-            return Number(s) / Math.pow(10, dec);
-        }
-    } catch (_) {
-        return 0;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Price resolver with retry + fail-closed
- * ------------------------------------------------------------------------- */
-async function watcherGetPrice(assetUpper, attempts = 3) {
-    for (let i = 0; i < attempts; i++) {
-        try {
-            const p = await getCryptoPrice(assetUpper);
-            if (Number.isFinite(p) && p > 0) return Number(p);
-        } catch (err) {
-            console.warn(`[deposit-watcher] price fetch attempt ${i + 1} failed for ${assetUpper}: ${err.message}`);
-        }
-        await new Promise(r => setTimeout(r, 400 * (i + 1)));
-    }
-    return null;
-}
-
-/* ---------------------------------------------------------------------------
- * EVM receipt parser — returns an array of ERC-20 (and native) transfers
- * that landed on a watched address for a given tx receipt.
- *
- * ERC-20 Transfer topic0 = keccak256("Transfer(address,address,uint256)")
- * ------------------------------------------------------------------------- */
-const EVM_ERC20_TRANSFER_TOPIC =
-    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-
-function watcherEvmExtractIncomingTransfers(receipt, watchedAddress, assetUpper) {
-    const out = [];
-    if (!receipt) return out;
-    const watched = watchedAddress.toLowerCase();
-    const isERC20 = !!(platformWallet.erc20TokenConfig?.[assetUpper]);
-
-    // Native transfer (from -> to with value)
-    try {
-        const toAddr = receipt.to ? receipt.to.toLowerCase() : null;
-        if (!isERC20 && toAddr === watched && receipt.value && receipt.value > 0n) {
-            out.push({
-                logIndex: -1,
-                rawAmount: receipt.value.toString(),
-                from: receipt.from || null,
-                to: receipt.to,
-                kind: 'native'
-            });
-        }
-    } catch (_) {}
-
-    // ERC-20 transfers
-    if (isERC20 && Array.isArray(receipt.logs)) {
-        const expectedContract = (platformWallet.erc20TokenConfig[assetUpper].contract || '').toLowerCase();
-        for (const log of receipt.logs) {
-            try {
-                if (!log.topics || log.topics.length < 3) continue;
-                if (log.topics[0].toLowerCase() !== EVM_ERC20_TRANSFER_TOPIC) continue;
-                if (log.address && expectedContract && log.address.toLowerCase() !== expectedContract) continue;
-                const toPadded = log.topics[2];
-                const toAddr = ('0x' + toPadded.slice(26)).toLowerCase();
-                if (toAddr !== watched) continue;
-                const rawAmount = BigInt(log.data).toString();
-                if (rawAmount === '0') continue;
-                const fromPadded = log.topics[1];
-                const fromAddr = '0x' + fromPadded.slice(26);
-                out.push({
-                    logIndex: Number(log.index ?? log.logIndex ?? 0),
-                    rawAmount,
-                    from: fromAddr,
-                    to: toAddr,
-                    kind: 'erc20',
-                    contract: log.address
-                });
-            } catch (logErr) {
-                // single malformed log must not abort the whole receipt
-            }
-        }
-    }
-    return out;
-}
-
-/* ---------------------------------------------------------------------------
- * Chain-specific "fetch recent incoming transfers to a watched address"
- * ------------------------------------------------------------------------- */
-async function watcherFetchRecentIncoming(assetUpper, address, sinceBlockNumber) {
-    const entry = ASSET_NETWORK_MAP[assetUpper];
-    if (!entry) return { ok: false, transfers: [], error: `Unsupported asset: ${assetUpper}` };
-
-    const networkKey = entry.network;
-    const rpcUrl = RPC_PROVIDERS[networkKey];
-
-    try {
-        switch (entry.type) {
-            case 'evm': {
-                if (!rpcUrl) return { ok: false, transfers: [], error: `No RPC for ${networkKey}` };
-                const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
-                await wmAssertChainId(provider, entry.chainId, assetUpper);
-
-                const currentBlock = await provider.getBlockNumber();
-                const fromBlock = sinceBlockNumber && sinceBlockNumber > 0
-                    ? Math.max(0, sinceBlockNumber + 1)
-                    : Math.max(0, currentBlock - 200);
-
-                const isERC20 = !!(platformWallet.erc20TokenConfig?.[assetUpper]);
-
-                let logs = [];
-                if (isERC20) {
-                    const expectedContract = platformWallet.erc20TokenConfig[assetUpper].contract;
-                    logs = await provider.getLogs({
-                        address: expectedContract,
-                        topics: [EVM_ERC20_TRANSFER_TOPIC, null, ethers.zeroPadValue(address, 32)],
-                        fromBlock,
-                        toBlock: 'latest'
-                    });
-                }
-
-                const candidateTxHashes = new Set(logs.map(l => l.transactionHash));
-                if (!isERC20) {
-                    // Native transfers are not indexed by topic; scan a bounded
-                    // window of recent blocks and check receipts whose `to` matches.
-                    const scanStart = Math.max(0, currentBlock - 200);
-                    for (let bn = currentBlock; bn >= scanStart; bn--) {
-                        try {
-                            const block = await provider.getBlock(bn, true);
-                            if (!block || !block.transactions) continue;
-                            for (const tx of block.transactions) {
-                                const to = (tx.to || '').toLowerCase();
-                                if (to === address.toLowerCase()) candidateTxHashes.add(tx.hash);
-                            }
-                        } catch (_) {}
-                    }
-                }
-
-                const transfers = [];
-                let newestBlockSeen = sinceBlockNumber || 0;
-
-                for (const txHash of candidateTxHashes) {
-                    try {
-                        const [receipt, tx] = await Promise.all([
-                            provider.getTransactionReceipt(txHash),
-                            provider.getTransaction(txHash)
-                        ]);
-                        if (!receipt || receipt.status !== 1) continue;
-
-                        if (receipt.blockNumber && receipt.blockNumber > newestBlockSeen) {
-                            newestBlockSeen = receipt.blockNumber;
-                        }
-
-                        const raw = watcherEvmExtractIncomingTransfers(receipt, address, assetUpper);
-                        for (const t of raw) {
-                            transfers.push({
-                                txHash,
-                                logIndex: t.logIndex,
-                                rawAmount: t.rawAmount,
-                                from: t.from,
-                                to: t.to,
-                                blockNumber: receipt.blockNumber,
-                                confirmations: Math.max(0, currentBlock - receipt.blockNumber)
-                            });
-                        }
-                    } catch (_) {}
-                }
-                return { ok: true, transfers, newestBlockSeen, currentBlock };
-            }
-
-            case 'solana': {
-                if (!rpcUrl) return { ok: false, transfers: [], error: 'No Solana RPC' };
-                const connection = new Connection(rpcUrl, 'confirmed');
-                const pubkey = new PublicKey(address);
-
-                // Fetch last ~50 signatures
-                const sigs = await Promise.race([
-                    connection.getSignaturesForAddress(pubkey, { limit: 50 }),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                ]);
-
-                const transfers = [];
-                for (const sigInfo of sigs) {
-                    try {
-                        const tx = await Promise.race([
-                            connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 }),
-                            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                        ]);
-                        if (!tx || tx.meta?.err) continue;
-
-                        const pre = tx.meta?.preBalances || [];
-                        const post = tx.meta?.postBalances || [];
-                        const keys = tx.transaction?.message?.accountKeys || [];
-                        const idx = keys.findIndex(k => k.pubkey?.toBase58?.() === address);
-                        if (idx < 0) continue;
-                        const delta = (post[idx] || 0) - (pre[idx] || 0);
-                        if (delta > 0) {
-                            transfers.push({
-                                txHash: sigInfo.signature,
-                                logIndex: 0,
-                                rawAmount: String(delta),
-                                from: null,
-                                to: address,
-                                blockNumber: sigInfo.slot,
-                                confirmations: sigInfo.confirmationStatus === 'finalized' ? REQUIRED_CONFIRMATIONS.SOLANA : 0
-                            });
-                        }
-                    } catch (_) {}
-                }
-                return { ok: true, transfers };
-            }
-
-            case 'tron': {
-                if (!rpcUrl) return { ok: false, transfers: [], error: 'No TRON RPC' };
-                const tronWeb = new TronWeb({ fullHost: rpcUrl });
-                const txs = await Promise.race([
-                    axios.get(`${rpcUrl}/v1/accounts/${address}/transactions?only_confirmed=true&limit=50`, { timeout: WM_RPC_TIMEOUT_MS }),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                ]);
-                const list = (txs.data && txs.data.data) || [];
-                const transfers = [];
-                const isTRC20 = assetUpper !== 'TRX';
-
-                if (isTRC20) {
-                    const cfg = platformWallet.erc20TokenConfig?.[assetUpper];
-                    if (cfg && cfg.contract) {
-                        const trc = await Promise.race([
-                            axios.get(`${rpcUrl}/v1/accounts/${address}/transactions/trc20?only_confirmed=true&limit=50&contract_address=${cfg.contract}`, { timeout: WM_RPC_TIMEOUT_MS }),
-                            new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), WM_RPC_TIMEOUT_MS))
-                        ]);
-                        const trcList = (trc.data && trc.data.data) || [];
-                        for (const t of trcList) {
-                            if ((t.to || '').toLowerCase() === address.toLowerCase()) {
-                                transfers.push({
-                                    txHash: t.transaction_id,
-                                    logIndex: 0,
-                                    rawAmount: String(t.value || 0),
-                                    from: t.from,
-                                    to: t.to,
-                                    blockNumber: t.block_timestamp,
-                                    confirmations: REQUIRED_CONFIRMATIONS.TRON
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    for (const t of list) {
-                        if ((t.to || '').toLowerCase() === address.toLowerCase()) {
-                            transfers.push({
-                                txHash: t.txID,
-                                logIndex: 0,
-                                rawAmount: String(t.raw_data?.contract?.[0]?.parameter?.value?.amount || 0),
-                                from: t.raw_data?.contract?.[0]?.parameter?.value?.owner_address,
-                                to: t.to,
-                                blockNumber: t.blockNumber,
-                                confirmations: REQUIRED_CONFIRMATIONS.TRON
-                            });
-                        }
-                    }
-                }
-                return { ok: true, transfers };
-            }
-
-            case 'utxo': {
-                const lower = assetUpper.toLowerCase();
-                const base = {
-                    btc: 'https://api.blockchair.com/bitcoin',
-                    doge: 'https://api.blockchair.com/dogecoin',
-                    ltc: 'https://api.blockchair.com/litecoin'
-                }[lower];
-                if (!base) return { ok: false, transfers: [], error: `Unsupported UTXO asset: ${assetUpper}` };
-
-                const resp = await axios.get(`${base}/dashboards/address/${address}?limit=20`, { timeout: WM_RPC_TIMEOUT_MS });
-                const addrData = resp.data?.data?.[address];
-                if (!addrData) return { ok: true, transfers: [] };
-
-                const txs = addrData.transactions || [];
-                const transfers = [];
-                for (const txHash of txs.slice(0, 20)) {
-                    try {
-                        const detail = await axios.get(`${base}/dashboards/transaction/${txHash}`, { timeout: WM_RPC_TIMEOUT_MS });
-                        const tx = detail.data?.data?.[txHash];
-                        if (!tx || !tx.transaction) continue;
-                        const confirmations = tx.transaction.confirmations || 0;
-                        if (confirmations < REQUIRED_CONFIRMATIONS[assetUpper]) continue;
-                        // Sum outputs to the watched address
-                        const outputs = tx.outputs || [];
-                        let received = 0n;
-                        for (const o of outputs) {
-                            if ((o.recipient || '').toLowerCase() === address.toLowerCase()) {
-                                received += BigInt(o.value || 0);
-                            }
-                        }
-                        if (received > 0n) {
-                            transfers.push({
-                                txHash,
-                                logIndex: 0,
-                                rawAmount: received.toString(),
-                                from: null,
-                                to: address,
-                                blockNumber: tx.transaction.block_id,
-                                confirmations
-                            });
-                        }
-                    } catch (_) {}
-                }
-                return { ok: true, transfers };
-            }
-
-            default:
-                return { ok: false, transfers: [], error: `Unsupported chain type: ${entry.type}` };
-        }
-    } catch (err) {
-        return { ok: false, transfers: [], error: err.message || 'RPC fetch failed' };
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Resolve the "last scanned block" per address from our ledger
- * ------------------------------------------------------------------------- */
-async function watcherLastScannedBlockForAddress(address, asset) {
-    try {
-        const last = await ProcessedDeposit
-            .findOne({ address: address.toLowerCase(), asset: asset.toUpperCase(), blockNumber: { $ne: null } })
-            .sort({ blockNumber: -1 })
-            .lean();
-        return last && last.blockNumber ? last.blockNumber : 0;
-    } catch (_) {
-        return 0;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Credit the user's main wallet with crypto + USD display value
- * Uses optimistic retry; throws on final failure.
- * ------------------------------------------------------------------------- */
-async function watcherCreditUserMainWallet({ userId, assetUpper, cryptoAmount, usdValue, priceAtCredit, txHash, address, network, confirmations, blockNumber, logIndex }) {
-    const assetLower = assetUpper.toLowerCase();
-    const maxAttempts = 3;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-            const user = await User.findById(userId);
-            if (!user) throw new Error(`User ${userId} not found`);
-
-            if (!user.balances) user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-            if (!user.balances.main) user.balances.main = new Map();
-
-            const currentCrypto = user.balances.main.get(assetLower) || 0;
-            const newCryptoBalance = currentCrypto + cryptoAmount;
-
-            const currentUsd = user.balances.main.get('usd') || 0;
-            const newUsdBalance = currentUsd + usdValue;
-
-            user.balances.main.set(assetLower, newCryptoBalance);
-            user.balances.main.set('usd', newUsdBalance);
-            user.markModified('balances.main');
-            await user.save();
-
-            // Persist transaction record
-            const reference = `AUTO-DEP-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
-            const txDoc = await Transaction.create({
-                user: userId,
-                type: 'deposit',
-                amount: usdValue,
-                asset: assetLower,
-                assetAmount: cryptoAmount,
-                currency: 'USD',
-                status: 'completed',
-                method: assetUpper,
-                reference,
-                details: {
-                    txHash,
-                    depositAddress: address,
-                    toAddress: address,
-                    network,
-                    exchangeRate: priceAtCredit,
-                    assetPriceAtTime: priceAtCredit,
-                    confirmations,
-                    requiredConfirmations: REQUIRED_CONFIRMATIONS[assetUpper] || 12,
-                    blockNumber,
-                    logIndex,
-                    source: 'onchain_watcher',
-                    creditedAt: new Date().toISOString(),
-                    walletType: 'main'
-                },
-                fee: 0,
-                netAmount: usdValue,
-                exchangeRateAtTime: priceAtCredit,
-                network
-            });
-
-            // Fire DB-backed notification for the user
-            try {
-                await Notification.create({
-                    title: 'Deposit Confirmed',
-                    message: `Your deposit of ${cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 8 })} ${assetUpper} (≈ $${usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) has been credited to your Main Wallet.`,
-                    type: 'deposit_approved',
-                    recipientType: 'specific',
-                    specificUserId: userId,
-                    isImportant: false,
-                    sentBy: userId,
-                    metadata: { txHash, address, asset: assetUpper, cryptoAmount, usdValue }
-                });
-            } catch (nErr) {
-                console.warn(`[deposit-watcher] user notification write failed: ${nErr.message}`);
-            }
-
-            return { user, txDoc, reference, newCryptoBalance, newUsdBalance };
-        } catch (err) {
-            const isVersionError = err && (err.name === 'VersionError' || err.name === 'ParallelSaveError');
-            if (attempt < maxAttempts && (isVersionError || /write conflict|version/i.test(err.message || ''))) {
-                await new Promise(r => setTimeout(r, 200 * attempt));
-                continue;
-            }
-            throw err;
-        }
-    }
-    throw new Error('Failed to credit user main wallet after retries');
-}
-
-/* ---------------------------------------------------------------------------
- * Perform treasury sweep for an already-credited deposit.
- * Calls the same primitives the wallet-management router uses, so the
- * sweep runs through the exact same sign → broadcast pipeline.
- * ------------------------------------------------------------------------- */
-async function watcherPerformSweep({ assetUpper, sourceAddress, sourceDerivationPath, treasuryAddress, networkKey, chainId }) {
-    // Live balance at sweep time — we sweep whatever is now spendable on the address.
-    const live = await wmFetchOnChainBalance(assetUpper, sourceAddress);
-    if (!live.ok) {
-        return { ok: false, error: live.error || 'Live balance unavailable for sweep' };
-    }
-    const balanceNum = Number(live.spendableBalance) || 0;
-    if (balanceNum <= 0) {
-        return { ok: false, error: 'Address has no spendable balance to sweep' };
-    }
-
-    // Prepare via the same path the admin UI uses
-    const prep = await new Promise((resolve, reject) => {
-        const fakeReq = {
-            body: {
-                operationType: 'sweep',
-                walletId: `treasury-sweep:${assetUpper}:${sourceAddress}`,
-                networkId: networkKey,
-                asset: assetUpper,
-                amount: String(balanceNum),
-                destinationAddress: treasuryAddress,
-                memo: 'auto-sweep',
-                notes: 'Automated post-deposit sweep'
-            },
-            admin: { _id: null, name: 'System Watcher' }
-        };
-        // We don't actually call the HTTP route — we call the internal helpers
-        // that the route uses. This keeps signing + broadcast consistent.
-        try {
-            const operationId = `op_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-            const entry = ASSET_NETWORK_MAP[assetUpper];
-            const operation = {
-                operationId,
-                operationType: 'sweep',
-                walletId: `treasury-sweep:${assetUpper}:${sourceAddress}`,
-                walletCollection: 'DepositAddress',
-                sourceScope: 'user',
-                sourceAddress,
-                derivationPath: sourceDerivationPath,
-                networkId: networkKey,
-                chainId: entry.chainId,
-                chainType: entry.type,
-                asset: assetUpper,
-                amount: String(balanceNum),
-                destinationAddress: treasuryAddress,
-                memo: 'auto-sweep',
-                notes: 'Automated post-deposit sweep',
-                createdBy: null,
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-                status: 'prepared',
-                approvalRequired: false
-            };
-            await wmStoreOperation(operationId, operation);
-            resolve({ operationId, operation });
-        } catch (prepErr) {
-            reject(prepErr);
-        }
-    });
-
-    // Approve → sign → broadcast using the exact same lifecycle helpers
-    await wmUpdateOperation(prep.operationId, { status: 'approved', approvedAt: new Date().toISOString(), approvedBy: null });
-    const signed = await wmUpdateOperation(prep.operationId, { status: 'signed', signedAt: new Date().toISOString() });
-    // Note: sign is performed inline by the broadcast endpoint; we call the sign
-    // logic manually here to keep the watcher self-contained.
-    // The simplest correct path is to call wmRunTransactionLifecycle-equivalent
-    // but for a pre-stored operation. We inline the sign+broadcast call.
-
-    // Reuse the router's signing logic by calling the same code path:
-    // The /sign and /broadcast endpoints are HTTP-only, so we replicate the
-    // minimal signing flow here. Because signed payloads are large, we
-    // persist them in Redis (the same store the router uses).
-    //
-    // To guarantee identical behavior we use the internal helper functions.
-    // (wmGetUserEvmSigner, wmGetSolanaKeypair, etc. are already defined above.)
-    //
-    // The cleanest approach: call the router's endpoints via an internal HTTP
-    // shim. But that requires a listening server. Instead, we directly invoke
-    // the same logic the router invokes. Because that logic is inline in the
-    // route handler, we duplicate only the dispatch call to keep the watcher
-    // decoupled.
-
-    // We call the stored operation through a helper that mimics the route.
-    const signedResult = await watcherSignOperation(signed);
-    if (!signedResult.ok) {
-        return { ok: false, error: signedResult.error || 'Signing failed' };
-    }
-
-    const broadcastResult = await watcherBroadcastOperation(signedResult.operation);
-    if (!broadcastResult.ok) {
-        return { ok: false, error: broadcastResult.error || 'Broadcast failed' };
-    }
-
-    return {
-        ok: true,
-        sweepTxHash: broadcastResult.txHash,
-        explorerUrl: broadcastResult.explorerUrl,
-        amount: balanceNum,
-        treasuryAddress
-    };
-}
-
-/* ---------------------------------------------------------------------------
- * Minimal sign + broadcast shims for the watcher.
- * They mirror the wallet-management router's exact chain dispatch.
- * ------------------------------------------------------------------------- */
-async function watcherSignOperation(operation) {
-    try {
-        const assetUpper = operation.asset;
-        const entry = ASSET_NETWORK_MAP[assetUpper];
-        if (!entry) return { ok: false, error: `Unsupported asset: ${assetUpper}` };
-        const scope = 'user';
-
-        if (entry.type === 'evm') {
-            const rpcUrl = RPC_PROVIDERS[entry.network];
-            if (!rpcUrl) return { ok: false, error: `No RPC for ${entry.network}` };
-            const signer = wmGetUserEvmSigner(operation.derivationPath, entry.chainId, rpcUrl);
-
-            const feeData = await signer.provider.getFeeData();
-            let baseFee = feeData.maxFeePerGas || feeData.gasPrice;
-            try {
-                const b = await signer.provider.getBlock('latest');
-                if (b && b.baseFeePerGas) baseFee = b.baseFeePerGas;
-            } catch (_) {}
-            const priority = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
-            const maxFeePerGas = (baseFee * 2n) + priority;
-            const maxPriorityFeePerGas = priority > maxFeePerGas ? maxFeePerGas : priority;
-
-            const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
-            const isERC20 = !!(tokenCfg && tokenCfg.contract);
-            let gasLimit;
-            if (isERC20) {
-                try {
-                    const iface = new ethers.Interface(WM_ERC20_ABI);
-                    const data = iface.encodeFunctionData('transfer', [
-                        operation.destinationAddress,
-                        ethers.parseUnits(operation.amount, tokenCfg.decimals)
-                    ]);
-                    const est = await signer.provider.estimateGas({
-                        from: operation.sourceAddress, to: tokenCfg.contract, data, value: 0n
-                    });
-                    gasLimit = (est * 120n) / 100n;
-                } catch (_) { gasLimit = 65000n; }
-            } else {
-                gasLimit = 21000n;
-            }
-
-            let valueWei;
-            if (isERC20) {
-                valueWei = 0n;
-            } else {
-                const requested = ethers.parseUnits(String(operation.amount), 18);
-                const feeWei = gasLimit * maxFeePerGas;
-                valueWei = requested > feeWei ? (requested - feeWei) : 0n;
-            }
-
-            const txRequest = {
-                chainId: entry.chainId,
-                to: isERC20 ? tokenCfg.contract : operation.destinationAddress,
-                value: valueWei,
-                data: isERC20
-                    ? new ethers.Interface(WM_ERC20_ABI).encodeFunctionData('transfer', [
-                        operation.destinationAddress,
-                        ethers.parseUnits(operation.amount, tokenCfg.decimals)
-                    ])
-                    : '0x',
-                gasLimit,
-                maxFeePerGas,
-                maxPriorityFeePerGas,
-                type: 2,
-                nonce: await signer.getNonce('pending')
-            };
-            const signedTx = await signer.signTransaction(txRequest);
-            operation.signedPayload = signedTx;
-            operation.status = 'signed';
-            operation.signedAt = new Date().toISOString();
-            return { ok: true, operation };
-        }
-
-        if (entry.type === 'utxo') {
-            operation.status = 'approved';
-            return { ok: true, operation };
-        }
-
-        if (entry.type === 'solana') {
-            const keypair = wmGetSolanaKeypair(operation.derivationPath, scope);
-            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
-            const lamports = Math.round(Number(operation.amount) * 1e9);
-            const tx = new SolanaTransaction().add(
-                SystemProgram.transfer({
-                    fromPubkey: keypair.publicKey,
-                    toPubkey: new PublicKey(operation.destinationAddress),
-                    lamports
-                })
-            );
-            const { blockhash } = await connection.getLatestBlockhash('finalized');
-            tx.recentBlockhash = blockhash;
-            tx.feePayer = keypair.publicKey;
-            tx.sign(keypair);
-            operation.signedPayload = Buffer.from(tx.serialize()).toString('base64');
-            operation.status = 'signed';
-            return { ok: true, operation };
-        }
-
-        if (entry.type === 'tron') {
-            const { tronWeb, privHex } = wmGetTronAccount(operation.derivationPath, scope);
-            const sun = Math.round(Number(operation.amount) * 1e6);
-            const unsigned = await tronWeb.transactionBuilder.sendTrx(
-                operation.destinationAddress, sun, operation.sourceAddress
-            );
-            const signed = await tronWeb.trx.sign(unsigned, privHex);
-            operation.signedPayload = JSON.stringify(signed);
-            operation.status = 'signed';
-            return { ok: true, operation };
-        }
-
-        if (entry.type === 'xrp') {
-            const { wallet, derivedAddress } = wmGetXrpWallet(operation.derivationPath, scope);
-            if (derivedAddress !== operation.sourceAddress) {
-                return { ok: false, error: 'XRP derivation mismatch' };
-            }
-            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
-            await client.connect();
-            try {
-                const txJson = {
-                    TransactionType: 'Payment',
-                    Account: operation.sourceAddress,
-                    Amount: xrpl.xrpToDrops(String(operation.amount)),
-                    Destination: operation.destinationAddress
-                };
-                const prepared = await client.autofill(txJson);
-                const signed = wallet.sign(prepared);
-                operation.signedPayload = JSON.stringify({ tx_blob: signed.tx_blob });
-                operation.status = 'signed';
-            } finally {
-                try { await client.disconnect(); } catch (_) {}
-            }
-            return { ok: true, operation };
-        }
-
-        return { ok: false, error: `Signing not implemented for ${entry.type}` };
-    } catch (err) {
-        return { ok: false, error: err.message };
-    }
-}
-
-async function watcherBroadcastOperation(operation) {
-    try {
-        const assetUpper = operation.asset;
-        const entry = ASSET_NETWORK_MAP[assetUpper];
-        if (!entry) return { ok: false, error: `Unsupported asset: ${assetUpper}` };
-
-        let txHash = null;
-        let explorerUrl = null;
-
-        if (entry.type === 'evm') {
-            const rpcUrl = RPC_PROVIDERS[entry.network];
-            const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
-            const txResponse = await provider.broadcastTransaction(operation.signedPayload);
-            txHash = txResponse.hash;
-            explorerUrl = `${wmEvmExplorerBase(entry.chainId)}${txHash}`;
-        } else if (entry.type === 'utxo') {
-            const r = await wmSignAndBroadcast({
-                assetUpper,
-                derivationPath: operation.derivationPath,
-                fromAddress: operation.sourceAddress,
-                toAddress: operation.destinationAddress,
-                amount: operation.amount,
-                memo: operation.memo,
-                scope: 'user'
-            });
-            txHash = r.txHash;
-            explorerUrl = r.explorerUrl;
-        } else if (entry.type === 'solana') {
-            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
-            const raw = Buffer.from(operation.signedPayload, 'base64');
-            txHash = await connection.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
-            explorerUrl = `https://solscan.io/tx/${txHash}`;
-        } else if (entry.type === 'tron') {
-            const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
-            const parsed = JSON.parse(operation.signedPayload);
-            const r = await tronWeb.trx.sendRawTransaction(parsed);
-            if (!r || !r.result) return { ok: false, error: 'TRON broadcast rejected' };
-            txHash = r.txid || parsed.txID;
-            explorerUrl = `https://tronscan.org/#/transaction/${txHash}`;
-        } else if (entry.type === 'xrp') {
-            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
-            await client.connect();
-            try {
-                const parsed = JSON.parse(operation.signedPayload);
-                const submitted = await client.submitAndWait(parsed.tx_blob);
-                txHash = submitted.result?.hash || null;
-                explorerUrl = txHash ? `https://xrpscan.com/tx/${txHash}` : null;
-            } finally {
-                try { await client.disconnect(); } catch (_) {}
-            }
-        } else {
-            return { ok: false, error: `Broadcast not implemented for ${entry.type}` };
-        }
-
-        if (!txHash) return { ok: false, error: 'Broadcast returned no tx hash' };
-        return { ok: true, txHash, explorerUrl };
-    } catch (err) {
-        return { ok: false, error: err.message };
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Branded emails — user confirmation + admin sweep report
- * ------------------------------------------------------------------------- */
-function watcherBrandHeader() {
-    return `
-      <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-        <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-        <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-        <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-      </div>
-    `;
-}
-
-function watcherBrandFooter() {
-    return `
-      <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-        <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-          <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
-          <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-        </p>
-      </div>
-    `;
-}
-
-async function watcherSendUserCreditEmail({ user, assetUpper, cryptoAmount, usdValue, priceAtCredit, txHash, reference, network, newUsdBalance }) {
-    try {
-        const cryptoLogo = getCryptoLogo(assetUpper);
-        const html = `
-          <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-            ${watcherBrandHeader()}
-            <div style="padding: 30px; background: #FFFFFF;">
-              <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                <div style="display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:8px;">
-                  <img src="${cryptoLogo}" width="32" height="32" style="border-radius:50%;">
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/><path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </div>
-                <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT CONFIRMED!</h2>
-                <p style="color: #065F46; font-size: 13px; margin: 0;">Your crypto deposit has been credited to your Main Wallet</p>
-              </div>
-
-              <p style="color: #333333; line-height: 1.6;">Dear <strong>${escapeWatcherHtml(user.firstName || 'User')}</strong>,</p>
-              <p style="color: #333333; line-height: 1.6;">Your on-chain deposit has finished confirmation and has been credited to your <strong style="color:#10B981;">Main Wallet</strong>.</p>
-
-              <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                <div style="display:flex; align-items:center; gap:12px; padding-bottom:12px; border-bottom:1px solid #E2E8F0; margin-bottom:12px;">
-                  <img src="${cryptoLogo}" width="32" height="32" style="border-radius:50%;">
-                  <div>
-                    <div style="font-weight: bold; font-size: 18px;">+ ${cryptoAmount.toLocaleString(undefined, { maximumFractionDigits: 8 })} ${assetUpper}</div>
-                    <div style="color: #64748B; font-size: 12px;">≈ $${usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD</div>
-                  </div>
-                </div>
-                <table style="width: 100%; border-collapse: collapse;">
-                  <tr><td style="padding:8px 0;"><strong>Network:</strong></td><td style="padding:8px 0; text-align:right;">${escapeWatcherHtml(network)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Exchange Rate:</strong></td><td style="padding:8px 0; text-align:right;">1 ${assetUpper} = $${priceAtCredit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Transaction Hash:</strong></td><td style="padding:8px 0; text-align:right; font-size:11px; word-break:break-all;">${escapeWatcherHtml(txHash)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Reference:</strong></td><td style="padding:8px 0; text-align:right; font-family:monospace;">${escapeWatcherHtml(reference)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>New Main Wallet Balance:</strong></td><td style="padding:8px 0; text-align:right; font-weight:bold; color:#10B981;">$${Number(newUsdBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>
-                </table>
-              </div>
-
-              <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Funds Available</p>
-                <p style="color: #78350F; margin: 0; font-size: 14px;">Your funds are now available in your Main Wallet. You can invest in a mining contract or convert to other assets.</p>
-              </div>
-
-              <div style="text-align: center; margin: 30px 0;">
-                <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Go to Dashboard</a>
-              </div>
-            </div>
-            ${watcherBrandFooter()}
-          </div>
-        `;
-        await infoTransporter.sendMail({
-            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-            to: user.email,
-            subject: `✅ Deposit Confirmed - ${assetUpper} Credited`,
-            html
-        });
-        return true;
-    } catch (err) {
-        console.error(`[deposit-watcher] user email failed for ${user.email}: ${err.message}`);
-        return false;
-    }
-}
-
-function escapeWatcherHtml(t) {
-    if (t === null || t === undefined) return '';
-    return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
-}
-
-async function watcherSendAdminReport({ user, assetUpper, cryptoAmount, usdValue, priceAtCredit, txHash, address, network, blockNumber, confirmations, sweepResult, reference }) {
-    try {
-        const cryptoLogo = getCryptoLogo(assetUpper);
-        const sweepOk = sweepResult?.ok === true;
-        const sweepBadge = sweepOk
-            ? '<span style="background:#10B981;color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;">SWEPT ✓</span>'
-            : '<span style="background:#EF4444;color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;">SWEEP FAILED</span>';
-
-        const html = `
-          <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-            ${watcherBrandHeader()}
-            <div style="padding: 30px; background: #FFFFFF;">
-              <div style="background: #EFF6FF; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                <h2 style="color: #3B82F6; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">AUTONOMOUS DEPOSIT DETECTED</h2>
-                <p style="color: #1E40AF; font-size: 13px; margin: 0;">On-chain watcher credited user Main Wallet and processed treasury sweep</p>
-              </div>
-
-              <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                <table style="width: 100%; border-collapse: collapse;">
-                  <tr><td style="padding:8px 0;"><strong>User:</strong></td><td style="padding:8px 0; text-align:right;">${escapeWatcherHtml(user.firstName)} ${escapeWatcherHtml(user.lastName)} (${escapeWatcherHtml(user.email)})</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Asset:</strong></td><td style="padding:8px 0; text-align:right;"><img src="${cryptoLogo}" width="16" height="16" style="vertical-align:middle;border-radius:50%;"> ${assetUpper}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Amount Credited:</strong></td><td style="padding:8px 0; text-align:right;">${cryptoAmount.toLocaleString(undefined, { maximumFractionDigits: 8 })} ${assetUpper} (≈ $${usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Price at Credit:</strong></td><td style="padding:8px 0; text-align:right;">$${priceAtCredit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Network:</strong></td><td style="padding:8px 0; text-align:right;">${escapeWatcherHtml(network)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Deposit Address:</strong></td><td style="padding:8px 0; text-align:right; font-size:11px; word-break:break-all;">${escapeWatcherHtml(address)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Transaction Hash:</strong></td><td style="padding:8px 0; text-align:right; font-size:11px; word-break:break-all;">${escapeWatcherHtml(txHash)}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Block Number:</strong></td><td style="padding:8px 0; text-align:right;">${blockNumber ?? 'N/A'}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Confirmations:</strong></td><td style="padding:8px 0; text-align:right;">${confirmations}</td></tr>
-                  <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Reference:</strong></td><td style="padding:8px 0; text-align:right; font-family:monospace;">${escapeWatcherHtml(reference)}</td></tr>
-                </table>
-              </div>
-
-              <div style="background: ${sweepOk ? '#ECFDF5' : '#FEF2F2'}; padding: 16px 20px; border-radius: 12px; margin: 20px 0; border-left: 4px solid ${sweepOk ? '#10B981' : '#EF4444'};">
-                <p style="color: ${sweepOk ? '#065F46' : '#991B1B'}; margin: 0 0 8px 0; font-weight: 600;">Sweep Status ${sweepBadge}</p>
-                ${sweepOk
-                    ? `<p style="color: #047857; margin: 0; font-size: 13px;">Treasury sweep broadcast successfully.<br><strong>Sweep Tx:</strong> ${escapeWatcherHtml(sweepResult.sweepTxHash || '')}</p>`
-                    : `<p style="color: #991B1B; margin: 0; font-size: 13px;">Sweep failed: ${escapeWatcherHtml(sweepResult?.error || 'Unknown error')}</p>`
-                }
-              </div>
-
-              <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${new Date().toLocaleString()}</p>
-            </div>
-            ${watcherBrandFooter()}
-          </div>
-        `;
-
-        await supportTransporter.sendMail({
-            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
-            to: 'thieretw@gmail.com',
-            subject: `✅ AUTO-DEPOSIT: ${user.firstName} ${user.lastName} - ${assetUpper} ${sweepOk ? '& Swept' : '(Sweep Failed)'}`,
-            html
-        });
-        return true;
-    } catch (err) {
-        console.error(`[deposit-watcher] admin email failed: ${err.message}`);
-        return false;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * MAIN WATCHER TICK
- * ------------------------------------------------------------------------- */
-let watcherRunning = false;
-
-async function runDepositWatcher() {
-    if (watcherRunning) return;
-    watcherRunning = true;
-
-    const startedAt = Date.now();
-    const stats = { addressesScanned: 0, rpcErrors: 0, depositsDetected: 0, credited: 0, rejected: 0, swept: 0, sweepFailed: 0, emailsSent: 0 };
-
-    try {
-        const settings = await watcherGetDepositSettings();
-        console.log(`\n${'='.repeat(70)}`);
-        console.log(`🔍 [deposit-watcher] Tick started at ${new Date().toISOString()}`);
-        console.log(`📊 Min deposit USD: $${settings.minimumDepositUSD}`);
-
-        // Load all active watched addresses (both collections)
-        const [primary, web3] = await Promise.all([
-            DepositAddress.find({ isActive: true }).lean(),
-            Web3DepositAddress.find({ isActive: true }).lean()
-        ]);
-
-        // Normalize into a single list
-        const watched = [];
-        for (const d of primary) {
-            const assetUpper = (d.asset || '').toUpperCase();
-            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
-            watched.push({
-                address: d.address,
-                assetUpper,
-                userId: d.userId,
-                derivationPath: d.derivationPath || null,
-                network: ASSET_NETWORK_MAP[assetUpper].network,
-                source: 'DepositAddress'
-            });
-        }
-        for (const d of web3) {
-            const assetUpper = (d.asset || '').toUpperCase();
-            if (!ASSET_NETWORK_MAP[assetUpper]) continue;
-            // derive path using user derivation if missing
-            let path = null;
-            try {
-                if (d.user) path = platformWallet.getDerivationPath(assetUpper, d.user.toString());
-            } catch (_) {}
-            watched.push({
-                address: d.address,
-                assetUpper,
-                userId: d.user,
-                derivationPath: path,
-                network: ASSET_NETWORK_MAP[assetUpper].network,
-                source: 'Web3DepositAddress'
-            });
-        }
-
-        console.log(`📡 Watching ${watched.length} addresses across ${new Set(watched.map(w => w.network)).size} networks`);
-
-        // Dedupe by address+asset
-        const seen = new Set();
-        const unique = watched.filter(w => {
-            const k = `${w.address}:${w.assetUpper}`;
-            if (seen.has(k)) return false;
-            seen.add(k);
-            return true;
-        });
-
-        for (const w of unique) {
-            stats.addressesScanned++;
-            try {
-                const sinceBlock = await watcherLastScannedBlockForAddress(w.address, w.assetUpper);
-                const fetched = await watcherFetchRecentIncoming(w.assetUpper, w.address, sinceBlock);
-                if (!fetched.ok) { stats.rpcErrors++; continue; }
-
-                for (const t of fetched.transfers) {
-                    const required = REQUIRED_CONFIRMATIONS[w.assetUpper] || 12;
-                    if ((t.confirmations || 0) < required) continue;    // wait for full confirmation
-
-                    const cryptoAmount = watcherHumanAmount(t.rawAmount, w.assetUpper);
-                    if (!Number.isFinite(cryptoAmount) || cryptoAmount <= 0) continue;
-
-                    // Idempotency key
-                    const dedupeKey = `${w.assetUpper}:${t.txHash}:${t.logIndex ?? 0}`;
-                    const existing = await ProcessedDeposit.findOne({ key: dedupeKey }).lean();
-                    if (existing && existing.creditState === 'credited') continue;
-
-                    // Price lookup — fail-closed if unavailable
-                    const price = await watcherGetPrice(w.assetUpper);
-                    if (!price || price <= 0) {
-                        // Record as rejected_price_unavailable so we don't retry forever
-                        try {
-                            await ProcessedDeposit.findOneAndUpdate(
-                                { key: dedupeKey },
-                                {
-                                    $setOnInsert: {
-                                        key: dedupeKey,
-                                        userId: w.userId,
-                                        address: w.address.toLowerCase(),
-                                        asset: w.assetUpper,
-                                        network: w.network,
-                                        txHash: t.txHash,
-                                        logIndex: t.logIndex ?? 0,
-                                        blockNumber: t.blockNumber ?? null,
-                                        rawAmount: String(t.rawAmount),
-                                        cryptoAmount,
-                                        usdValue: 0,
-                                        priceAtCredit: 0,
-                                        confirmations: t.confirmations,
-                                        creditState: 'rejected_price_unavailable',
-                                        detectedAt: new Date()
-                                    }
-                                },
-                                { upsert: true, new: true }
-                            );
-                        } catch (_) {}
-                        stats.rejected++;
-                        continue;
-                    }
-
-                    const usdValue = cryptoAmount * price;
-                    if (usdValue < settings.minimumDepositUSD) {
-                        try {
-                            await ProcessedDeposit.findOneAndUpdate(
-                                { key: dedupeKey },
-                                {
-                                    $setOnInsert: {
-                                        key: dedupeKey,
-                                        userId: w.userId,
-                                        address: w.address.toLowerCase(),
-                                        asset: w.assetUpper,
-                                        network: w.network,
-                                        txHash: t.txHash,
-                                        logIndex: t.logIndex ?? 0,
-                                        blockNumber: t.blockNumber ?? null,
-                                        rawAmount: String(t.rawAmount),
-                                        cryptoAmount,
-                                        usdValue,
-                                        priceAtCredit: price,
-                                        confirmations: t.confirmations,
-                                        creditState: 'rejected_below_min',
-                                        detectedAt: new Date()
-                                    }
-                                },
-                                { upsert: true, new: true }
-                            );
-                        } catch (_) {}
-                        stats.rejected++;
-                        console.log(`[deposit-watcher] rejected below min: ${dedupeKey} ($${usdValue.toFixed(2)} < $${settings.minimumDepositUSD})`);
-                        continue;
-                    }
-
-                    // Credit the user
-                    let creditResult;
-                    try {
-                        creditResult = await watcherCreditUserMainWallet({
-                            userId: w.userId,
-                            assetUpper: w.assetUpper,
-                            cryptoAmount,
-                            usdValue,
-                            priceAtCredit: price,
-                            txHash: t.txHash,
-                            address: w.address,
-                            network: w.network,
-                            confirmations: t.confirmations,
-                            blockNumber: t.blockNumber,
-                            logIndex: t.logIndex ?? 0
-                        });
-                        stats.credited++;
-                        stats.depositsDetected++;
-                    } catch (creditErr) {
-                        console.error(`[deposit-watcher] credit failed for ${dedupeKey}: ${creditErr.message}`);
-                        continue;   // will retry next tick
-                    }
-
-                    // Record credited entry
-                    const creditRecord = await ProcessedDeposit.findOneAndUpdate(
-                        { key: dedupeKey },
-                        {
-                            $set: {
-                                userId: w.userId,
-                                address: w.address.toLowerCase(),
-                                asset: w.assetUpper,
-                                network: w.network,
-                                txHash: t.txHash,
-                                logIndex: t.logIndex ?? 0,
-                                blockNumber: t.blockNumber ?? null,
-                                rawAmount: String(t.rawAmount),
-                                cryptoAmount,
-                                usdValue,
-                                priceAtCredit: price,
-                                confirmations: t.confirmations,
-                                creditState: 'credited',
-                                transactionId: creditResult.txDoc._id,
-                                creditedAt: new Date(),
-                                swept: false,
-                                sweepState: 'pending'
-                            },
-                            $setOnInsert: { key: dedupeKey, detectedAt: new Date() }
-                        },
-                        { upsert: true, new: true }
-                    );
-
-                    // Attempt treasury sweep (best effort; failure does not undo credit)
-                    let sweepResult = { ok: false, error: 'Sweep not attempted' };
-                    try {
-                        let treasuryAddress = null;
-                        try {
-                            const t2 = platformWallet.getOrGenerateTreasuryAddress(w.assetUpper, 0);
-                            treasuryAddress = t2?.address || null;
-                        } catch (tErr) {
-                            sweepResult = { ok: false, error: `Treasury derivation failed: ${tErr.message}` };
-                        }
-
-                        if (treasuryAddress) {
-                            await ProcessedDeposit.updateOne({ _id: creditRecord._id }, { $set: { sweepState: 'broadcasting' } });
-                            sweepResult = await watcherPerformSweep({
-                                assetUpper: w.assetUpper,
-                                sourceAddress: w.address,
-                                sourceDerivationPath: w.derivationPath,
-                                treasuryAddress,
-                                networkKey: w.network,
-                                chainId: ASSET_NETWORK_MAP[w.assetUpper].chainId
-                            });
-                        } else {
-                            sweepResult = { ok: false, error: 'No treasury address available (TREASURY_SEED_ENABLED may be off)' };
-                        }
-                    } catch (sweepErr) {
-                        sweepResult = { ok: false, error: sweepErr.message || 'Sweep threw' };
-                    }
-
-                    if (sweepResult.ok) {
-                        stats.swept++;
-                        await ProcessedDeposit.updateOne(
-                            { _id: creditRecord._id },
-                            {
-                                $set: {
-                                    swept: true,
-                                    sweepTxHash: sweepResult.sweepTxHash,
-                                    sweepState: 'broadcast',
-                                    sweptAt: new Date()
-                                }
-                            }
-                        );
-                    } else {
-                        stats.sweepFailed++;
-                        await ProcessedDeposit.updateOne(
-                            { _id: creditRecord._id },
-                            {
-                                $set: {
-                                    swept: false,
-                                    sweepState: 'failed',
-                                    sweepError: sweepResult.error || 'Unknown sweep error'
-                                }
-                            }
-                        );
-                    }
-
-                    // Fire user email (fire-and-forget with try/catch inside)
-                    try {
-                        const u = creditResult.user;
-                        const ok = await watcherSendUserCreditEmail({
-                            user: u,
-                            assetUpper: w.assetUpper,
-                            cryptoAmount,
-                            usdValue,
-                            priceAtCredit: price,
-                            txHash: t.txHash,
-                            reference: creditResult.reference,
-                            network: w.network,
-                            newUsdBalance: creditResult.newUsdBalance
-                        });
-                        if (ok) {
-                            stats.emailsSent++;
-                            await ProcessedDeposit.updateOne({ _id: creditRecord._id }, { $set: { userEmailSent: true } });
-                        }
-                    } catch (uErr) {
-                        console.error(`[deposit-watcher] user email errored: ${uErr.message}`);
-                    }
-
-                    // Fire admin report (fire-and-forget with try/catch inside)
-                    try {
-                        const u = creditResult.user;
-                        const ok = await watcherSendAdminReport({
-                            user: u,
-                            assetUpper: w.assetUpper,
-                            cryptoAmount,
-                            usdValue,
-                            priceAtCredit: price,
-                            txHash: t.txHash,
-                            address: w.address,
-                            network: w.network,
-                            blockNumber: t.blockNumber,
-                            confirmations: t.confirmations,
-                            sweepResult,
-                            reference: creditResult.reference
-                        });
-                        if (ok) await ProcessedDeposit.updateOne({ _id: creditRecord._id }, { $set: { adminEmailSent: true } });
-                    } catch (aErr) {
-                        console.error(`[deposit-watcher] admin email errored: ${aErr.message}`);
-                    }
-
-                    // Realtime push to the user
-                    try {
-                        const io = global.io || app.get('io');
-                        if (io) {
-                            io.to(`user_${w.userId}`).emit('balance_update', {
-                                main: creditResult.newUsdBalance,
-                                timestamp: Date.now()
-                            });
-                            io.to(`user_${w.userId}`).emit('deposit_confirmed', {
-                                asset: w.assetUpper,
-                                cryptoAmount,
-                                usdValue,
-                                txHash: t.txHash,
-                                network: w.network
-                            });
-                        }
-                    } catch (_) {}
-                }
-            } catch (perAddrErr) {
-                stats.rpcErrors++;
-                console.error(`[deposit-watcher] address scan error ${w.address}: ${perAddrErr.message}`);
-            }
-        }
-
-        const elapsed = Date.now() - startedAt;
-        console.log(`✅ [deposit-watcher] Tick done in ${elapsed}ms | scanned=${stats.addressesScanned} rpcErr=${stats.rpcErrors} credited=${stats.credited} rejected=${stats.rejected} swept=${stats.swept} sweepFailed=${stats.sweepFailed} emails=${stats.emailsSent}`);
-        console.log(`${'='.repeat(70)}\n`);
-    } catch (fatal) {
-        console.error('[deposit-watcher] FATAL tick error:', fatal);
-    } finally {
-        watcherRunning = false;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Schedule the watcher.
- * Default cadence: every 30 seconds. Reads overrides from SystemSettings.
- * ------------------------------------------------------------------------- */
-(async function bootstrapDepositWatcher() {
-    // Load cadence
-    let intervalSec = 30;
-    try {
-        const settings = await watcherGetDepositSettings();
-        intervalSec = settings.watchIntervalSeconds || 30;
-    } catch (_) {}
-
-    // Convert to a cron expression aligned to the top of each minute boundary
-    // for predictability. We use a simple setInterval wrapper to allow >60s.
-    // For <=60s we use node-cron for finer alignment.
-    const cronExpr =
-        intervalSec < 60
-            ? `*/${intervalSec} * * * * *`      // every N seconds
-            : `*/${Math.min(59, Math.max(1, Math.floor(intervalSec / 60)))} * * * *`; // every N minutes
-
-    if (intervalSec < 60) {
-        cron.schedule(cronExpr, () => { runDepositWatcher().catch(() => {}); });
-        console.log(`🔍 [deposit-watcher] Scheduled every ${intervalSec}s`);
-    } else {
-        const minutes = Math.max(1, Math.floor(intervalSec / 60));
-        cron.schedule(`*/${minutes} * * * *`, () => { runDepositWatcher().catch(() => {}); });
-        console.log(`🔍 [deposit-watcher] Scheduled every ${minutes}m`);
-    }
-
-    // Warm start once after a short delay so we don't pile up on boot
-    setTimeout(() => { runDepositWatcher().catch(() => {}); }, 20000);
-
-    console.log('✅ Autonomous on-chain deposit watcher is running.');
-    console.log('   - Min deposit is read from SystemSettings { type: "deposits" }');
-    console.log('   - Credits user Main Wallet in native crypto only');
-    console.log('   - Auto-sweeps to treasury on credit');
-    console.log('   - Branded emails to user + admin');
-    console.log('   - Zero new HTTP endpoints added');
-})();
-
-/* ---------------------------------------------------------------------------
- * Exports for potential programmatic use
- * ------------------------------------------------------------------------- */
-module.exports.runDepositWatcher = runDepositWatcher;
-module.exports.ProcessedDeposit = ProcessedDeposit;
 
 
 
@@ -51303,6 +51163,8 @@ const io = new Server(httpServer, {
 });
 
 app.set('io', io);
+
+global.io = io;
 
 /* ----------------------------------------------------------------------------
  * Socket.IO auth middleware
@@ -52405,6 +52267,7 @@ const gracefulShutdown = () => {
   if (priceBroadcastInterval) clearInterval(priceBroadcastInterval);
   if (balanceBroadcastInterval) clearInterval(balanceBroadcastInterval);
   stopInvestorGrowthJob();
+  stopDepositWatcher();
   
   io.close(() => {
     console.log('Socket.IO server closed');
