@@ -32893,6 +32893,10 @@ async function notifyPendingDeposit({ row, user, deposit }) {
     } catch (_) { /* audit failure must not throw */ }
 }
 
+
+
+
+
 /* ============================================================================
  * GET /api/admin/deposits/pending
  * ----------------------------------------------------------------------------
@@ -33119,11 +33123,142 @@ app.get('/api/admin/deposits/pending', adminProtect, restrictTo('super', 'financ
                 );
 
                 row.readyForApproval = confirmations >= required;
-                row
+                row.confirmations = confirmations;
+                row.requiredConfirmations = required;
 
+                row.consistency = {
+                    onChainVerified: !!row.onChain?.available,
+                    confirmations,
+                    requiredConfirmations: required,
+                    readyForApproval: confirmations >= required,
+                    flags: (() => {
+                        const out = [];
+                        if (row.onChain?.available === false) out.push('ONCHAIN_UNAVAILABLE');
+                        if (row.onChain?.available && row.onChain.status === 'failed') out.push('CHAIN_FAILED');
+                        if (confirmations > 0 && confirmations < required) out.push('AWAITING_CONFIRMATIONS');
+                        if (confirmations >= required) out.push('READY_FOR_APPROVAL');
+                        return out;
+                    })()
+                };
 
+                return { row, deposit };
+            },
+            DEPOSIT_ONCHAIN_CONCURRENCY
+        );
 
+        const rows = enriched
+            .filter((e) => e && e.row && !e.row.__error)
+            .map((e) => e.row);
 
+        /* ------------------------------------------------------------------
+         * 6. DISPATCH ONE-TIME NOTIFICATION EMAILS
+         *    Only for pending rows that have a valid txHash and haven't been
+         *    notified yet. Runs in the background so the HTTP response isn't
+         *    blocked by SMTP latency.
+         * ---------------------------------------------------------------- */
+        if (shouldNotify) {
+            setImmediate(() => {
+                (async () => {
+                    for (const entry of enriched) {
+                        if (!entry || !entry.row || !entry.deposit) continue;
+
+                        const row = entry.row;
+                        const deposit = entry.deposit;
+
+                        if (!row.txHash) continue;
+                        if (!row.onChain?.available) continue; // nothing to notify about yet
+                        if (row.onChain.status === 'failed') continue;
+
+                        try {
+                            const populatedUser = deposit.user || {};
+                            await notifyPendingDeposit({
+                                row,
+                                user: {
+                                    _id: populatedUser._id || null,
+                                    firstName: populatedUser.firstName || 'Valued Customer',
+                                    lastName: populatedUser.lastName || '',
+                                    email: populatedUser.email || null
+                                },
+                                deposit
+                            });
+                        } catch (notifyErr) {
+                            console.error(
+                                '[admin/deposits/pending] notification failed for',
+                                row.txHash,
+                                notifyErr.message
+                            );
+                        }
+                    }
+                })().catch((bgErr) => {
+                    console.error('[admin/deposits/pending] background notify failed:', bgErr);
+                });
+            });
+        }
+
+        /* ------------------------------------------------------------------
+         * 7. RESPOND
+         * ---------------------------------------------------------------- */
+        const totalPages = Math.max(1, Math.ceil(totalCount / limit));
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                deposits: rows,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    totalItems: totalCount,
+                    itemsPerPage: limit,
+                    hasNextPage: page < totalPages,
+                    hasPrevPage: page > 1
+                },
+                filters: {
+                    asset: assetFilter,
+                    network: networkFilter,
+                    search,
+                    from: fromDate ? fromDate.toISOString() : null,
+                    to: toDate ? toDate.toISOString() : null,
+                    notifyEnabled: shouldNotify
+                },
+                meta: {
+                    enrichedCount: rows.length,
+                    onChainAvailable: rows.filter((r) => r.onChain && r.onChain.available).length,
+                    onChainUnavailable: rows.filter((r) => r.onChain && !r.onChain.available).length,
+                    readyForApproval: rows.filter((r) => r.readyForApproval).length,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('[admin/deposits/pending] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'admin_deposits_pending_error',
+                entity: 'Transaction',
+                performedBy: req.admin?._id || null,
+                performedByModel: 'Admin',
+                performedByEmail: req.admin?.email || null,
+                performedByName: req.admin?.name || null,
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    query: req.query,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (_) { /* silent */ }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to fetch pending deposits'
+        });
+    }
+});
 
 
 
