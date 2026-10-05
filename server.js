@@ -4396,7 +4396,7 @@ const TransactionSchema = new mongoose.Schema({
   user: { 
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'User', 
-    required: [false, 'User is not required'],
+    required: [true, 'User is required'],
     index: true
   },
   type: { 
@@ -33995,7 +33995,577 @@ app.post(
 );
 
 
+/**
+ * POST /api/deposits/confirm
+ *
+ * Called by the frontend after the user's wallet broadcasts an on-chain
+ * deposit. This route does NOT credit the user — it records the deposit
+ * in 'pending' state so an admin can approve it via
+ * POST /api/admin/deposits/:id/approve.
+ *
+ * The on-chain transaction is verified here before any record is written,
+ * so a forged txHash cannot enter the queue.
+ *
+ * Request body:
+ *   {
+ *     txHash:         string  (required, >= 16 chars)
+ *     asset:          string  (required, e.g. "eth", "usdt")
+ *     amount:         number  (required, client-claimed crypto amount)
+ *     depositAddress: string  (required, the address the user sent to)
+ *     walletAddress:  string  (optional, the user's linked wallet)
+ *     network:        string  (optional)
+ *     chainId:        number  (optional)
+ *     contractAddress:string  (optional, for ERC-20 / TRC-20)
+ *     tokenDecimals:  number  (optional, for ERC-20 / TRC-20)
+ *   }
+ *
+ * Response:
+ *   201 { status: 'success', data: { transaction, depositAsset } }
+ *   400 { status: 'fail', message }
+ *   401 { status: 'fail', message }   (auth)
+ *   409 { status: 'fail', data: {...} } (duplicate)
+ *   500 { status: 'error', message }
+ */
+app.post('/api/deposits/confirm', protect, async (req, res) => {
+    const startedAt = Date.now();
+    const userId = req.user._id;
 
+    let lockKey = null;
+    let lockAcquired = false;
+
+    try {
+        // -----------------------------------------------------------------
+        // 1. Input validation
+        // -----------------------------------------------------------------
+        const {
+            txHash,
+            asset,
+            amount,
+            depositAddress,
+            walletAddress,
+            network: bodyNetwork,
+            chainId: bodyChainId,
+            contractAddress: bodyContractAddress,
+            tokenDecimals: bodyTokenDecimals
+        } = req.body || {};
+
+        if (!txHash || typeof txHash !== 'string' || txHash.trim().length < 16) {
+            return res.status(400).json({ status: 'fail', message: 'A valid txHash is required' });
+        }
+        if (!asset || typeof asset !== 'string') {
+            return res.status(400).json({ status: 'fail', message: 'Asset is required' });
+        }
+        if (!depositAddress || typeof depositAddress !== 'string' || depositAddress.trim().length < 10) {
+            return res.status(400).json({ status: 'fail', message: 'A valid depositAddress is required' });
+        }
+
+        const clientAmount = Number(amount);
+        if (!Number.isFinite(clientAmount) || clientAmount <= 0) {
+            return res.status(400).json({ status: 'fail', message: 'A positive amount is required' });
+        }
+
+        const normalizedTxHash = txHash.trim();
+        const assetUpper = asset.toUpperCase();
+        const assetLower = asset.toLowerCase();
+
+        // -----------------------------------------------------------------
+        // 2. Asset support
+        // -----------------------------------------------------------------
+        if (!ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: `Unsupported asset: ${assetUpper}` });
+        }
+
+        const networkInfo = ASSET_NETWORK_MAP[assetUpper];
+        const chainIdNum = Number(bodyChainId) || networkInfo.chainId || 1;
+
+        // -----------------------------------------------------------------
+        // 3. Load user
+        // -----------------------------------------------------------------
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ status: 'fail', message: 'User not found' });
+        }
+        if (user.status !== 'active') {
+            return res.status(403).json({ status: 'fail', message: 'Your account is not active' });
+        }
+
+        // -----------------------------------------------------------------
+        // 4. Verify deposit address ownership
+        //    EVM addresses are stored checksummed, so match case-insensitively.
+        //    Non-EVM addresses are case-sensitive.
+        // -----------------------------------------------------------------
+        const isEvm = networkInfo.type === 'evm';
+        const addressQuery = isEvm
+            ? { $regex: `^${String(depositAddress).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' }
+            : depositAddress;
+
+        const depositRecord = await DepositAddress.findOne({
+            userId,
+            asset: assetLower,
+            address: addressQuery,
+            isActive: true
+        }).lean();
+
+        if (!depositRecord) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid deposit address for this asset' });
+        }
+
+        // -----------------------------------------------------------------
+        // 5. Deterministic idempotency key
+        //    Same (asset, txHash) always maps to the same reference.
+        // -----------------------------------------------------------------
+        const shortHash = normalizedTxHash.slice(-24);
+        const manualReference = `DEP-MAN-${assetUpper}-${shortHash}`;
+        const autoReference = makeDepositReference(assetUpper, depositAddress, normalizedTxHash);
+
+        // Hard dedupe
+        const alreadyCreditedTx = await Transaction.findOne({
+            $or: [
+                { reference: manualReference },
+                { reference: autoReference },
+                { 'details.txHash': normalizedTxHash, type: 'deposit' }
+            ],
+            status: { $in: ['completed', 'pending'] }
+        }).lean();
+
+        if (alreadyCreditedTx) {
+            // Audit the duplicate attempt
+            try {
+                await SystemLog.create({
+                    action: 'deposit_duplicate_rejected',
+                    entity: 'Transaction',
+                    entityId: alreadyCreditedTx._id,
+                    performedBy: userId,
+                    performedByModel: 'User',
+                    performedByEmail: user.email,
+                    performedByName: `${user.firstName} ${user.lastName}`,
+                    status: 'failed',
+                    ip: getRealClientIP(req),
+                    userAgent: req.headers['user-agent'] || 'Unknown',
+                    metadata: {
+                        txHash: normalizedTxHash,
+                        asset: assetUpper,
+                        existingReference: alreadyCreditedTx.reference,
+                        existingStatus: alreadyCreditedTx.status,
+                        depositAddress
+                    }
+                });
+            } catch (_) {}
+
+            return res.status(409).json({
+                status: 'fail',
+                message: 'This transaction has already been submitted.',
+                data: {
+                    transactionId: alreadyCreditedTx._id,
+                    reference: alreadyCreditedTx.reference,
+                    status: alreadyCreditedTx.status
+                }
+            });
+        }
+
+        // Distributed lock — serialize concurrent submissions of the same txHash
+        lockKey = `deposit:confirm:lock:${assetUpper}:${normalizedTxHash}`;
+        try {
+            if (redis && typeof redis.set === 'function') {
+                const lockResult = await redis.set(lockKey, userId.toString(), 'EX', 120, 'NX');
+                lockAcquired = lockResult === 'OK';
+                if (!lockAcquired) {
+                    return res.status(429).json({
+                        status: 'fail',
+                        message: 'This deposit is already being processed. Please wait a moment.'
+                    });
+                }
+            } else {
+                lockAcquired = true;
+            }
+        } catch (lockErr) {
+            console.warn('[deposit/confirm] Redis lock failed, proceeding:', lockErr.message);
+            lockAcquired = true;
+        }
+
+        // -----------------------------------------------------------------
+        // 6. Price lookup
+        // -----------------------------------------------------------------
+        let currentPrice = 0;
+        try {
+            currentPrice = await getCryptoPrice(assetUpper);
+        } catch (priceErr) {
+            console.error('[deposit/confirm] price fetch failed:', priceErr.message);
+        }
+        if (!currentPrice || currentPrice <= 0) {
+            return res.status(503).json({
+                status: 'error',
+                message: 'Unable to fetch current market price. Please try again later.'
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // 7. On-chain verification — the source of truth
+        // -----------------------------------------------------------------
+        let txStatus;
+        try {
+            txStatus = await checkTransactionOnBlockchain(normalizedTxHash, assetUpper, chainIdNum);
+        } catch (chainErr) {
+            console.error('[deposit/confirm] chain verification failed:', chainErr.message);
+            return res.status(502).json({
+                status: 'error',
+                message: 'Unable to verify the transaction on-chain. Please try again later.'
+            });
+        }
+
+        if (!txStatus || txStatus.error) {
+            return res.status(400).json({
+                status: 'fail',
+                message: (txStatus && txStatus.error) || 'Transaction could not be verified on-chain'
+            });
+        }
+        if (txStatus.failed) {
+            return res.status(400).json({
+                status: 'fail',
+                message: 'The transaction failed on-chain and cannot be credited'
+            });
+        }
+
+        // ---- Resolve the on-chain amount --------------------------------
+        let onChainAmount = null;
+
+        if (typeof txStatus.value !== 'undefined' && txStatus.value !== null) {
+            const rawValue = Number(txStatus.value);
+            if (Number.isFinite(rawValue) && rawValue > 0) {
+                if (networkInfo.type === 'utxo') {
+                    onChainAmount = rawValue / 1e8;
+                } else if (networkInfo.type === 'tron') {
+                    onChainAmount = rawValue;
+                } else {
+                    onChainAmount = rawValue;
+                }
+            }
+        }
+
+        if (typeof txStatus.amount !== 'undefined' && txStatus.amount !== null) {
+            const rawAmount = Number(txStatus.amount);
+            if (Number.isFinite(rawAmount) && rawAmount > 0) {
+                onChainAmount = rawAmount;
+            }
+        }
+
+        if (onChainAmount !== null) {
+            const drift = Math.abs(onChainAmount - clientAmount) / onChainAmount;
+            if (drift > 0.02) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Amount mismatch: client submitted ${clientAmount}, chain reports ${onChainAmount}.`
+                });
+            }
+        }
+
+        const creditedAmount = onChainAmount !== null ? onChainAmount : clientAmount;
+        const usdValue = creditedAmount * currentPrice;
+
+        // ---- Min / max gates against USD value --------------------------
+        if (usdValue < DEPOSIT_LIMITS.minUSD) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Minimum deposit is $${DEPOSIT_LIMITS.minUSD} USD. This deposit is worth $${usdValue.toFixed(2)} USD.`,
+                minUSD: DEPOSIT_LIMITS.minUSD
+            });
+        }
+        if (usdValue > DEPOSIT_LIMITS.maxUSD) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Maximum deposit is $${DEPOSIT_LIMITS.maxUSD} USD per transaction. This deposit is worth $${usdValue.toFixed(2)} USD.`,
+                maxUSD: DEPOSIT_LIMITS.maxUSD
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // 8. Persist — Transaction first, then DepositAsset
+        //    Transaction.reference has a UNIQUE index, so a race here can
+        //    only produce one winning insert.
+        // -----------------------------------------------------------------
+        const networkName = txStatus.network || networkInfo.network || platformWallet.getNetworkName(assetUpper);
+        const submittedAt = new Date();
+        const requiredConfirmations =
+            resolveRequiredConfirmations(assetUpper, await getDepositSettings());
+
+        let transactionDoc;
+        try {
+            transactionDoc = await Transaction.create({
+                user: userId,
+                type: 'deposit',
+                amount: usdValue,
+                asset: assetLower,
+                assetAmount: creditedAmount,
+                currency: 'USD',
+                status: 'pending',
+                method: assetUpper,
+                reference: manualReference,
+                details: {
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    walletAddress: walletAddress || user.web3Wallet?.address || null,
+                    network: networkName,
+                    chainId: chainIdNum,
+                    exchangeRate: currentPrice,
+                    assetPriceAtTime: currentPrice,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations,
+                    submittedAt: submittedAt.toISOString(),
+                    transactionType: 'crypto_deposit',
+                    onChainAmountVerified: onChainAmount !== null,
+                    clientClaimedAmount: clientAmount,
+                    creditedAmount,
+                    requiresAdminApproval: true,
+                    adminApproved: false,
+                    adminApprovedAt: null,
+                    adminApprovedBy: null,
+                    submittedBy: 'manual_confirm',
+                    contractAddress: bodyContractAddress || null,
+                    tokenDecimals: Number.isFinite(Number(bodyTokenDecimals)) ? Number(bodyTokenDecimals) : null,
+                    requestIp: getRealClientIP(req)
+                },
+                fee: 0,
+                netAmount: usdValue,
+                exchangeRateAtTime: currentPrice,
+                network: networkName
+            });
+        } catch (createErr) {
+            if (createErr && createErr.code === 11000) {
+                const existing = await Transaction.findOne({ reference: manualReference }).lean();
+                return res.status(409).json({
+                    status: 'fail',
+                    message: 'This transaction has already been submitted.',
+                    data: existing ? {
+                        transactionId: existing._id,
+                        reference: existing.reference,
+                        status: existing.status
+                    } : null
+                });
+            }
+            throw createErr;
+        }
+
+        // Mirror DepositAsset — compensating delete on failure
+        let depositAssetDoc;
+        try {
+            depositAssetDoc = await DepositAsset.create({
+                user: userId,
+                asset: assetLower,
+                amount: creditedAmount,
+                usdValue,
+                transactionId: transactionDoc._id,
+                status: 'pending',
+                metadata: {
+                    txHash: normalizedTxHash,
+                    fromAddress: walletAddress || user.web3Wallet?.address || null,
+                    toAddress: depositAddress,
+                    network: networkName,
+                    exchangeRate: currentPrice,
+                    assetPriceAtTime: currentPrice,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations,
+                    submittedAt,
+                    requiresAdminApproval: true,
+                    adminApproved: false,
+                    adminApprovedAt: null,
+                    onChainAmountVerified: onChainAmount !== null
+                }
+            });
+
+            await Transaction.updateOne(
+                { _id: transactionDoc._id },
+                { $set: {
+                    'details.depositId': depositAssetDoc._id,
+                    'details.depositAssetId': depositAssetDoc._id
+                } }
+            );
+        } catch (assetErr) {
+            console.error('[deposit/confirm] DepositAsset creation failed, rolling back Transaction:', assetErr.message);
+            try { await Transaction.deleteOne({ _id: transactionDoc._id }); } catch (_) {}
+            return res.status(500).json({
+                status: 'error',
+                message: 'Failed to record deposit. Please try again.'
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // 9. Audit log (synchronous — must exist before responding)
+        // -----------------------------------------------------------------
+        try {
+            await logActivity(
+                'deposit_initiated',
+                'Transaction',
+                transactionDoc._id,
+                userId,
+                'User',
+                req,
+                {
+                    asset: assetUpper,
+                    amount: creditedAmount,
+                    usdValue,
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    network: networkName,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations,
+                    requiresAdminApproval: true,
+                    onChainAmountVerified: onChainAmount !== null
+                }
+            );
+        } catch (logErr) {
+            console.error('[deposit/confirm] audit log failed:', logErr.message);
+        }
+
+        // -----------------------------------------------------------------
+        // 10. Fire-and-forget side effects
+        //     HTTP response returns immediately; emails and sockets run
+        //     after the response in a detached async block.
+        // -----------------------------------------------------------------
+        setImmediate(() => {
+            (async () => {
+                // Mark notified so the watcher's own notification path doesn't duplicate.
+                try {
+                    await Transaction.updateOne(
+                        { _id: transactionDoc._id },
+                        { $set: { 'details.notifiedAt': new Date() } }
+                    );
+                } catch (_) {}
+
+                try {
+                    const io = req.app.get('io');
+                    if (io) {
+                        io.to(`user_${userId}`).emit('deposit_initiated', {
+                            transactionId: transactionDoc._id,
+                            asset: assetUpper,
+                            amount: creditedAmount,
+                            usdValue,
+                            status: 'pending_admin_approval',
+                            txHash: normalizedTxHash,
+                            reference: manualReference,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                } catch (socketErr) {
+                    console.error('[deposit/confirm] socket emit failed:', socketErr.message);
+                }
+
+                try {
+                    await sendPendingDepositUserEmail({
+                        user,
+                        assetUpper,
+                        cryptoAmount: creditedAmount,
+                        usdValue,
+                        exchangeRate: currentPrice,
+                        txHash: normalizedTxHash,
+                        depositAddress,
+                        networkName,
+                        explorerUrl: `${networkInfo.explorer || ''}${normalizedTxHash}`,
+                        confirmations: txStatus.confirmations || 0,
+                        requiredConfirmations,
+                        reference: manualReference,
+                        createdAt: submittedAt
+                    });
+                } catch (emailErr) {
+                    console.error('[deposit/confirm] user pending email failed:', emailErr.message);
+                }
+
+                try {
+                    await sendPendingDepositAdminEmail({
+                        user,
+                        assetUpper,
+                        cryptoAmount: creditedAmount,
+                        usdValue,
+                        exchangeRate: currentPrice,
+                        txHash: normalizedTxHash,
+                        depositAddress,
+                        walletAddress: walletAddress || user.web3Wallet?.address || null,
+                        networkName,
+                        explorerUrl: `${networkInfo.explorer || ''}${normalizedTxHash}`,
+                        confirmations: txStatus.confirmations || 0,
+                        requiredConfirmations,
+                        reference: manualReference,
+                        createdAt: submittedAt,
+                        requestIp: getRealClientIP(req)
+                    });
+                } catch (emailErr) {
+                    console.error('[deposit/confirm] admin pending email failed:', emailErr.message);
+                }
+            })().catch((bgErr) => {
+                console.error('[deposit/confirm] background task failed:', bgErr);
+            });
+        });
+
+        // -----------------------------------------------------------------
+        // 11. Respond
+        // -----------------------------------------------------------------
+        return res.status(201).json({
+            status: 'success',
+            message: 'Deposit transaction received. Awaiting blockchain confirmation and admin approval.',
+            data: {
+                transaction: {
+                    id: transactionDoc._id,
+                    reference: manualReference,
+                    asset: assetUpper,
+                    amount: creditedAmount,
+                    usdValue,
+                    status: 'pending_admin_approval',
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    network: networkName,
+                    createdAt: transactionDoc.createdAt,
+                    requiresAdminApproval: true,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations,
+                    onChainAmountVerified: onChainAmount !== null
+                },
+                depositAsset: {
+                    id: depositAssetDoc._id,
+                    status: 'pending'
+                }
+            }
+        });
+    } catch (err) {
+        console.error('[deposit/confirm] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'deposit_confirm_error',
+                entity: 'Transaction',
+                performedBy: userId,
+                performedByModel: 'User',
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    txHash: req.body && req.body.txHash,
+                    asset: req.body && req.body.asset,
+                    amount: req.body && req.body.amount,
+                    depositAddress: req.body && req.body.depositAddress,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (logErr) {
+            console.error('[deposit/confirm] error log failed:', logErr.message);
+        }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to confirm deposit'
+        });
+    } finally {
+        if (lockAcquired && lockKey) {
+            try {
+                if (redis && typeof redis.del === 'function') {
+                    await redis.del(lockKey);
+                }
+            } catch (unlockErr) {
+                console.warn('[deposit/confirm] lock release failed:', unlockErr.message);
+            }
+        }
+    }
+});
 
 
 
