@@ -53584,6 +53584,633 @@ console.log('   - GET  /reports');
 
 
 
+// =============================================
+// MINING STATISTICS - SINGLE SOURCE OF TRUTH (REDIS)
+// =============================================
+//
+// DERIVATION CHAIN (one direction only, no contradictions):
+//
+//   BTC_PER_TH_PER_HOUR = 0.000025 / 24       (server constant)
+//   BTC_PER_TH_PER_DAY  = BTC_PER_TH_PER_HOUR × 24 = 0.000025
+//
+//   TH/s   = BTC/day ÷ BTC_PER_TH_PER_DAY
+//   PH/s   = TH/s ÷ 1,000
+//
+// The hardcoded btcRewards range (4.5–25.0 BTC/day) drives hashrate
+// and capacity ranges so the strip can never display BTC that exceeds
+// what the server's own payout constant supports.
+//
+// STALE-CACHE PROTECTION:
+//   • Redis is cleared on startup
+//   • Redis is cleared on /api/mining/reset
+//   • Both endpoints recompute BTC rewards from capacity on every request
+// =============================================
+
+// Redis keys for mining stats (single source of truth)
+const REDIS_MINING_KEY = 'mining_stats';
+const REDIS_MINING_LAST_UPDATE_KEY = 'mining_stats_last_update';
+
+// =============================================
+// NUMBER FORMATTING HELPER
+// =============================================
+//
+// Declared as a hoisted `function` (not a const arrow) so boot-time
+// logging can safely call it before the rest of the module is evaluated.
+// Using `const` here would put the helper in the temporal dead zone and
+// throw: ReferenceError: Cannot access 'formatNumberWithCommas' before
+// initialization.
+//
+function formatNumberWithCommas(num) {
+    if (num === undefined || num === null || Number.isNaN(Number(num))) return '--';
+    return Number(num).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// =============================================
+// CLEAR REDIS - FORCE FRESH START
+// =============================================
+const clearRedisMiningStats = async () => {
+    try {
+        await redis.del(REDIS_MINING_KEY);
+        await redis.del(REDIS_MINING_LAST_UPDATE_KEY);
+        console.log('🗑️ Redis mining stats cleared successfully');
+        return true;
+    } catch (err) {
+        console.error('Error clearing Redis mining stats:', err);
+        return false;
+    }
+};
+
+// Execute clear on startup - this guarantees no stale PH/s / BTC values
+// from a previous deployment can ever be served.
+setTimeout(async () => {
+    await clearRedisMiningStats();
+    miningStatsCache = null;
+    miningStatsLastCacheTime = 0;
+    console.log('🔄 Redis mining stats reset complete - starting fresh');
+}, 1000);
+
+// =============================================
+// MINING CONFIGURATION - SINGLE SOURCE OF TRUTH
+// =============================================
+//
+// `btcRewards` is the ONLY hardcoded economic range.
+// `hashrate` and `capacity` are DERIVED from it below.
+// =============================================
+const MINING_CONFIG = {
+    // BTC rewards range per day - HARDCODED SOURCE OF TRUTH
+    btcRewards: {
+        min: 4.5,     // Minimum daily BTC
+        max: 25.0     // Maximum daily BTC
+    },
+    // Uptime range (%) - HARDCODED, preserved
+    uptime: {
+        min: 88.00,
+        max: 99.99
+    },
+    // Active contracts are tied to investor count (5%-30%) - HARDCODED
+    contractsPercentage: {
+        min: 0.05,  // 5% of total investors
+        max: 0.30   // 30% of total investors
+    },
+    // Volatility percentage (for random fluctuations)
+    volatility: 0.15, // 15% variance
+    // Update interval (milliseconds) - HARDCODED
+    updateInterval: 1800000 // 30 minutes (1800000 ms)
+};
+
+// =============================================
+// DERIVED RANGES - COMPUTED FROM SERVER CONSTANTS
+// =============================================
+//
+// These are NOT hardcoded. They are calculated at boot from:
+//   - MINING_CONFIG.btcRewards     (BTC/day, hardcoded)
+//   - BTC_PER_TH_PER_HOUR          (server constant)
+//   - 1 PH/s = 1,000 TH/s
+//
+// This guarantees the mining strip can never display more BTC
+// than the platform's own payout constant supports.
+
+// 1 PH/s = 1,000 TH/s
+const TH_PER_PH = 1000;
+
+// BTC per TH/s per day (derived from the per-hour server constant)
+const BTC_PER_TH_PER_DAY = BTC_PER_TH_PER_HOUR * 24; // = 0.000025
+
+// Capacity (TH/s) is derived from the hardcoded BTC rewards range
+const DERIVED_CAPACITY_MIN_TH = MINING_CONFIG.btcRewards.min / BTC_PER_TH_PER_DAY;
+const DERIVED_CAPACITY_MAX_TH = MINING_CONFIG.btcRewards.max / BTC_PER_TH_PER_DAY;
+
+// Hashrate (PH/s) is derived from capacity
+const DERIVED_HASHRATE_MIN_PH = DERIVED_CAPACITY_MIN_TH / TH_PER_PH;
+const DERIVED_HASHRATE_MAX_PH = DERIVED_CAPACITY_MAX_TH / TH_PER_PH;
+
+console.log('📐 Derived mining ranges from BTC_PER_TH_PER_HOUR:');
+console.log(`   BTC_PER_TH_PER_HOUR = ${BTC_PER_TH_PER_HOUR}`);
+console.log(`   BTC_PER_TH_PER_DAY  = ${BTC_PER_TH_PER_DAY}`);
+console.log(`   Capacity range: ${formatNumberWithCommas(DERIVED_CAPACITY_MIN_TH)} - ${formatNumberWithCommas(DERIVED_CAPACITY_MAX_TH)} TH/s`);
+console.log(`   Hashrate range: ${DERIVED_HASHRATE_MIN_PH} - ${DERIVED_HASHRATE_MAX_PH} PH/s`);
+console.log(`   BTC rewards range: ${MINING_CONFIG.btcRewards.min} - ${MINING_CONFIG.btcRewards.max} BTC/day`);
+
+// Current mining stats cache (in-memory fallback)
+let miningStatsCache = null;
+let miningStatsLastCacheTime = 0;
+let miningStatsUpdateInterval = null;
+
+/**
+ * Get current investor count from Redis (single source of truth)
+ */
+const getCurrentInvestorCount = async () => {
+    try {
+        const count = await redis.get(REDIS_INVESTOR_KEY);
+        return count ? parseInt(count) : INITIAL_INVESTOR_COUNT;
+    } catch (err) {
+        console.error('Error getting investor count:', err);
+        return INITIAL_INVESTOR_COUNT;
+    }
+};
+
+/**
+ * Get current mining stats from Redis or generate initial values
+ */
+const getMiningStatsFromRedis = async () => {
+    try {
+        const statsData = await redis.get(REDIS_MINING_KEY);
+        if (statsData) {
+            return JSON.parse(statsData);
+        }
+        return null;
+    } catch (err) {
+        console.error('Error reading mining stats from Redis:', err);
+        return null;
+    }
+};
+
+/**
+ * Save mining stats to Redis
+ */
+const saveMiningStatsToRedis = async (stats) => {
+    try {
+        await redis.set(REDIS_MINING_KEY, JSON.stringify(stats));
+        await redis.set(REDIS_MINING_LAST_UPDATE_KEY, Date.now().toString());
+        return true;
+    } catch (err) {
+        console.error('Error saving mining stats to Redis:', err);
+        return false;
+    }
+};
+
+/**
+ * Fetch current BTC price for admin context logging.
+ * This does NOT drive the BTC/day math (that constant is physical),
+ * it only gives admins a USD reference alongside the displayed stats.
+ */
+const getBTCMiningContextPrice = async () => {
+    try {
+        const response = await axios.get(
+            'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+            { timeout: 5000 }
+        );
+        if (response.data?.bitcoin?.usd > 0) {
+            return response.data.bitcoin.usd;
+        }
+    } catch (err) {
+        console.warn('Could not fetch BTC price for mining context:', err.message);
+    }
+    return null;
+};
+
+/**
+ * Generate initial mining stats with realistic values.
+ *
+ * DERIVATION CHAIN:
+ *   1) Pick btcRewards inside the hardcoded range
+ *   2) capacityTH   = btcRewards ÷ BTC_PER_TH_PER_DAY
+ *   3) hashratePH   = capacityTH ÷ TH_PER_PH
+ *
+ * This is the ONLY way hashrate and capacity are ever produced.
+ */
+const generateInitialMiningStats = async () => {
+    // Get current investor count
+    const investorCount = await getCurrentInvestorCount();
+
+    // Contracts tied to investor count (5%-30%) - HARDCODED, preserved
+    const contractPercentage = MINING_CONFIG.contractsPercentage.min +
+        (Math.random() * (MINING_CONFIG.contractsPercentage.max - MINING_CONFIG.contractsPercentage.min));
+    const contracts = Math.floor(investorCount * contractPercentage);
+
+    // =============================================
+    // STEP 1: pick BTC/day inside the hardcoded range
+    // =============================================
+    const btcRewards =
+        MINING_CONFIG.btcRewards.min +
+        Math.random() * (MINING_CONFIG.btcRewards.max - MINING_CONFIG.btcRewards.min);
+
+    // =============================================
+    // STEP 2: BTC/day → TH/s using the server constant
+    // =============================================
+    const capacityTH = btcRewards / BTC_PER_TH_PER_DAY;
+
+    // =============================================
+    // STEP 3: TH/s → PH/s (1 PH/s = 1,000 TH/s)
+    // =============================================
+    const hashratePH = capacityTH / TH_PER_PH;
+
+    // Uptime within hardcoded range
+    const uptime = MINING_CONFIG.uptime.min +
+        (Math.random() * (MINING_CONFIG.uptime.max - MINING_CONFIG.uptime.min));
+
+    // Optional BTC context price (for admin logging only)
+    const btcContextPrice = await getBTCMiningContextPrice();
+
+    return {
+        hashrate: parseFloat(hashratePH.toFixed(2)),
+        btcRewards: parseFloat(btcRewards.toFixed(2)),
+        capacity: parseFloat(capacityTH.toFixed(0)),
+        uptime: parseFloat(uptime.toFixed(2)),
+        contracts: contracts,
+        contractsPercentage: parseFloat((contractPercentage * 100).toFixed(1)),
+        investorCount: investorCount,
+        lastUpdated: Date.now(),
+        // 7-day chart data - TIED TO THIS SYSTEM
+        chartData: generateInitialChartData(hashratePH),
+        hashrateChange: parseFloat(((Math.random() - 0.5) * 6).toFixed(2)),
+        rewardsChange: parseFloat(((Math.random() - 0.5) * 8).toFixed(2)),
+        btcContextPrice: btcContextPrice,
+        // Expose the constants actually used so admins can audit them
+        _constants: {
+            BTC_PER_TH_PER_HOUR: BTC_PER_TH_PER_HOUR,
+            BTC_PER_TH_PER_DAY: BTC_PER_TH_PER_DAY,
+            TH_PER_PH: TH_PER_PH
+        }
+    };
+};
+
+/**
+ * Generate initial 7-day chart data.
+ * Chart values are tied to the hashrate system.
+ */
+const generateInitialChartData = (baseHashrate) => {
+    const data = [];
+    const now = new Date();
+    const hashrate = baseHashrate ||
+        (MINING_CONFIG.btcRewards.min + Math.random() * (MINING_CONFIG.btcRewards.max - MINING_CONFIG.btcRewards.min))
+            / BTC_PER_TH_PER_DAY / TH_PER_PH;
+
+    for (let i = 6; i >= 0; i--) {
+        const date = new Date(now);
+        date.setDate(date.getDate() - i);
+        // Random walk variation tied to the hashrate
+        const variation = (Math.random() - 0.5) * 0.2;
+        const value = hashrate * (1 + variation);
+        data.push({
+            date: date.toISOString().split('T')[0],
+            value: parseFloat(value.toFixed(2))
+        });
+    }
+    return data;
+};
+
+/**
+ * Update mining stats with realistic fluctuations.
+ *
+ * Random walk happens on BTC/day inside the hardcoded range.
+ * hashrate and capacity are ALWAYS re-derived from it, so the three
+ * values can never drift out of sync.
+ */
+const updateMiningStats = async () => {
+    try {
+        let currentStats = await getMiningStatsFromRedis();
+        const investorCount = await getCurrentInvestorCount();
+
+        if (!currentStats) {
+            // Initialize if not exists
+            currentStats = await generateInitialMiningStats();
+            await saveMiningStatsToRedis(currentStats);
+            miningStatsCache = currentStats;
+            miningStatsLastCacheTime = Date.now();
+            console.log(`📊 Mining stats initialized: ${formatNumberWithCommas(currentStats.capacity)} TH/s, ${currentStats.btcRewards} BTC/day, ${formatNumberWithCommas(currentStats.contracts)} contracts (${currentStats.contractsPercentage}% of ${formatNumberWithCommas(investorCount)} investors)`);
+            return currentStats;
+        }
+
+        // =============================================
+        // STEP 1: random walk on BTC/day inside the hardcoded range
+        // with a slight upward drift and small bounded noise.
+        // =============================================
+        const range = MINING_CONFIG.btcRewards.max - MINING_CONFIG.btcRewards.min;
+        const drift = range * 0.001;                        // 0.1% of range per update
+        const noise = (Math.random() - 0.5) * range * 0.02; // ±1% of range
+
+        let newBtcRewards = currentStats.btcRewards + drift + noise;
+        newBtcRewards = Math.max(
+            MINING_CONFIG.btcRewards.min,
+            Math.min(MINING_CONFIG.btcRewards.max, newBtcRewards)
+        );
+
+        // =============================================
+        // STEP 2: derive capacity (TH/s) from BTC/day
+        // =============================================
+        const newCapacityTH = newBtcRewards / BTC_PER_TH_PER_DAY;
+
+        // =============================================
+        // STEP 3: derive hashrate (PH/s) from capacity
+        // =============================================
+        const newHashratePH = newCapacityTH / TH_PER_PH;
+
+        // Uptime with small fluctuations
+        let newUptime = currentStats.uptime + (Math.random() - 0.5) * 0.04;
+        newUptime = Math.max(MINING_CONFIG.uptime.min, Math.min(MINING_CONFIG.uptime.max, newUptime));
+
+        // =============================================
+        // Contracts are ALWAYS 5%-30% of investor count
+        // =============================================
+        const contractPercentage = MINING_CONFIG.contractsPercentage.min +
+            (Math.random() * (MINING_CONFIG.contractsPercentage.max - MINING_CONFIG.contractsPercentage.min));
+        const newContracts = Math.floor(investorCount * contractPercentage);
+        const newContractsPercentage = parseFloat((contractPercentage * 100).toFixed(1));
+
+        // Change percentages
+        const hashrateChangePercent = ((newHashratePH - currentStats.hashrate) / currentStats.hashrate) * 100;
+        const rewardsChangePercent = ((newBtcRewards - currentStats.btcRewards) / currentStats.btcRewards) * 100;
+
+        // =============================================
+        // CHART DATA - TIED TO THE SYSTEM
+        // =============================================
+        const chartData = currentStats.chartData || generateInitialChartData(newHashratePH);
+        const now = new Date();
+        const todayStr = now.toISOString().split('T')[0];
+
+        const lastPoint = chartData[chartData.length - 1];
+        if (lastPoint && lastPoint.date === todayStr) {
+            lastPoint.value = parseFloat(newHashratePH.toFixed(2));
+        } else {
+            chartData.push({
+                date: todayStr,
+                value: parseFloat(newHashratePH.toFixed(2))
+            });
+            while (chartData.length > 7) {
+                chartData.shift();
+            }
+        }
+
+        // Optional BTC price context
+        const btcContextPrice = await getBTCMiningContextPrice();
+
+        const updatedStats = {
+            hashrate: parseFloat(newHashratePH.toFixed(2)),
+            btcRewards: parseFloat(newBtcRewards.toFixed(2)),
+            capacity: parseFloat(newCapacityTH.toFixed(0)),
+            uptime: parseFloat(newUptime.toFixed(2)),
+            contracts: newContracts,
+            contractsPercentage: newContractsPercentage,
+            investorCount: investorCount,
+            lastUpdated: Date.now(),
+            chartData: chartData,
+            hashrateChange: parseFloat(hashrateChangePercent.toFixed(2)),
+            rewardsChange: parseFloat(rewardsChangePercent.toFixed(2)),
+            btcContextPrice: btcContextPrice,
+            _constants: {
+                BTC_PER_TH_PER_HOUR: BTC_PER_TH_PER_HOUR,
+                BTC_PER_TH_PER_DAY: BTC_PER_TH_PER_DAY,
+                TH_PER_PH: TH_PER_PH
+            }
+        };
+
+        // Save to Redis
+        await saveMiningStatsToRedis(updatedStats);
+        miningStatsCache = updatedStats;
+        miningStatsLastCacheTime = Date.now();
+
+        // Broadcast update via WebSocket
+        if (io) {
+            io.emit('mining_stats_update', {
+                hashrate: updatedStats.hashrate,
+                btcRewards: updatedStats.btcRewards,
+                capacity: updatedStats.capacity,
+                uptime: updatedStats.uptime,
+                contracts: updatedStats.contracts,
+                contractsPercentage: updatedStats.contractsPercentage,
+                hashrateChange: updatedStats.hashrateChange,
+                rewardsChange: updatedStats.rewardsChange,
+                investorCount: investorCount,
+                timestamp: Date.now()
+            });
+        }
+
+        console.log(`📊 Mining stats updated: ${formatNumberWithCommas(updatedStats.capacity)} TH/s (${updatedStats.hashrate} PH/s), ${updatedStats.btcRewards} BTC/day, ${formatNumberWithCommas(updatedStats.contracts)} contracts (${updatedStats.contractsPercentage}% of ${formatNumberWithCommas(investorCount)} investors)`);
+
+        return updatedStats;
+
+    } catch (err) {
+        console.error('Error updating mining stats:', err);
+        return miningStatsCache || await generateInitialMiningStats();
+    }
+};
+
+/**
+ * Start the mining stats update job.
+ */
+const startMiningStatsJob = async () => {
+    // Initialize stats if they don't exist
+    let stats = await getMiningStatsFromRedis();
+
+    // Stale-schema guard: if Redis holds an old shape (no btcRewards or a
+    // capacity outside the derived range), discard it and regenerate.
+    const isStaleSchema =
+        !stats ||
+        typeof stats.btcRewards !== 'number' ||
+        stats.capacity < DERIVED_CAPACITY_MIN_TH * 0.5 ||
+        stats.capacity > DERIVED_CAPACITY_MAX_TH * 1.5;
+
+    if (isStaleSchema) {
+        if (stats) {
+            console.warn('⚠️ Stale mining stats schema detected in Redis. Regenerating fresh.');
+            await clearRedisMiningStats();
+        }
+        stats = await generateInitialMiningStats();
+        await saveMiningStatsToRedis(stats);
+        miningStatsCache = stats;
+        miningStatsLastCacheTime = Date.now();
+        console.log(`📊 Mining stats initialized: ${formatNumberWithCommas(stats.capacity)} TH/s (${stats.hashrate} PH/s), ${stats.btcRewards} BTC/day`);
+    } else {
+        miningStatsCache = stats;
+        miningStatsLastCacheTime = Date.now();
+        console.log(`📊 Mining stats loaded from Redis: ${formatNumberWithCommas(stats.capacity)} TH/s (${stats.hashrate} PH/s), ${stats.btcRewards} BTC/day`);
+    }
+
+    // Schedule the next update
+    const scheduleNextUpdate = () => {
+        const baseInterval = MINING_CONFIG.updateInterval;
+        const jitter = Math.floor(Math.random() * 60000) - 30000; // ±30 second jitter
+        const interval = Math.max(60000, baseInterval + jitter);
+
+        miningStatsUpdateInterval = setTimeout(async () => {
+            try {
+                await updateMiningStats();
+                scheduleNextUpdate();
+            } catch (err) {
+                console.error('Error in mining stats update job:', err);
+                scheduleNextUpdate();
+            }
+        }, interval);
+    };
+
+    scheduleNextUpdate();
+    console.log(`🚀 Mining stats job started. Updates every ${MINING_CONFIG.updateInterval/60000} minutes with jitter`);
+};
+
+/**
+ * Stop the mining stats update job
+ */
+const stopMiningStatsJob = () => {
+    if (miningStatsUpdateInterval) {
+        clearTimeout(miningStatsUpdateInterval);
+        miningStatsUpdateInterval = null;
+        console.log('🛑 Mining stats job stopped');
+    }
+};
+
+/**
+ * Get current mining stats (returns cached or fresh)
+ */
+const getCurrentMiningStats = async () => {
+    // Check cache first (max 5 seconds stale)
+    if (miningStatsCache && (Date.now() - miningStatsLastCacheTime < 5000)) {
+        return miningStatsCache;
+    }
+
+    // Try Redis
+    const stats = await getMiningStatsFromRedis();
+    if (stats) {
+        miningStatsCache = stats;
+        miningStatsLastCacheTime = Date.now();
+        return stats;
+    }
+
+    // Generate fallback
+    const fallback = await generateInitialMiningStats();
+    await saveMiningStatsToRedis(fallback);
+    miningStatsCache = fallback;
+    miningStatsLastCacheTime = Date.now();
+    return fallback;
+};
+
+// =============================================
+// START MINING STATS JOB ON SERVER STARTUP
+// =============================================
+setTimeout(() => {
+    startMiningStatsJob();
+}, 3000);
+
+// =============================================
+// ENDPOINT 1: GET /api/mining/stats - Mining Performance Strip
+//
+// BTC rewards are recomputed from capacity on every request so a stale
+// Redis value can never leak a mismatched figure to the frontend.
+// =============================================
+app.get('/api/mining/stats', async (req, res) => {
+    try {
+        const stats = await getCurrentMiningStats();
+
+        // Self-audit: BTC rewards must equal capacity × BTC_PER_TH_PER_DAY.
+        const auditedBtcRewards = stats.capacity * BTC_PER_TH_PER_DAY;
+
+        res.status(200).json({
+            hashrate: stats.hashrate,                              // PH/s
+            capacity: stats.capacity,                              // TH/s
+            rewards: parseFloat(auditedBtcRewards.toFixed(2)),     // BTC (24h)
+            uptime: stats.uptime                                   // %
+        });
+
+    } catch (err) {
+        console.error('Error in /api/mining/stats:', err);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch mining statistics'
+        });
+    }
+});
+
+// =============================================
+// ENDPOINT 2: GET /api/mining/dashboard - Mining Dashboard Preview
+//
+// Same self-audit as /api/mining/stats.
+// =============================================
+app.get('/api/mining/dashboard', async (req, res) => {
+    try {
+        const stats = await getCurrentMiningStats();
+
+        // Same self-audit as /api/mining/stats
+        const auditedBtcRewards = stats.capacity * BTC_PER_TH_PER_DAY;
+
+        res.status(200).json({
+            hashrate: stats.hashrate,                              // PH/s
+            rewards: parseFloat(auditedBtcRewards.toFixed(2)),     // BTC (24h)
+            contracts: stats.contracts,                            // Active contracts
+            hashrateChange: stats.hashrateChange || 0,             // Percentage
+            rewardsChange: stats.rewardsChange || 0,               // Percentage
+            chartData: stats.chartData || generateInitialChartData(stats.hashrate)
+        });
+
+    } catch (err) {
+        console.error('Error in /api/mining/dashboard:', err);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch mining dashboard data'
+        });
+    }
+});
+
+// =============================================
+// ENDPOINT 3: POST /api/mining/reset - Force reset mining stats
+//
+// Clears Redis and reseeds. Guarantees the next /stats call cannot
+// return any previously cached PH/s or BTC value.
+// =============================================
+app.post('/api/mining/reset', async (req, res) => {
+    try {
+        await clearRedisMiningStats();
+        miningStatsCache = null;
+        miningStatsLastCacheTime = 0;
+
+        // Generate fresh stats
+        const newStats = await generateInitialMiningStats();
+        await saveMiningStatsToRedis(newStats);
+        miningStatsCache = newStats;
+        miningStatsLastCacheTime = Date.now();
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Mining stats reset successfully',
+            data: {
+                hashrate: newStats.hashrate,
+                capacity: newStats.capacity,
+                rewards: newStats.btcRewards,
+                uptime: newStats.uptime
+            }
+        });
+    } catch (err) {
+        console.error('Error resetting mining stats:', err);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to reset mining statistics'
+        });
+    }
+});
+
+console.log('✅ Mining Statistics endpoints loaded:');
+console.log('   - GET /api/mining/stats');
+console.log('   - GET /api/mining/dashboard');
+console.log('   - POST /api/mining/reset');
+console.log(`   - Active contracts: ${MINING_CONFIG.contractsPercentage.min*100}%-${MINING_CONFIG.contractsPercentage.max*100}% of investor count`);
+console.log(`   - Update interval: ${MINING_CONFIG.updateInterval/60000} minutes`);
+console.log(`   - BTC rewards range (hardcoded): ${MINING_CONFIG.btcRewards.min}-${MINING_CONFIG.btcRewards.max} BTC/day`);
+console.log(`   - Capacity range (derived): ${formatNumberWithCommas(DERIVED_CAPACITY_MIN_TH)}-${formatNumberWithCommas(DERIVED_CAPACITY_MAX_TH)} TH/s`);
+console.log(`   - Hashrate range (derived): ${DERIVED_HASHRATE_MIN_PH}-${DERIVED_HASHRATE_MAX_PH} PH/s`);
+console.log(`   - Uptime range (hardcoded): ${MINING_CONFIG.uptime.min}%-${MINING_CONFIG.uptime.max}%`);
+console.log(`   - BTC_PER_TH_PER_HOUR (server constant): ${BTC_PER_TH_PER_HOUR}`);
+console.log('🗑️ Redis will be cleared on startup');
+
+
 
 
 
