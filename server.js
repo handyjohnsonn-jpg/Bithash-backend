@@ -3374,12 +3374,11 @@ const PairLimits = mongoose.models.PairLimits || mongoose.model('PairLimits', Pa
 const AssetExtraInfo = mongoose.models.AssetExtraInfo || mongoose.model('AssetExtraInfo', AssetExtraInfoSchema);
 
 
-
 const SystemSettingsSchema = new mongoose.Schema({
   type: { 
     type: String, 
     required: true,
-    enum: ['general', 'email', 'payment', 'security', 'electricity'],
+    enum: ['general', 'email', 'payment', 'security', 'electricity', 'deposits'],
     unique: true
   },
   platformName: String,
@@ -3417,6 +3416,44 @@ const SystemSettingsSchema = new mongoose.Schema({
 
     updatedBy:           { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
     updatedAt:           { type: Date, default: Date.now }
+  },
+
+  // ============================================================
+  // DEPOSIT SETTINGS (populated only when type === 'deposits')
+  // ============================================================
+  // Single source of truth for the platform-wide minimum deposit
+  // threshold, the on-chain watcher cadence, and the auto-approve /
+  // auto-sweep behaviour. NEVER hardcode any of these values in
+  // endpoint logic — always read them from this document.
+  deposits: {
+    // Minimum accepted deposit, in USD. A deposit whose live on-chain
+    // USD value falls below this is rejected and never credited.
+    minimumDepositUSD:   { type: Number, default: 10, min: 0 },
+
+    // How often (in seconds) the on-chain watcher polls each pending deposit.
+    watchIntervalSeconds: { type: Number, default: 30, min: 5, max: 600 },
+
+    // Maximum watcher attempts before the deposit is marked abandoned.
+    maxWatchAttempts:     { type: Number, default: 60, min: 5, max: 2880 },
+
+    // Auto-approve and credit the user's main wallet once the deposit
+    // reaches the required on-chain confirmations.
+    autoApproveOnConfirm: { type: Boolean, default: true },
+
+    // Auto-sweep the confirmed funds to the treasury wallet immediately
+    // after the deposit is credited.
+    autoSweepOnApprove:   { type: Boolean, default: true },
+
+    // Optional platform-wide override of per-asset confirmation requirements.
+    // When null, each asset uses its own REQUIRED_CONFIRMATIONS entry.
+    requiredConfirmationsOverride: { type: Number, default: null, min: 1 },
+
+    currency:  { type: String, default: 'USD' },
+
+    notes:     { type: String, default: '' },
+
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+    updatedAt: { type: Date, default: Date.now }
   },
 
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
