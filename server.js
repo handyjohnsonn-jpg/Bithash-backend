@@ -33324,10 +33324,9 @@ app.get('/api/admin/deposits/pending', adminProtect, restrictTo('super', 'financ
 
 
 
-
-/**
+/* ============================================================================
  * POST /api/admin/deposits/:id/approve
- *
+ * ----------------------------------------------------------------------------
  * Admin-only. Approves a pending deposit, credits the user's main wallet
  * exactly once, mirrors the DepositAsset, dispatches user + admin emails,
  * emits sockets, writes audit rows, and triggers the treasury sweep.
@@ -33343,12 +33342,12 @@ app.get('/api/admin/deposits/pending', adminProtect, restrictTo('super', 'financ
  * On-chain verification: the deposit's txHash is verified against the chain
  * before any credit is written. If the transaction cannot be found or has
  * failed on-chain, the approval is rejected.
- */
+ * ========================================================================== */
 app.post(
   '/api/admin/deposits/:id/approve',
   adminProtect,
   restrictTo('super', 'finance'),
-  async (req, res) => {
+  async function approveDepositHandler(req, res) {
     const startedAt = Date.now();
     const adminId = req.admin?._id || null;
 
@@ -33418,9 +33417,6 @@ app.post(
     }
 
     // ---- 2. Idempotency: already credited? -----------------------------
-    // The authoritative flag is `details.creditedAt` on the Transaction.
-    // We also treat DepositAsset.status === 'completed' + Transaction.status === 'completed'
-    // as already-credited.
     const depositAsset = depositSource === 'DepositAsset'
       ? deposit
       : (transaction && transaction._linkedDepositAsset) || null;
@@ -33448,8 +33444,6 @@ app.post(
     }
 
     // ---- 3. Validate state ---------------------------------------------
-    // DepositAsset.status may be 'pending'. Transaction.status may be 'pending'.
-    // If we somehow reached here with a non-pending, non-completed state, refuse.
     const currentStatus = (depositAsset && depositAsset.status) || (transaction && transaction.status);
     if (currentStatus && currentStatus !== 'pending') {
       return res.status(400).json({
@@ -33522,9 +33516,6 @@ app.post(
       0;
 
     // ---- 6. On-chain verification --------------------------------------
-    // We refuse to credit a deposit whose on-chain transaction cannot be
-    // verified. If the deposit has no txHash (e.g. an admin manual credit),
-    // skip verification but flag it.
     let onChainVerified = false;
     let onChainSnapshot = null;
 
@@ -33566,12 +33557,10 @@ app.post(
         });
       }
     } else {
-      // No txHash: this is a manual credit. Record the fact in the audit.
       onChainSnapshot = { manual: true, verified: false };
     }
 
     // ---- 7. Resolve the exchange rate ----------------------------------
-    // Prefer the price locked at submission; fall back to live.
     let exchangeRate =
       (transaction && transaction.exchangeRateAtTime) ||
       (depositAsset && depositAsset.metadata && depositAsset.metadata.exchangeRate) ||
@@ -33582,23 +33571,21 @@ app.post(
       try {
         const live = await getCryptoPrice(assetUpper);
         if (live && live > 0) exchangeRate = live;
-      } catch (_) {}
+      } catch (_) { /* fall through to implied rate */ }
     }
     if (!exchangeRate || exchangeRate <= 0) {
-      exchangeRate = usdAmount / cryptoAmount;   // last resort: implied rate
+      exchangeRate = usdAmount / cryptoAmount;
     }
 
-    // ---- 8. Credit the user's main wallet (idempotent) -----------------
-    // We store creditedAt on the Transaction.details as the guard. The
-    // write pattern is: set creditedAt in a conditional update first, then
-    // credit. If the conditional update fails, another worker got there.
+    // ---- 8. Credit the user's main wallet (atomic idempotent claim) ----
     const creditOperationId = crypto.randomBytes(8).toString('hex');
     const creditedAt = new Date();
 
     let creditClaimed = false;
 
     if (transaction && transaction._id) {
-      const claim = await Transaction.updateOne(
+      // Atomic claim: only succeeds if `creditedAt` does not yet exist.
+      const claim = await Transaction.findOneAndUpdate(
         {
           _id: transaction._id,
           'details.creditedAt': { $exists: false }
@@ -33608,12 +33595,12 @@ app.post(
             'details.creditedAt': creditedAt,
             'details.creditOperationId': creditOperationId
           }
-        }
+        },
+        { new: false }
       );
-      creditClaimed = claim.modifiedCount === 1;
+      creditClaimed = !!claim;
     } else {
-      // No transaction document: nothing to claim against. We will create
-      // one in step 10 and rely on a unique reference.
+      // No transaction document to claim against; we create one in step 10.
       creditClaimed = true;
     }
 
@@ -33625,7 +33612,7 @@ app.post(
       });
     }
 
-    // Snapshot balances before mutation so we can roll back if needed.
+    // Snapshot the balances before mutation so we can roll back if needed.
     if (!user.balances) {
       user.balances = { main: new Map(), active: new Map(), matured: new Map() };
     }
@@ -33748,9 +33735,7 @@ app.post(
       });
     }
 
-    // ---- 11. Treasury sweep (post-credit) ------------------------------
-    // Best-effort. Failure does not roll back the credit; it is recorded
-    // on the transaction so the treasury ops team can retry manually.
+    // ---- 11. Treasury sweep (post-credit, best-effort) -----------------
     let sweepOutcome = { attempted: false };
 
     try {
@@ -33813,7 +33798,7 @@ app.post(
             }
           }
         );
-      } catch (_) {}
+      } catch (_) { /* silent */ }
     }
 
     // ---- 12. Recompute the user's total main USD for the email ---------
@@ -33824,7 +33809,7 @@ app.post(
       try {
         const p = await getCryptoPrice(asset.toUpperCase());
         if (p && p > 0) totalMainUsd += Number(balance) * p;
-      } catch (_) {}
+      } catch (_) { /* skip this asset */ }
     }
     totalMainUsd = Number(totalMainUsd.toFixed(2));
 
@@ -33993,15 +33978,14 @@ app.post(
           processingTimeMs: Date.now() - startedAt
         }
       });
-    } catch (_) {}
+    } catch (_) { /* silent */ }
 
     return res.status(500).json({
       status: 'fail',
       message: err.message || 'Failed to approve deposit'
     });
   }
-);
-
+});
 
 
 
