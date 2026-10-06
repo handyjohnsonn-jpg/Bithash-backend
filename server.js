@@ -20280,97 +20280,225 @@ app.post('/api/investments', protect, [
     const firstCycleEndDate = new Date(Date.now() + plan.duration * 60 * 60 * 1000);
     const firstCycleStartDate = new Date();
 
-    if (balanceType === 'main') {
-      const newMainBTCBalance = mainBitcoinBalance - investmentBTCAmount;
-      if (newMainBTCBalance <= 0.00000001) {
-        user.balances.main.delete('btc');
-      } else {
-        user.balances.main.set('btc', newMainBTCBalance);
-      }
-      console.log(`   Deducted ${investmentBTCAmount.toFixed(8)} BTC from Main wallet. New balance: ${newMainBTCBalance.toFixed(8)} BTC`);
-    } else if (balanceType === 'matured') {
-      const newMaturedBTCBalance = maturedBitcoinBalance - investmentBTCAmount;
-      if (newMaturedBTCBalance <= 0.00000001) {
-        user.balances.matured.delete('btc');
-      } else {
-        user.balances.matured.set('btc', newMaturedBTCBalance);
-      }
-      console.log(`   Deducted ${investmentBTCAmount.toFixed(8)} BTC from Matured wallet. New balance: ${newMaturedBTCBalance.toFixed(8)} BTC`);
+        
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    let investment;   // declared here so it is in scope after the try block
+
+    try {
+        /* ---- 1. Re-read the user inside the transaction ---- */
+        const userDoc = await User.findById(userId).session(session);
+        if (!userDoc) {
+            throw new Error('User not found inside rental transaction');
+        }
+
+        if (!userDoc.balances) {
+            userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+        }
+        if (!userDoc.balances.main) userDoc.balances.main = new Map();
+        if (!userDoc.balances.active) userDoc.balances.active = new Map();
+        if (!userDoc.balances.matured) userDoc.balances.matured = new Map();
+
+        /* ---- 2. Snapshot pre-state ---- */
+        const preMainBTC    = Number(userDoc.balances.main.get('btc') || 0);
+        const preMaturedBTC = Number(userDoc.balances.matured.get('btc') || 0);
+        const preActiveBTC  = Number(userDoc.balances.active.get('btc') || 0);
+        const preActiveUSD  = Number(userDoc.balances.active.get('usd') || 0);
+
+        /* ---- 3. Compute post-state ---- */
+        let postSourceBTC;
+        if (balanceType === 'main') {
+            postSourceBTC = preMainBTC - investmentBTCAmount;
+        } else {
+            postSourceBTC = preMaturedBTC - investmentBTCAmount;
+        }
+        if (postSourceBTC <= 0.00000001) postSourceBTC = 0;
+
+        const postActiveBTC = Number((preActiveBTC + netPrincipalBTC).toFixed(18));
+        const postActiveUSD = Number((preActiveUSD + netPrincipalUSD).toFixed(2));
+
+        /* ---- 4. Apply to in-memory doc ---- */
+        if (balanceType === 'main') {
+            if (postSourceBTC === 0) userDoc.balances.main.delete('btc');
+            else userDoc.balances.main.set('btc', postSourceBTC);
+        } else {
+            if (postSourceBTC === 0) userDoc.balances.matured.delete('btc');
+            else userDoc.balances.matured.set('btc', postSourceBTC);
+        }
+        userDoc.balances.active.set('btc', postActiveBTC);
+        userDoc.balances.active.set('usd', postActiveUSD);
+        userDoc.markModified('balances');
+
+        await userDoc.save({ session });
+
+        /* ---- 5. Create the Investment document inside the transaction ---- */
+        [investment] = await Investment.create([{
+            user: userId,
+            plan: planId,
+            amount: netPrincipalUSD,
+            amountBTC: netPrincipalBTC,
+            originalAmount: amount,
+            originalAmountBTC: investmentBTCAmount,
+            originalCurrency: 'USD',
+            currency: 'BTC',
+            expectedReturn: firstCycleReturnUSD,
+            expectedReturnBTC: firstCycleReturnBTC,
+            returnPercentage: plan.percentage,
+            endDate: firstCycleEndDate,
+            payoutSchedule: 'end_term',
+            status: 'active',
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+            deviceInfo: getDeviceType(req),
+            termsAccepted: true,
+            investmentFee: firstCycleFeeUSD,
+            investmentFeeBTC: firstCycleFeeBTC,
+            balanceType: balanceType,
+            btcPriceAtInvestment: btcPrice,
+
+            costBasis: costBasisSnapshot,
+            totalPowerCostUSD: firstCyclePowerCostUSD,
+            totalPowerCostBTC: firstCyclePowerCostBTC,
+
+            autoCompoundMonths: requestedMonths > 0 ? requestedMonths : 1,
+            totalCycles: totalCycles,
+            cyclesPerMonth: cyclesPerMonth,
+            currentCycle: 1,
+            currentMonth: 1,
+            isAutoCompoundActive: totalCycles > 1,
+            monthStartingPrincipalUSD: netPrincipalUSD,
+            monthStartingPrincipalBTC: netPrincipalBTC,
+            monthToDateReturnUSD: 0,
+            monthToDateReturnBTC: 0,
+            cumulativeReturnUSD: 0,
+            cumulativeReturnBTC: 0,
+            currentHashrate: initialHashpower,
+            hashrateHistory: [{
+                cycleNumber: 1,
+                monthNumber: 1,
+                hashrate: initialHashpower,
+                btcPriceAtCalculation: btcPrice,
+                calculatedAt: firstCycleStartDate
+            }],
+            cycleHistory: [{
+                cycleNumber: 1,
+                monthNumber: 1,
+                incomingBalanceUSD: incomingBalanceUSD,
+                incomingBalanceBTC: incomingBalanceBTC,
+                feeUSD: firstCycleFeeUSD,
+                feeBTC: firstCycleFeeBTC,
+                netPrincipalUSD: netPrincipalUSD,
+                netPrincipalBTC: netPrincipalBTC,
+                returnUSD: 0,
+                returnBTC: 0,
+                btcPriceAtStart: btcPrice,
+                startDate: firstCycleStartDate,
+                endDate: firstCycleEndDate,
+                status: 'active'
+            }]
+        }], { session });
+
+        /* ---- 6. Ledger: rental debit on the source wallet ---- */
+        const rentalRef = `rental_debit:${investment._id}`;
+
+        await writeLedgerEntry({
+            user: userId,
+            wallet: balanceType,
+            asset: 'btc',
+            direction: 'debit',
+            amount: investmentBTCAmount,
+            usdValueAtTime: amount,
+            assetPriceAtTime: btcPrice,
+            source: 'rental_debit',
+            reference: rentalRef,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postSourceBTC,
+            metadata: {
+                contractId: investment._id.toString(),
+                planId: planId.toString(),
+                planName: plan.name,
+                balanceType,
+                reason: 'Rented hashrate — gross debit from user wallet'
+            },
+            session
+        });
+
+        /* ---- 7. Ledger: cycle fee visibility entry on the source wallet ---- */
+        await writeLedgerEntry({
+            user: userId,
+            wallet: balanceType,
+            asset: 'btc',
+            direction: 'debit',
+            amount: firstCycleFeeBTC,
+            usdValueAtTime: firstCycleFeeUSD,
+            assetPriceAtTime: btcPrice,
+            source: 'cycle_fee',
+            reference: `${rentalRef}:fee`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postSourceBTC,
+            metadata: {
+                contractId: investment._id.toString(),
+                planName: plan.name,
+                cycleFeePercent,
+                cycle: 1,
+                month: 1,
+                feeSource: (typeof plan.cycleFeePercent === 'number') ? 'plan' : 'global',
+                reason: 'Cycle initiation fee (already netted at debit time)'
+            },
+            session
+        });
+
+        /* ---- 8. Ledger: net principal credit to the active wallet ---- */
+        await writeLedgerEntry({
+            user: userId,
+            wallet: 'active',
+            asset: 'btc',
+            direction: 'credit',
+            amount: netPrincipalBTC,
+            usdValueAtTime: netPrincipalUSD,
+            assetPriceAtTime: btcPrice,
+            source: 'rental_debit',
+            reference: `${rentalRef}:active`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postActiveBTC,
+            metadata: {
+                contractId: investment._id.toString(),
+                planName: plan.name,
+                reason: 'Net principal deployed into active mining pool'
+            },
+            session
+        });
+
+        /* ---- 9. Commit ---- */
+        await session.commitTransaction();
+
+        /* Mirror balances back onto the caller's `user` reference so any
+           later code in this handler sees the post-transaction state. */
+        user.balances = userDoc.balances;
+
+        console.log(`✅ Rental ledger entries written for contract ${investment._id}`);
+
+    } catch (txErr) {
+        await session.abortTransaction();
+        session.endSession();
+
+        console.error('❌ Rental transaction failed:', txErr);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to record mining contract. No funds were deducted.'
+        });
+    } finally {
+        if (session.inTransaction()) {
+            await session.abortTransaction();
+        }
+        session.endSession();
     }
 
-    const currentActiveBTC = user.balances.active.get('btc') || 0;
-    user.balances.active.set('btc', currentActiveBTC + netPrincipalBTC);
-    const currentActiveUSD = user.balances.active.get('usd') || 0;
-    user.balances.active.set('usd', currentActiveUSD + netPrincipalUSD);
-
-    await user.save();
-
-    const investment = await Investment.create({
-      user: userId,
-      plan: planId,
-      amount: netPrincipalUSD,
-      amountBTC: netPrincipalBTC,
-      originalAmount: amount,
-      originalAmountBTC: investmentBTCAmount,
-      originalCurrency: 'USD',
-      currency: 'BTC',
-      expectedReturn: firstCycleReturnUSD,
-      expectedReturnBTC: firstCycleReturnBTC,
-      returnPercentage: plan.percentage,
-      endDate: firstCycleEndDate,
-      payoutSchedule: 'end_term',
-      status: 'active',
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
-      deviceInfo: getDeviceType(req),
-      termsAccepted: true,
-      investmentFee: firstCycleFeeUSD,
-      investmentFeeBTC: firstCycleFeeBTC,
-      balanceType: balanceType,
-      btcPriceAtInvestment: btcPrice,
-
-      costBasis: costBasisSnapshot,
-      totalPowerCostUSD: firstCyclePowerCostUSD,
-      totalPowerCostBTC: firstCyclePowerCostBTC,
-
-      autoCompoundMonths: requestedMonths > 0 ? requestedMonths : 1,
-      totalCycles: totalCycles,
-      cyclesPerMonth: cyclesPerMonth,
-      currentCycle: 1,
-      currentMonth: 1,
-      isAutoCompoundActive: totalCycles > 1,
-      monthStartingPrincipalUSD: netPrincipalUSD,
-      monthStartingPrincipalBTC: netPrincipalBTC,
-      monthToDateReturnUSD: 0,
-      monthToDateReturnBTC: 0,
-      cumulativeReturnUSD: 0,
-      cumulativeReturnBTC: 0,
-      currentHashrate: initialHashpower,
-      hashrateHistory: [{
-        cycleNumber: 1,
-        monthNumber: 1,
-        hashrate: initialHashpower,
-        btcPriceAtCalculation: btcPrice,
-        calculatedAt: firstCycleStartDate
-      }],
-      cycleHistory: [{
-        cycleNumber: 1,
-        monthNumber: 1,
-        incomingBalanceUSD: incomingBalanceUSD,
-        incomingBalanceBTC: incomingBalanceBTC,
-        feeUSD: firstCycleFeeUSD,
-        feeBTC: firstCycleFeeBTC,
-        netPrincipalUSD: netPrincipalUSD,
-        netPrincipalBTC: netPrincipalBTC,
-        returnUSD: 0,
-        returnBTC: 0,
-        btcPriceAtStart: btcPrice,
-        startDate: firstCycleStartDate,
-        endDate: firstCycleEndDate,
-        status: 'active'
-      }]
-    });
-
+    
     const transaction = await Transaction.create({
       user: userId,
       type: 'investment',
