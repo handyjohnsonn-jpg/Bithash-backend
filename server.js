@@ -8027,21 +8027,82 @@ const calculateReferralCommissions = async (investment) => {
       paidAt: new Date()
     });
 
-    const updatedUpline = await User.findByIdAndUpdate(
-      uplineId,
-      {
-        $inc: {
-          'balances.main': commissionAmount,
-          'referralStats.totalEarnings': commissionAmount,
-          'referralStats.availableBalance': commissionAmount,
-          'downlineStats.totalCommissionEarned': commissionAmount,
-          'downlineStats.thisMonthCommission': commissionAmount
-        }
-      },
-      { new: true }
-    );
+        /* ============================================================================
+     * Atomic referral commission credit + ledger write.
+     *
+     * Money path:
+     *   upline main wallet → credit commissionAmount in USD
+     *
+     * The commission is denominated in USD, not crypto, so the ledger entry
+     * uses asset='usd' with assetPriceAtTime=1.
+     * ========================================================================== */
+    let updatedUpline;
+    {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const uplineDoc = await User.findById(uplineId).session(session);
+            if (!uplineDoc) throw new Error(`Upline user ${uplineId} not found`);
 
-    console.log(`Updated upline ${uplineUser.email} MAIN balance with $${commissionAmount}. New balance: $${updatedUpline.balances.main}`);
+            if (!uplineDoc.balances) {
+                uplineDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!uplineDoc.balances.main) uplineDoc.balances.main = new Map();
+
+            const preUSD = Number(uplineDoc.balances.main.get('usd') || 0);
+            const postUSD = Number((preUSD + commissionAmount).toFixed(2));
+
+            uplineDoc.balances.main.set('usd', postUSD);
+            uplineDoc.referralStats.totalEarnings =
+                (uplineDoc.referralStats.totalEarnings || 0) + commissionAmount;
+            uplineDoc.referralStats.availableBalance =
+                (uplineDoc.referralStats.availableBalance || 0) + commissionAmount;
+            uplineDoc.downlineStats.totalCommissionEarned =
+                (uplineDoc.downlineStats.totalCommissionEarned || 0) + commissionAmount;
+            uplineDoc.downlineStats.thisMonthCommission =
+                (uplineDoc.downlineStats.thisMonthCommission || 0) + commissionAmount;
+            uplineDoc.markModified('balances.main');
+
+            await uplineDoc.save({ session });
+
+            await writeLedgerEntry({
+                user: uplineId,
+                wallet: 'main',
+                asset: 'usd',
+                direction: 'credit',
+                amount: commissionAmount,
+                usdValueAtTime: commissionAmount,
+                assetPriceAtTime: 1,
+                source: 'referral_commission',
+                reference: `referral_commission:${commissionHistory._id}`,
+                relatedEntity: commissionHistory._id,
+                relatedModel: 'CommissionHistory',
+                balanceAfter: postUSD,
+                metadata: {
+                    downlineUserId: investorId.toString(),
+                    downlineEmail: uplineUser.email,
+                    investmentId: investmentId.toString(),
+                    round: relationship.commissionRounds - relationship.remainingRounds + 1,
+                    totalRounds: relationship.commissionRounds,
+                    percentage: commissionPercentage,
+                    reason: 'Downline investment commission'
+                },
+                session
+            });
+
+            await session.commitTransaction();
+            updatedUpline = uplineDoc;
+
+            console.log(`✅ Referral ledger entry written for upline ${uplineUser.email}: $${commissionAmount}`);
+        } catch (txErr) {
+            await session.abortTransaction();
+            console.error('❌ Referral commission transaction failed:', txErr);
+            
+            return;
+        } finally {
+            session.endSession();
+        }
+    }
 
     relationship.remainingRounds -= 1;
     relationship.totalCommissionEarned += commissionAmount;
