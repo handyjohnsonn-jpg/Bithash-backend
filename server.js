@@ -49737,6 +49737,58 @@ app.post('/api/promos/redeem', protect, async (req, res) => {
     }
 
     await user.save();
+	
+	    /* ============================================================================
+     * Promotion credit — ledger write.
+     *
+     * Money path:
+     *   walletType → credit  rewardValue (asset)  OR  bonusCryptoAmount (asset)
+     *
+     * The `switch` above already mutated the in-memory balance. We capture
+     * the post-state here and write exactly one ledger entry.
+     * ========================================================================== */
+    {
+        const creditAsset = (rewardAsset || finalDepositAsset || 'usdt').toLowerCase();
+        const creditAmount =
+            promo.rewardType === 'bonus' || promo.rewardType === 'percentage'
+                ? bonusCryptoAmount
+                : rewardValue;
+        const creditUsd =
+            promo.rewardType === 'bonus' || promo.rewardType === 'percentage'
+                ? bonusUSDValue
+                : (rewardValue * currentPrice);
+
+        const postBalance = Number(targetWallet.get(creditAsset) || 0);
+
+        await writeLedgerEntry({
+            user: userId,
+            wallet: walletType,
+            asset: creditAsset,
+            direction: 'credit',
+            amount: creditAmount,
+            usdValueAtTime: creditUsd,
+            assetPriceAtTime: currentPrice,
+            source: 'promotion_credit',
+            reference: `promotion_credit:${promo._id}:${userId}`,
+            relatedEntity: promo._id,
+            relatedModel: 'Promo',
+            balanceAfter: postBalance,
+            metadata: {
+                promoCode: promo.code,
+                promoDescription: promo.description,
+                rewardType: promo.rewardType,
+                rewardValue: promo.rewardValue,
+                walletType,
+                appliedToDepositId: recentDeposit._id.toString(),
+                adminOnly: false
+            },
+            session: null
+        });
+
+        console.log(`✅ Promotion ledger entry written for user ${userId}, code ${promo.code}`);
+    }
+
+    await user.save();
 
     const transactionReference = `PROMO-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     const transactionUSDValue = rewardValue * currentPrice;
@@ -56136,6 +56188,382 @@ console.log('🗑️ Redis will be cleared on startup');
 
 
 
+/* ============================================================================
+ * ADMIN PROMO CODE MANAGEMENT ENDPOINTS
+ * ----------------------------------------------------------------------------
+ * These endpoints are required by the admin dashboard's "Promo Codes" section.
+ * They are mounted under /api/admin/promo and are protected by adminProtect
+ * middleware.
+ * ========================================================================== */
+
+/**
+ * GET /api/admin/promo/stats
+ * Retrieves aggregated statistics for the promo dashboard.
+ */
+app.get('/api/admin/promo/stats', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const now = new Date();
+        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+        const [activeCodes, totalRedemptions, totalRewardedAgg, expiringSoon] = await Promise.all([
+            // Active codes: isActive=true, not expired, and not exhausted
+            Promo.countDocuments({
+                isActive: true,
+                expiresAt: { $gt: now },
+                $expr: { $lt: ['$usedCount', '$maxUses'] }
+            }),
+            // Total redemptions
+            RedeemedPromo.countDocuments(),
+            // Total value rewarded
+            RedeemedPromo.aggregate([
+                { $group: { _id: null, total: { $sum: '$rewardValue' } } }
+            ]),
+            // Codes expiring in the next 7 days that are still active
+            Promo.countDocuments({
+                isActive: true,
+                expiresAt: { $gt: now, $lte: sevenDaysFromNow },
+                $expr: { $lt: ['$usedCount', '$maxUses'] }
+            })
+        ]);
+
+        const totalRewarded = totalRewardedAgg.length > 0 ? totalRewardedAgg[0].total : 0;
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                stats: {
+                    activeCodes,
+                    totalRedemptions,
+                    totalRewarded,
+                    expiringSoon
+                }
+            }
+        });
+    } catch (err) {
+        console.error('Error fetching promo stats:', err);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch promo statistics' });
+    }
+});
+
+/**
+ * GET /api/admin/promo
+ * Lists all promo codes with pagination, search, and status filtering.
+ */
+app.get('/api/admin/promo', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+        const skip = (page - 1) * limit;
+
+        const search = (req.query.search || '').trim();
+        const statusFilter = req.query.status || 'all';
+
+        let query = {};
+        const now = new Date();
+
+        // Status filtering logic
+        if (statusFilter !== 'all') {
+            switch (statusFilter) {
+                case 'active':
+                    query.isActive = true;
+                    query.expiresAt = { $gt: now };
+                    query.$expr = { $lt: ['$usedCount', '$maxUses'] };
+                    break;
+                case 'paused':
+                    query.isActive = false;
+                    query.expiresAt = { $gt: now };
+                    query.$expr = { $lt: ['$usedCount', '$maxUses'] };
+                    break;
+                case 'expired':
+                    query.expiresAt = { $lte: now };
+                    break;
+                case 'exhausted':
+                    query.$expr = { $gte: ['$usedCount', '$maxUses'] };
+                    break;
+                case 'disabled':
+                    query.isActive = false;
+                    query.$expr = { $gte: ['$usedCount', '$maxUses'] };
+                    break;
+                case 'draft': // Corresponds to 'inactive' but not expired/exhausted
+                    query.isActive = false;
+                    query.expiresAt = { $gt: now };
+                    query.$expr = { $lt: ['$usedCount', '$maxUses'] };
+                    break;
+            }
+        }
+
+        // Search filtering
+        if (search) {
+            query.code = { $regex: search, $options: 'i' };
+        }
+
+        const promos = await Promo.find(query)
+            .populate('createdBy', 'name')
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        const total = await Promo.countDocuments(query);
+        const totalPages = Math.ceil(total / limit);
+
+        const enrichedPromos = promos.map(promo => {
+            let status = 'draft';
+            if (promo.isActive && promo.expiresAt > now && promo.usedCount < promo.maxUses) status = 'active';
+            else if (!promo.isActive && promo.expiresAt > now && promo.usedCount < promo.maxUses) status = 'paused';
+            else if (promo.expiresAt <= now) status = 'expired';
+            else if (promo.usedCount >= promo.maxUses) status = 'exhausted';
+            else if (!promo.isActive) status = 'disabled';
+
+            return {
+                ...promo,
+                status,
+                reward: `${promo.rewardValue}${promo.rewardType === 'percentage' ? '%' : ''} ${promo.rewardAsset.toUpperCase()}`,
+                wallet: promo.walletType || 'main',
+                audience: promo.targetType === 'all' ? 'All Users' : `${promo.userIds?.length || 0} Users`,
+                expires: promo.expiresAt ? new Date(promo.expiresAt).toLocaleDateString() : 'Never',
+                remainingUses: Math.max(0, promo.maxUses - promo.usedCount),
+                targetUserCount: promo.userIds?.length || 0,
+            };
+        });
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                promos: enrichedPromos,
+                pagination: {
+                    currentPage: page,
+                    totalPages,
+                    totalItems: total,
+                    hasNextPage: page < totalPages,
+                    hasPrevPage: page > 1
+                }
+            }
+        });
+    } catch (err) {
+        console.error('Error fetching promos:', err);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch promo codes' });
+    }
+});
+
+/**
+ * POST /api/admin/promo
+ * Creates a new promo code.
+ */
+app.post('/api/admin/promo', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const {
+            code,
+            description,
+            rewardType,
+            rewardValue,
+            currency, // This maps to rewardAsset in the model
+            targetType,
+            targetUsers, // This is an array of user IDs
+            maxRedemptions,
+            perUserLimit,
+            expiresAt,
+            wallet,
+            category
+        } = req.body;
+
+        // Validation
+        if (!code || !rewardValue || !rewardType || !currency) {
+            return res.status(400).json({ status: 'fail', message: 'Missing required fields: code, rewardValue, rewardType, currency' });
+        }
+
+        const existingPromo = await Promo.findOne({ code: code.toUpperCase() });
+        if (existingPromo) {
+            return res.status(409).json({ status: 'fail', message: `Promo code "${code.toUpperCase()}" already exists.` });
+        }
+
+        const newPromo = await Promo.create({
+            code: code.toUpperCase(),
+            description: description || `${rewardValue}${rewardType === 'percentage' ? '%' : ''} bonus on deposits.`,
+            rewardType,
+            rewardValue,
+            rewardAsset: currency.toLowerCase(),
+            maxUses: maxRedemptions || 0, // 0 means unlimited
+            expiresAt: expiresAt ? new Date(expiresAt) : new Date(new Date().setFullYear(new Date().getFullYear() + 1)), // Default to 1 year
+            isActive: true, // Create as active by default
+            createdBy: req.admin._id,
+            targetType: targetType || 'all',
+            userIds: targetType === 'specific' ? targetUsers : [],
+            walletType: wallet || 'main',
+            maxRedemptionsPerUser: perUserLimit || 1,
+            category: category || 'deposit'
+        });
+
+        await logActivity('promo_created', 'Promo', newPromo._id, req.admin._id, 'Admin', req, {
+            code: newPromo.code,
+            reward: `${rewardValue}${rewardType === 'percentage' ? '%' : ''} ${currency}`
+        });
+
+        res.status(201).json({
+            status: 'success',
+            message: `Promo code "${newPromo.code}" created successfully.`,
+            data: { promo: newPromo }
+        });
+
+    } catch (err) {
+        console.error('Error creating promo:', err);
+        if (err.code === 11000) {
+            return res.status(409).json({ status: 'fail', message: 'This promo code already exists.' });
+        }
+        if (err.name === 'ValidationError') {
+            return res.status(400).json({ status: 'fail', message: err.message });
+        }
+        res.status(500).json({ status: 'error', message: 'Failed to create promo code' });
+    }
+});
+
+/**
+ * PATCH /api/admin/promo/:id/status
+ * Toggles a promo code's active (or paused) status.
+ */
+app.patch('/api/admin/promo/:id/status', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid promo ID' });
+        }
+
+        if (!['active', 'paused'].includes(status)) {
+            return res.status(400).json({ status: 'fail', message: 'Status must be either "active" or "paused"' });
+        }
+
+        const promo = await Promo.findById(id);
+        if (!promo) {
+            return res.status(404).json({ status: 'fail', message: 'Promo code not found' });
+        }
+
+        // Check if the promo can be activated
+        if (status === 'active' && (promo.expiresAt <= new Date() || promo.usedCount >= promo.maxUses)) {
+            return res.status(400).json({ status: 'fail', message: 'Cannot activate an expired or exhausted promo code.' });
+        }
+
+        promo.isActive = (status === 'active');
+        await promo.save();
+
+        await logActivity(`promo_${status}`, 'Promo', promo._id, req.admin._id, 'Admin', req, { code: promo.code });
+
+        res.status(200).json({
+            status: 'success',
+            message: `Promo code successfully ${status === 'active' ? 'activated' : 'paused'}.`,
+            data: { promo }
+        });
+
+    } catch (err) {
+        console.error('Error updating promo status:', err);
+        res.status(500).json({ status: 'error', message: 'Failed to update promo status' });
+    }
+});
+
+/**
+ * DELETE /api/admin/promo/:id
+ * Deletes a promo code.
+ */
+app.delete('/api/admin/promo/:id', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid promo ID' });
+        }
+
+        const promo = await Promo.findByIdAndDelete(id);
+
+        if (!promo) {
+            return res.status(404).json({ status: 'fail', message: 'Promo code not found' });
+        }
+
+        // Also delete associated redemption records
+        await RedeemedPromo.deleteMany({ promoId: id });
+
+        await logActivity('promo_deleted', 'Promo', promo._id, req.admin._id, 'Admin', req, { code: promo.code });
+
+        res.status(200).json({
+            status: 'success',
+            message: `Promo code "${promo.code}" deleted successfully.`
+        });
+
+    } catch (err) {
+        console.error('Error deleting promo:', err);
+        res.status(500).json({ status: 'error', message: 'Failed to delete promo code' });
+    }
+});
+
+/**
+ * GET /api/admin/promo/export
+ * Exports all promo codes as a CSV file.
+ */
+app.get('/api/admin/promo/export', adminProtect, restrictTo('super', 'finance'), async (req, res) => {
+    try {
+        const promos = await Promo.find({}).populate('createdBy', 'name').sort({ createdAt: -1 }).lean();
+
+        if (promos.length === 0) {
+            return res.status(404).json({ status: 'fail', message: 'No promo codes found to export.' });
+        }
+
+        const csvHeaders = [
+            'Code', 'Description', 'Reward Type', 'Reward Value', 'Reward Asset', 'Wallet Type',
+            'Target Type', 'Target Users', 'Max Uses', 'Used Count', 'Remaining Uses',
+            'Per-User Limit', 'Status', 'Category', 'Expires At', 'Created By', 'Created At'
+        ];
+
+        let csvRows = [csvHeaders.join(',')];
+
+        const now = new Date();
+        promos.forEach(promo => {
+            let status = 'Draft';
+            if (promo.isActive && promo.expiresAt > now && promo.usedCount < promo.maxUses) status = 'Active';
+            else if (!promo.isActive && promo.expiresAt > now && promo.usedCount < promo.maxUses) status = 'Paused';
+            else if (promo.expiresAt <= now) status = 'Expired';
+            else if (promo.usedCount >= promo.maxUses) status = 'Exhausted';
+
+            const row = [
+                `"${promo.code}"`,
+                `"${promo.description || ''}"`,
+                `"${promo.rewardType}"`,
+                promo.rewardValue,
+                `"${promo.rewardAsset.toUpperCase()}"`,
+                `"${promo.walletType || 'main'}"`,
+                `"${promo.targetType}"`,
+                promo.userIds?.length || 0,
+                promo.maxUses,
+                promo.usedCount || 0,
+                Math.max(0, promo.maxUses - (promo.usedCount || 0)),
+                promo.maxRedemptionsPerUser || 1,
+                `"${status}"`,
+                `"${promo.category || 'general'}"`,
+                `"${promo.expiresAt ? new Date(promo.expiresAt).toISOString() : 'Never'}"`,
+                `"${promo.createdBy?.name || 'System'}"`,
+                `"${new Date(promo.createdAt).toISOString()}"`
+            ];
+            csvRows.push(row.join(','));
+        });
+
+        const csvString = csvRows.join('\n');
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="promo-codes-export-${new Date().toISOString().split('T')[0]}.csv"`);
+        res.status(200).send(csvString);
+
+    } catch (err) {
+        console.error('Error exporting promos:', err);
+        res.status(500).json({ status: 'error', message: 'Failed to export promo codes' });
+    }
+});
+
+console.log('✅ Admin Promo Code Management endpoints loaded (5 endpoints):');
+console.log('   - GET    /api/admin/promo/stats');
+console.log('   - GET    /api/admin/promo');
+console.log('   - POST   /api/admin/promo');
+console.log('   - PATCH  /api/admin/promo/:id/status');
+console.log('   - DELETE /api/admin/promo/:id');
+console.log('   - GET    /api/admin/promo/export');
 
 
 
