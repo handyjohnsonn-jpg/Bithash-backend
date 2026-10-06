@@ -17789,6 +17789,121 @@ app.post('/api/convert', protect, async (req, res) => {
       }
     }
     
+	
+	    /* ============================================================================
+     * Currency conversion — ledger writes.
+     *
+     * Money path:
+     *   Each wallet that supplied the source asset  → debit  (its portion)
+     *   Each wallet that received the target asset   → credit (its portion)
+     *
+     * A single conversion can produce up to four ledger entries.
+     * ========================================================================== */
+    {
+        const convRef = `conversion:${Date.now()}:${userId}`;
+
+        if (amountFromMain > 0) {
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: fromAssetLower,
+                direction: 'debit',
+                amount: amountFromMain,
+                usdValueAtTime: amountFromMain * fromPrice,
+                assetPriceAtTime: fromPrice,
+                source: 'conversion',
+                reference: `${convRef}:main:debit:${fromAssetLower}`,
+                relatedEntity: null,
+                relatedModel: null,
+                balanceAfter: Number(user.balances.main.get(fromAssetLower) || 0),
+                metadata: {
+                    fromAsset: fromAssetLower,
+                    toAsset: toAssetLower,
+                    fromPrice,
+                    toPrice,
+                    feePercent: CONVERSION_FEE_PERCENT,
+                    reason: 'Conversion — source debit'
+                },
+                session: null
+            });
+        }
+
+        if (amountFromMatured > 0) {
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'matured',
+                asset: fromAssetLower,
+                direction: 'debit',
+                amount: amountFromMatured,
+                usdValueAtTime: amountFromMatured * fromPrice,
+                assetPriceAtTime: fromPrice,
+                source: 'conversion',
+                reference: `${convRef}:matured:debit:${fromAssetLower}`,
+                relatedEntity: null,
+                relatedModel: null,
+                balanceAfter: Number(user.balances.matured.get(fromAssetLower) || 0),
+                metadata: {
+                    fromAsset: fromAssetLower,
+                    toAsset: toAssetLower,
+                    reason: 'Conversion — source debit'
+                },
+                session: null
+            });
+        }
+
+        if (amountFromMain > 0) {
+            const proportionFromMain = amountFromMain / amount;
+            const toAmountForMain = toAmount * proportionFromMain;
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: toAssetLower,
+                direction: 'credit',
+                amount: toAmountForMain,
+                usdValueAtTime: toAmountForMain * toPrice,
+                assetPriceAtTime: toPrice,
+                source: 'conversion',
+                reference: `${convRef}:main:credit:${toAssetLower}`,
+                relatedEntity: null,
+                relatedModel: null,
+                balanceAfter: Number(user.balances.main.get(toAssetLower) || 0),
+                metadata: {
+                    fromAsset: fromAssetLower,
+                    toAsset: toAssetLower,
+                    reason: 'Conversion — target credit'
+                },
+                session: null
+            });
+        }
+
+        if (amountFromMatured > 0) {
+            const proportionFromMatured = amountFromMatured / amount;
+            const toAmountForMatured = toAmount * proportionFromMatured;
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'matured',
+                asset: toAssetLower,
+                direction: 'credit',
+                amount: toAmountForMatured,
+                usdValueAtTime: toAmountForMatured * toPrice,
+                assetPriceAtTime: toPrice,
+                source: 'conversion',
+                reference: `${convRef}:matured:credit:${toAssetLower}`,
+                relatedEntity: null,
+                relatedModel: null,
+                balanceAfter: Number(user.balances.matured.get(toAssetLower) || 0),
+                metadata: {
+                    fromAsset: fromAssetLower,
+                    toAsset: toAssetLower,
+                    reason: 'Conversion — target credit'
+                },
+                session: null
+            });
+        }
+
+        console.log(`✅ Conversion ledger entries written for user ${userId}`);
+    }
+
     await user.save();
     console.log('User balances updated and saved successfully');
     console.log('Updated balances:', {
@@ -18510,6 +18625,29 @@ app.post('/api/admin/users/:userId/crypto-balance', adminProtect, restrictTo('su
     const newUsdBalance = currentUsdBalance + usdValue;
     user.balances[walletType].set('usd', newUsdBalance);
     
+       await writeLedgerEntry({
+        user: userId,
+        wallet: walletType,
+        asset: currencyLower,
+        direction: 'credit',
+        amount: amount,
+        usdValueAtTime: usdValue,
+        assetPriceAtTime: price,
+        source: 'admin_adjustment',
+        reference: `admin_adjustment:${Date.now()}:${req.admin._id}:${currencyLower}`,
+        relatedEntity: req.admin._id,
+        relatedModel: 'ManualAdjustment',
+        balanceAfter: newCryptoBalance,
+        metadata: {
+            adminId: req.admin._id.toString(),
+            adminName: req.admin.name,
+            reason: description || 'Admin manual crypto credit',
+            description,
+            adminOnly: false
+        },
+        session: null
+    });
+
     await user.save();
     
     const transaction = await Transaction.create({
@@ -24620,8 +24758,66 @@ app.post('/api/loans/:id/repay', protect, async (req, res) => {
       });
     }
 
-    user.balances.main -= loan.repaymentAmount;
-    await user.save();
+        /* ============================================================================
+     * Financing repayment — atomic debit + ledger write.
+     *
+     * Money path:
+     *   main wallet → debit  loan.repaymentAmount (USD)
+     * ========================================================================== */
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const userDoc = await User.findById(req.user.id).session(session);
+        if (!userDoc) throw new Error('User not found inside repayment transaction');
+
+        if (!userDoc.balances) {
+            userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+        }
+        if (!userDoc.balances.main) userDoc.balances.main = new Map();
+
+        const preUSD = Number(userDoc.balances.main.get('usd') || 0);
+        const postUSD = Number((preUSD - loan.repaymentAmount).toFixed(2));
+        if (postUSD < 0) throw new Error('Insufficient balance for repayment');
+
+        userDoc.balances.main.set('usd', postUSD);
+        userDoc.markModified('balances.main');
+
+        await userDoc.save({ session });
+
+        await writeLedgerEntry({
+            user: req.user.id,
+            wallet: 'main',
+            asset: 'usd',
+            direction: 'debit',
+            amount: loan.repaymentAmount,
+            usdValueAtTime: loan.repaymentAmount,
+            assetPriceAtTime: 1,
+            source: 'financing_repayment',
+            reference: `financing_repayment:${loan._id}`,
+            relatedEntity: loan._id,
+            relatedModel: 'Loan',
+            balanceAfter: postUSD,
+            metadata: {
+                financingId: loan._id.toString(),
+                reason: 'Financing repayment from main wallet'
+            },
+            session
+        });
+
+        await session.commitTransaction();
+
+        console.log(`✅ Financing repayment ledger written for financing ${loan._id}`);
+    } catch (txErr) {
+        await session.abortTransaction();
+        console.error('❌ Financing repayment transaction failed:', txErr);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to record financing repayment'
+        });
+    } finally {
+        session.endSession();
+    }
 
     loan.status = 'repaid';
     loan.endDate = new Date();
@@ -27658,9 +27854,97 @@ app.post('/api/loans/apply', protect, async (req, res) => {
             approvedAt: new Date()
         });
 
-        user.balances.main += netLoanAmount;
-        user.balances.loan += amount; // Track total loan amount
-        await user.save();
+              /* ============================================================================
+         * Financing drawdown — atomic credit + ledger write.
+         *
+         * Money path:
+         *   main wallet → credit  netLoanAmount (USD)
+         *
+         * The funding fee is recorded separately for reporting.
+         * ========================================================================== */
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        try {
+            const userDoc = await User.findById(userId).session(session);
+            if (!userDoc) throw new Error('User not found inside financing transaction');
+
+            if (!userDoc.balances) {
+                userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!userDoc.balances.main) userDoc.balances.main = new Map();
+
+            const preUSD = Number(userDoc.balances.main.get('usd') || 0);
+            const postUSD = Number((preUSD + netLoanAmount).toFixed(2));
+
+            userDoc.balances.main.set('usd', postUSD);
+            userDoc.markModified('balances.main');
+
+            await userDoc.save({ session });
+
+            const drawdownRef = `financing_drawdown:${loan._id}`;
+
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: 'usd',
+                direction: 'credit',
+                amount: netLoanAmount,
+                usdValueAtTime: netLoanAmount,
+                assetPriceAtTime: 1,
+                source: 'financing_drawdown',
+                reference: drawdownRef,
+                relatedEntity: loan._id,
+                relatedModel: 'Loan',
+                balanceAfter: postUSD,
+                metadata: {
+                    financingId: loan._id.toString(),
+                    grossAmount: amount,
+                    disbursementFee: calculatedDisbursementFee,
+                    purpose,
+                    term,
+                    interestRate,
+                    reason: 'Financing drawdown credited to main wallet'
+                },
+                session
+            });
+
+            // Funding fee visibility entry
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: 'usd',
+                direction: 'debit',
+                amount: calculatedDisbursementFee,
+                usdValueAtTime: calculatedDisbursementFee,
+                assetPriceAtTime: 1,
+                source: 'financing_drawdown',
+                reference: `${drawdownRef}:fee`,
+                relatedEntity: loan._id,
+                relatedModel: 'Loan',
+                balanceAfter: postUSD,
+                metadata: {
+                    financingId: loan._id.toString(),
+                    reason: 'Funding fee (already netted at drawdown)',
+                    adminOnly: false
+                },
+                session
+            });
+
+            await session.commitTransaction();
+
+            console.log(`✅ Financing drawdown ledger written for financing ${loan._id}`);
+
+        } catch (txErr) {
+            await session.abortTransaction();
+            console.error('❌ Financing drawdown transaction failed:', txErr);
+            return res.status(500).json({
+                status: 'error',
+                message: 'Failed to record financing drawdown'
+            });
+        } finally {
+            session.endSession();
+        }
 
         const transaction = await Transaction.create({
             user: userId,
@@ -31572,35 +31856,85 @@ app.post('/api/admin/withdrawals/:id/approve', adminProtect, restrictTo('super',
 
     const fundsAlreadyDeducted = withdrawal.details?.fundsAlreadyDeducted === true;
 
-    if (!fundsAlreadyDeducted) {
-      if (!user.balances || !user.balances.main) {
-        return res.status(400).json({
-          status: 'fail',
-          message: 'User has no balance to withdraw from'
-        });
-      }
+      if (!fundsAlreadyDeducted) {
+        /* ====================================================================
+         * Admin-approval deduction path. Used only for withdrawals that were
+         * submitted without pre-deduction (legacy or admin-created).
+         *
+         * Money path:
+         *   main wallet → debit  cryptoAmount (asset)
+         * ================================================================== */
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-      const currentBalance = user.balances.main.get(asset) || 0;
-      if (currentBalance < cryptoAmount) {
-        return res.status(400).json({
-          status: 'fail',
-          message: `Insufficient ${asset.toUpperCase()} balance. Available: ${currentBalance}, Requested: ${cryptoAmount}`
-        });
-      }
+        try {
+            const userDoc = await User.findById(withdrawal.user._id).session(session);
+            if (!userDoc) throw new Error('User not found inside approval transaction');
 
-      const newBalance = currentBalance - cryptoAmount;
-      if (newBalance <= 0) {
-        user.balances.main.delete(asset);
-      } else {
-        user.balances.main.set(asset, newBalance);
-      }
+            if (!userDoc.balances) {
+                userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!userDoc.balances.main) userDoc.balances.main = new Map();
 
-      const currentUsdBalance = user.balances.main.get('usd') || 0;
-      user.balances.main.set('usd', currentUsdBalance - usdAmount);
+            const preCrypto = Number(userDoc.balances.main.get(asset) || 0);
+            if (preCrypto < cryptoAmount) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.status(400).json({
+                    status: 'fail',
+                    message: `Insufficient ${asset.toUpperCase()} balance. Available: ${preCrypto}, Requested: ${cryptoAmount}`
+                });
+            }
 
-      await user.save();
+            const postCrypto = Number((preCrypto - cryptoAmount).toFixed(18));
+            if (postCrypto <= 0) userDoc.balances.main.delete(asset);
+            else userDoc.balances.main.set(asset, postCrypto);
+
+            const preUSD = Number(userDoc.balances.main.get('usd') || 0);
+            const postUSD = Number((preUSD - usdAmount).toFixed(2));
+            userDoc.balances.main.set('usd', postUSD);
+            userDoc.markModified('balances.main');
+
+            await userDoc.save({ session });
+
+            await writeLedgerEntry({
+                user: withdrawal.user._id,
+                wallet: 'main',
+                asset: asset,
+                direction: 'debit',
+                amount: cryptoAmount,
+                usdValueAtTime: usdAmount,
+                assetPriceAtTime: withdrawal.exchangeRateAtTime || 0,
+                source: 'withdrawal',
+                reference: `withdrawal:${withdrawal._id}`,
+                relatedEntity: withdrawal._id,
+                relatedModel: 'Transaction',
+                balanceAfter: postCrypto,
+                metadata: {
+                    withdrawalId: withdrawal._id.toString(),
+                    destination: walletAddress,
+                    network,
+                    reason: 'Admin-approved withdrawal (not pre-deducted)'
+                },
+                session
+            });
+
+            await session.commitTransaction();
+
+            console.log(`✅ Withdrawal approval ledger written for ${withdrawal.reference}`);
+
+        } catch (txErr) {
+            await session.abortTransaction();
+            console.error('❌ Withdrawal approval transaction failed:', txErr);
+            return res.status(500).json({
+                status: 'error',
+                message: 'Failed to record withdrawal approval'
+            });
+        } finally {
+            session.endSession();
+        }
     } else {
-      console.log(`✅ Withdrawal ${withdrawal.reference}: Funds already deducted at request time. Skipping balance deduction.`);
+        console.log(`✅ Withdrawal ${withdrawal.reference}: Funds already deducted at request time. Ledger entry already written. Skipping.`);
     }
 
     withdrawal.status = 'completed';
@@ -32003,6 +32337,67 @@ app.post('/api/admin/withdrawals/:id/reject', adminProtect, restrictTo('super', 
         }
       }
 
+
+      /* ========================================================================
+       * Withdrawal rejection — refund ledger writes.
+       *
+       * Money path:
+       *   main wallet    → credit  refundToMain
+       *   matured wallet → credit  refundToMatured
+       *
+       * The original debit was already written at request time (4.5) or at
+       * approval time (4.6). This refunds the non-gas-fee portion. The gas
+       * fee is not refunded and is separately recognised as platform revenue.
+       * ====================================================================== */
+      const rejRef = `withdrawal_reject:${withdrawal._id}`;
+
+      if (refundToMain > 0) {
+          await writeLedgerEntry({
+              user: user._id,
+              wallet: 'main',
+              asset: asset,
+              direction: 'credit',
+              amount: refundToMain,
+              usdValueAtTime: refundToMain * exchangeRate,
+              assetPriceAtTime: exchangeRate || 1,
+              source: 'withdrawal',
+              reference: `${rejRef}:main`,
+              relatedEntity: withdrawal._id,
+              relatedModel: 'Transaction',
+              balanceAfter: Number(user.balances.main.get(asset) || 0),
+              metadata: {
+                  withdrawalId: withdrawal._id.toString(),
+                  rejectionReason: reason,
+                  reason: 'Refund of withdrawal request to main wallet'
+              },
+              session: null
+          });
+      }
+
+      if (refundToMatured > 0) {
+          await writeLedgerEntry({
+              user: user._id,
+              wallet: 'matured',
+              asset: asset,
+              direction: 'credit',
+              amount: refundToMatured,
+              usdValueAtTime: refundToMatured * exchangeRate,
+              assetPriceAtTime: exchangeRate || 1,
+              source: 'withdrawal',
+              reference: `${rejRef}:matured`,
+              relatedEntity: withdrawal._id,
+              relatedModel: 'Transaction',
+              balanceAfter: Number(user.balances.matured.get(asset) || 0),
+              metadata: {
+                  withdrawalId: withdrawal._id.toString(),
+                  rejectionReason: reason,
+                  reason: 'Refund of withdrawal request to matured wallet'
+              },
+              session: null
+          });
+      }
+
+      console.log(`✅ Withdrawal rejection refund ledger written for ${withdrawal.reference}`);
       await user.save();
       console.log(`   ✅ User balances saved successfully`);
 
@@ -46692,8 +47087,79 @@ app.post('/api/withdrawals/spot', protect, async (req, res) => {
       }
     }
     
-    await user.save();
+	
+	    /* ============================================================================
+     * User-initiated withdrawal — ledger writes.
+     *
+     * Money path:
+     *   main wallet    → debit  (withdrawalFromMain + gasFeeInTargetAsset)
+     *   matured wallet → debit  withdrawalFromMatured
+     *
+     * One entry per wallet touched. The transaction record that will be
+     * created below carries fundsAlreadyDeducted: true, which tells the
+     * admin approval route NOT to deduct again.
+     * ========================================================================== */
+    {
+        const wdRefMain = `withdrawal:${reference}:main`;
+        const wdRefMatured = `withdrawal:${reference}:matured`;
 
+        if (totalMainDeduction > 0) {
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: assetLower,
+                direction: 'debit',
+                amount: totalMainDeduction,
+                usdValueAtTime: (totalMainDeduction * targetPrice),
+                assetPriceAtTime: targetPrice,
+                source: 'withdrawal',
+                reference: wdRefMain,
+                relatedEntity: null,       // Transaction not created yet at this point
+                relatedModel: null,
+                balanceAfter: Number(user.balances.main.get(assetLower) || 0),
+                metadata: {
+                    requestId,
+                    withdrawalReference: reference,
+                    destination: walletAddress,
+                    network: detectedNetwork,
+                    includesGasFee: gasFeeInTargetAsset,
+                    reason: 'User-initiated withdrawal (pre-deducted at request time)'
+                },
+                session: null
+            });
+        }
+
+        if (totalMaturedDeduction > 0) {
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'matured',
+                asset: assetLower,
+                direction: 'debit',
+                amount: totalMaturedDeduction,
+                usdValueAtTime: (totalMaturedDeduction * targetPrice),
+                assetPriceAtTime: targetPrice,
+                source: 'withdrawal',
+                reference: wdRefMatured,
+                relatedEntity: null,
+                relatedModel: null,
+                balanceAfter: Number(user.balances.matured.get(assetLower) || 0),
+                metadata: {
+                    requestId,
+                    withdrawalReference: reference,
+                    destination: walletAddress,
+                    network: detectedNetwork,
+                    reason: 'User-initiated withdrawal (pre-deducted at request time)'
+                },
+                session: null
+            });
+        }
+
+        console.log(`✅ Withdrawal ledger entries written for reference ${reference}`);
+    }
+
+    await user.save();
+	
+  
     
     const reference = `WTH-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     
