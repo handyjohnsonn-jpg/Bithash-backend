@@ -8612,8 +8612,7 @@ if (STATEMENT_SCHEDULE.monthly.enabled) {
     console.log('📅 Monthly statement cron scheduled: last day of each month at 23:55 UTC');
 }
 
-/* Kick off the worker so it is consuming before the first cron fires. */
-startStatementWorker();
+
 
 
 
@@ -43320,7 +43319,7 @@ function startStatementWorker() {
 }
 
 
-
+startStatementWorker();
 
 
 
