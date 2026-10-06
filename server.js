@@ -8484,6 +8484,44 @@ const recalculateAllUserBalances = async (io) => {
 
 
 
+/* ============================================================================
+ * STATEMENT SCHEDULE CONFIGURATION
+ * ========================================================================== */
+const STATEMENT_SCHEDULE = {
+    // Enable or disable statement types globally.
+    weekly: {
+        enabled: true,
+        // Sunday at 23:59 UTC
+        cronExpr: '59 23 * * 0',
+        periodLabel: (d) => {
+            const end = new Date(d);
+            const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+            return { start, end, label: `Week ending ${end.toISOString().slice(0, 10)}` };
+        },
+        queuePrefix: 'weekly'
+    },
+    monthly: {
+        enabled: true,
+        // Last day of the month at 23:55 UTC
+        cronExpr: '55 23 28-31 * *',
+        periodLabel: (d) => {
+            const end = new Date(d);
+            const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1, 0, 0, 0, 0));
+            return { start, end, label: `${start.toISOString().slice(0, 7)}` };
+        },
+        queuePrefix: 'monthly'
+    }
+};
+
+// Retention: keep up to 12 months of statements in the queue.
+// BullMQ removeOnComplete already trims the job object; the actual
+// FinancialStatement documents are retained indefinitely.
+const STATEMENT_RETENTION_MONTHS = 12;
+
+
+
+
+
 
 
 /* ============================================================================
@@ -42597,39 +42635,7 @@ function getFiatFlagForEmail(currencyCode) {
 console.log('✅ Email logo helpers registered');
 
 
-/* ============================================================================
- * STATEMENT SCHEDULE CONFIGURATION
- * ========================================================================== */
-const STATEMENT_SCHEDULE = {
-    // Enable or disable statement types globally.
-    weekly: {
-        enabled: true,
-        // Sunday at 23:59 UTC
-        cronExpr: '59 23 * * 0',
-        periodLabel: (d) => {
-            const end = new Date(d);
-            const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
-            return { start, end, label: `Week ending ${end.toISOString().slice(0, 10)}` };
-        },
-        queuePrefix: 'weekly'
-    },
-    monthly: {
-        enabled: true,
-        // Last day of the month at 23:55 UTC
-        cronExpr: '55 23 28-31 * *',
-        periodLabel: (d) => {
-            const end = new Date(d);
-            const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1, 0, 0, 0, 0));
-            return { start, end, label: `${start.toISOString().slice(0, 7)}` };
-        },
-        queuePrefix: 'monthly'
-    }
-};
 
-// Retention: keep up to 12 months of statements in the queue.
-// BullMQ removeOnComplete already trims the job object; the actual
-// FinancialStatement documents are retained indefinitely.
-const STATEMENT_RETENTION_MONTHS = 12;
 
 
 
