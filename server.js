@@ -59394,12 +59394,9 @@ startRealTimeBalanceBroadcaster();
 startRealTimePriceBroadcaster();
 
 startPnLCronJob(io);
-
-const gracefulShutdown = () => {
+const gracefulShutdown = async () => {
   console.log('Received shutdown signal. Cleaning up...');
-  
-  
-  
+
   try {
       if (statementWorker) await statementWorker.close();
       if (statementQueueEvents) await statementQueueEvents.close();
@@ -59411,17 +59408,17 @@ const gracefulShutdown = () => {
   } catch (e) {
       console.error('Error closing BullMQ:', e.message);
   }
-  
+
   if (priceBroadcastInterval) clearInterval(priceBroadcastInterval);
   if (balanceBroadcastInterval) clearInterval(balanceBroadcastInterval);
   stopInvestorGrowthJob();
   stopDepositWatcher();
-  
+
   io.close(() => {
     console.log('Socket.IO server closed');
     process.exit(0);
   });
-  
+
   setTimeout(() => {
     console.error('Forced shutdown after timeout');
     process.exit(1);
