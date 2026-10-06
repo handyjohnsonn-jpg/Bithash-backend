@@ -30,6 +30,7 @@ const sharp = require('sharp');
 const validator = require('validator');
 const { body, validationResult } = require('express-validator');
 const axios = require('axios');
+const Decimal = require('decimal.js');
 const speakeasy = require('speakeasy');
 const { v4: uuidv4 } = require('uuid');
 const WebSocket = require('ws');
@@ -4304,6 +4305,225 @@ const Investment = mongoose.model('Investment', InvestmentSchema);
 
 
 
+const WalletLedgerEntrySchema = new mongoose.Schema(
+    {
+        user: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+            required: true,
+            index: true
+        },
+
+        wallet: {
+            type: String,
+            enum: ['main', 'active', 'matured', 'savings'],
+            required: true
+        },
+
+        // 'btc' | 'eth' | 'usdt' | 'usd' | ...  (always lowercased)
+        asset: {
+            type: String,
+            required: true,
+            lowercase: true
+        },
+
+        direction: {
+            type: String,
+            enum: ['credit', 'debit'],
+            required: true
+        },
+
+        // Asset quantity moved (e.g. 0.00012345 BTC or 250.00 USD)
+        amount: {
+            type: mongoose.Schema.Types.Decimal128,
+            required: true
+        },
+
+        // USD value of the movement, frozen at the moment it happened
+        usdValueAtTime: {
+            type: mongoose.Schema.Types.Decimal128,
+            required: true
+        },
+
+        // The asset's USD price at the moment of the movement (1 for USD/stablecoins)
+        assetPriceAtTime: {
+            type: mongoose.Schema.Types.Decimal128,
+            required: true
+        },
+
+        /*
+         * source — canonical vocabulary for every money path in the system.
+         *
+         * On-chain (ADMIN-ONLY, must never be surfaced to the end user):
+         *   onchain_deposit
+         *   onchain_sweep
+         *
+         * Mining contract lifecycle:
+         *   rental_debit
+         *   cycle_fee
+         *   power_cost
+         *   cycle_return
+         *   mining_payout
+         *   contract_cancellation_refund
+         *
+         * Referrals / promotions:
+         *   referral_commission
+         *   promotion_credit
+         *
+         * Financing:
+         *   financing_drawdown
+         *   financing_repayment
+         *
+         * Trading:
+         *   trading_buy
+         *   trading_sell
+         *   conversion
+         *
+         * Wallet operations:
+         *   withdrawal
+         *   internal_transfer
+         *   admin_adjustment
+         *
+         * Backfill only:
+         *   legacy_opening_balance
+         */
+        source: {
+            type: String,
+            required: true,
+            enum: [
+                'onchain_deposit',
+                'onchain_sweep',
+                'rental_debit',
+                'cycle_fee',
+                'power_cost',
+                'cycle_return',
+                'mining_payout',
+                'contract_cancellation_refund',
+                'referral_commission',
+                'promotion_credit',
+                'financing_drawdown',
+                'financing_repayment',
+                'trading_buy',
+                'trading_sell',
+                'conversion',
+                'withdrawal',
+                'internal_transfer',
+                'admin_adjustment',
+                'legacy_opening_balance'
+            ]
+        },
+
+        /*
+         * reference — deterministic idempotency key.
+         *
+         * NOT unique by itself, because a single logical event (one txHash,
+         * one contract cycle) may produce multiple ledger entries across
+         * different wallets, assets, or directions. Uniqueness is enforced
+         * by the compound index below.
+         */
+        reference: {
+            type: String,
+            required: true
+        },
+
+        relatedEntity: {
+            type: mongoose.Schema.Types.ObjectId,
+            default: null
+        },
+
+        relatedModel: {
+            type: String,
+            enum: [
+                'Transaction',
+                'DepositAsset',
+                'Investment',
+                'Buy',
+                'Sell',
+                'Loan',
+                'Promo',
+                'RedeemedPromo',
+                'CommissionHistory',
+                'ManualAdjustment',
+                'WalletSweep',
+                'System',
+                null
+            ],
+            default: null
+        },
+
+        // Post-move balance of the affected (wallet, asset) — the canonical
+        // answer to "what was this wallet holding after this entry?"
+        balanceAfter: {
+            type: mongoose.Schema.Types.Decimal128,
+            required: true
+        },
+
+        metadata: {
+            type: mongoose.Schema.Types.Mixed,
+            default: {}
+        }
+    },
+    {
+        timestamps: true,
+        strict: 'throw',
+        // Never update. Immutability is enforced at the schema level.
+        versionKey: false
+    }
+);
+
+/* ----------------------------------------------------------------------------
+ * Idempotency: same (user, source, reference, wallet, asset, direction) can
+ * only ever be written once. Retries of the same logical event hit a duplicate
+ * key error, which callers treat as "already recorded" and move on.
+ * -------------------------------------------------------------------------- */
+WalletLedgerEntrySchema.index(
+    { user: 1, source: 1, reference: 1, wallet: 1, asset: 1, direction: 1 },
+    { unique: true }
+);
+
+/* ----------------------------------------------------------------------------
+ * Query indexes for statement generation.
+ * -------------------------------------------------------------------------- */
+WalletLedgerEntrySchema.index({ user: 1, createdAt: -1 });
+WalletLedgerEntrySchema.index({ user: 1, wallet: 1, asset: 1, createdAt: -1 });
+WalletLedgerEntrySchema.index({ user: 1, source: 1, createdAt: -1 });
+
+/* ----------------------------------------------------------------------------
+ * Hard immutability guards — Mongoose will throw on any update/delete path.
+ * -------------------------------------------------------------------------- */
+WalletLedgerEntrySchema.pre('updateOne', function () {
+    throw new Error('WalletLedgerEntry is append-only. Updates are forbidden.');
+});
+WalletLedgerEntrySchema.pre('updateMany', function () {
+    throw new Error('WalletLedgerEntry is append-only. Updates are forbidden.');
+});
+WalletLedgerEntrySchema.pre('findOneAndUpdate', function () {
+    throw new Error('WalletLedgerEntry is append-only. Updates are forbidden.');
+});
+WalletLedgerEntrySchema.pre('findOneAndDelete', function () {
+    throw new Error('WalletLedgerEntry is append-only. Deletes are forbidden.');
+});
+WalletLedgerEntrySchema.pre('deleteOne', function () {
+    throw new Error('WalletLedgerEntry is append-only. Deletes are forbidden.');
+});
+WalletLedgerEntrySchema.pre('deleteMany', function () {
+    throw new Error('WalletLedgerEntry is append-only. Deletes are forbidden.');
+});
+
+const WalletLedgerEntry = mongoose.model('WalletLedgerEntry', WalletLedgerEntrySchema);
+
+console.log('✅ WalletLedgerEntry model registered');
+
+
+
+
+
+
+
+
+
+
+
 
 
 const CardPaymentSchema = new mongoose.Schema({
@@ -5237,7 +5457,7 @@ const SystemLogSchema = new mongoose.Schema({
     type: String, 
     required: [true, 'Entity is required'],
     enum: [
-      'user', 'admin', 'transaction','FinancialStatement', 'investment',  'Investment', 'kyc',  'Treasury','plan', 'loan',
+      'user', 'admin', 'transaction','FinancialStatement', 'investment',  'WalletLedgerEntry','Investment', 'kyc',  'Treasury','plan', 'loan',
       'withdrawal', 'deposit', 'referral', 'notification', 'system', 'security',
       'authentication', 'api', 'settings', 'support', 'Promo',   'audit', 'maintenance',
       'card_payment', 'deposit_asset', 'buy', 'sell', 'conversion', 'transfer',
@@ -7621,6 +7841,62 @@ const protect = async (req, res, next) => {
     });
   }
 };
+
+
+
+
+
+
+
+
+async function writeLedgerEntry({
+    user,
+    wallet,
+    asset,
+    direction,
+    amount,
+    usdValueAtTime,
+    assetPriceAtTime,
+    source,
+    reference,
+    relatedEntity = null,
+    relatedModel = null,
+    balanceAfter,
+    metadata = {},
+    session = null
+}) {
+    const payload = {
+        user,
+        wallet,
+        asset: String(asset).toLowerCase(),
+        direction,
+        amount: mongoose.Types.Decimal128.fromString(String(amount)),
+        usdValueAtTime: mongoose.Types.Decimal128.fromString(String(usdValueAtTime)),
+        assetPriceAtTime: mongoose.Types.Decimal128.fromString(String(assetPriceAtTime)),
+        source,
+        reference,
+        relatedEntity,
+        relatedModel,
+        balanceAfter: mongoose.Types.Decimal128.fromString(String(balanceAfter)),
+        metadata
+    };
+
+    const opts = session ? { session } : {};
+
+    try {
+        const [doc] = await WalletLedgerEntry.create([payload], opts);
+        return { ok: true, entry: doc };
+    } catch (err) {
+        // Duplicate key — this exact movement was already recorded.
+        if (err && err.code === 11000) {
+            return { ok: true, duplicate: true };
+        }
+        throw err;
+    }
+}
+
+
+
 
 
 
@@ -42552,54 +42828,112 @@ async function resolveAddressOwnership(assetUpper, address) {
 
 
 
-
-/**
- * Credit the user's main wallet with the on-chain crypto amount.
- * USD is stored for display only and never treated as a spendable balance.
- */
 async function creditUserMainWallet({ user, assetUpper, cryptoAmount, usdValue, depositSettings, txHash, networkName }) {
     const assetLower = assetUpper.toLowerCase();
     const price = await fetchAssetUsdPrice(assetUpper);
     const usdForDisplay = price > 0 ? Number((cryptoAmount * price).toFixed(2)) : usdValue;
 
-    if (!user.balances) user.balances = { main: new Map(), active: new Map(), matured: new Map() };
-    if (!user.balances.main) user.balances.main = new Map();
-    if (!user.balances.active) user.balances.active = new Map();
-    if (!user.balances.matured) user.balances.matured = new Map();
+    /* ------------------------------------------------------------------------
+     * Atomic credit + ledger write.
+     *
+     * Atlas Cluster0 is a 3-node replica set, so real transactions are
+     * available. The ledger write and the balance mutation must succeed or
+     * fail together.
+     * ---------------------------------------------------------------------- */
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    const currentCrypto = Number(user.balances.main.get(assetLower) || 0);
-    const newCrypto = Number((currentCrypto + cryptoAmount).toFixed(18));
-    user.balances.main.set(assetLower, newCrypto);
-
-    // 'usd' entry on main is a display cache only. We refresh it to the live
-    // valuation of the crypto actually held, not a naive additive counter.
-    // This prevents double-counting when prices move.
-    let totalMainUsd = 0;
-    for (const [asset, bal] of user.balances.main.entries()) {
-        if (asset === 'usd') continue;
-        if (!bal || bal <= 0) continue;
-        if (asset === assetLower) {
-            totalMainUsd += newCrypto * (price > 0 ? price : (usdForDisplay / Math.max(cryptoAmount, 1e-18)));
-        } else {
-            const p = await fetchAssetUsdPrice(asset.toUpperCase());
-            if (p > 0) totalMainUsd += Number(bal) * p;
+    try {
+        /* ---- Re-read inside the transaction to avoid races ---- */
+        const userDoc = await User.findById(user._id).session(session);
+        if (!userDoc) {
+            throw new Error(`User ${user._id} not found inside credit transaction`);
         }
+
+        if (!userDoc.balances) {
+            userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+        }
+        if (!userDoc.balances.main) userDoc.balances.main = new Map();
+        if (!userDoc.balances.active) userDoc.balances.active = new Map();
+        if (!userDoc.balances.matured) userDoc.balances.matured = new Map();
+
+        /* ---- Snapshot pre-state ---- */
+        const preCrypto = Number(userDoc.balances.main.get(assetLower) || 0);
+        const postCrypto = Number((preCrypto + cryptoAmount).toFixed(18));
+
+        /* ---- Compute the fresh main-wallet USD display value ----
+         * 'usd' on main is a display cache only. Recompute from the live
+         * crypto holdings, never accumulate blindly.
+         */
+        let totalMainUsd = 0;
+        for (const [asset, bal] of userDoc.balances.main.entries()) {
+            if (asset === 'usd') continue;
+            if (!bal || bal <= 0) continue;
+            if (asset === assetLower) {
+                totalMainUsd += postCrypto * (price > 0 ? price : (usdForDisplay / Math.max(cryptoAmount, 1e-18)));
+            } else {
+                const p = await fetchAssetUsdPrice(asset.toUpperCase());
+                if (p > 0) totalMainUsd += Number(bal) * p;
+            }
+        }
+        totalMainUsd = Number(totalMainUsd.toFixed(2));
+
+        /* ---- Apply to the in-memory document ---- */
+        userDoc.balances.main.set(assetLower, postCrypto);
+        userDoc.balances.main.set('usd', totalMainUsd);
+        userDoc.markModified('balances.main');
+
+        await userDoc.save({ session });
+
+        /* ---- Ledger write inside the same session ---- */
+        await writeLedgerEntry({
+            user: userDoc._id,
+            wallet: 'main',
+            asset: assetLower,
+            direction: 'credit',
+            amount: cryptoAmount,
+            usdValueAtTime: usdForDisplay,
+            assetPriceAtTime: price > 0 ? price : (usdForDisplay / Math.max(cryptoAmount, 1e-18)),
+            source: 'onchain_deposit',
+            reference: `onchain_deposit:${txHash}`,
+            relatedEntity: null,
+            relatedModel: null,
+            balanceAfter: postCrypto,
+            metadata: {
+                txHash,
+                network: networkName,
+                assetUpper,
+                adminOnly: true
+            },
+            session
+        });
+
+        await session.commitTransaction();
+
+     
+        user.balances = userDoc.balances;
+
+        console.log(`✅ Ledger entry written for on-chain deposit ${txHash} (${cryptoAmount} ${assetUpper} → main)`);
+
+        return {
+            newCrypto: postCrypto,
+            usdForDisplay,
+            totalMainUsd
+        };
+    } catch (err) {
+        await session.abortTransaction();
+        console.error(
+            `❌ creditUserMainWallet transaction failed for tx ${txHash}:`,
+            err.message
+        );
+        throw err;
+    } finally {
+        session.endSession();
     }
-    user.balances.main.set('usd', Number(totalMainUsd.toFixed(2)));
-
-    await user.save();
-
-    return {
-        newCrypto,
-        usdForDisplay,
-        totalMainUsd: Number(totalMainUsd.toFixed(2))
-    };
 }
 
-/**
- * Immediately sweep the credited balance from the user's deposit address
- * to the correct treasury wallet. Uses the existing treasury derivation.
- */
+
+
 async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, networkName }) {
     const entry = ASSET_NETWORK_MAP[assetUpper];
     if (!entry) {
