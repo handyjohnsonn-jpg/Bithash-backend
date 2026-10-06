@@ -21589,6 +21589,95 @@ const completeMaturedInvestmentsCron = async () => {
           }
 
           await user.save({ session });
+		  
+		  
+		            /* ============================================================
+           * LEDGER: final-cycle payout
+           *
+           * Money path:
+           *   active wallet  →  debit  returnedPrincipalBTC (release)
+           *   matured wallet →  credit finalPayoutBTC        (principal + profit)
+           *
+           * Two visibility entries on the active wallet record the
+           * final cycle's gross return and its power cost. Both are netted
+           * into the payout already, so they are reporting-only.
+           * ============================================================ */
+          const finalRef = `contract_complete:${investment._id}`;
+
+          // (a) Release the active principal
+          await writeLedgerEntry({
+            user: userId,
+            wallet: 'active',
+            asset: 'btc',
+            direction: 'debit',
+            amount: returnedPrincipalBTC,
+            usdValueAtTime: returnedPrincipalUSD,
+            assetPriceAtTime: currentBTCPrice,
+            source: 'cycle_return',
+            reference: `${finalRef}:release`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: Math.max(0, newActiveBTC),
+            metadata: {
+              contractId: investment._id.toString(),
+              cycle: investment.currentCycle,
+              month: investment.currentMonth,
+              reason: 'Release of active principal on final payout'
+            },
+            session
+          });
+
+          // (b) Final payout to matured wallet
+          await writeLedgerEntry({
+            user: userId,
+            wallet: 'matured',
+            asset: 'btc',
+            direction: 'credit',
+            amount: finalPayoutBTC,
+            usdValueAtTime: finalPayoutUSD,
+            assetPriceAtTime: currentBTCPrice,
+            source: 'mining_payout',
+            reference: finalRef,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: currentMaturedBTC + finalPayoutBTC,
+            metadata: {
+              contractId: investment._id.toString(),
+              cycle: investment.currentCycle,
+              month: investment.currentMonth,
+              returnedPrincipalBTC,
+              finalProfitBTC,
+              reason: 'Final cycle payout: capital deployed + net mining returns'
+            },
+            session
+          });
+
+          // (c) Final-cycle power cost visibility
+          await writeLedgerEntry({
+            user: userId,
+            wallet: 'active',
+            asset: 'btc',
+            direction: 'debit',
+            amount: cyclePowerCostBTC,
+            usdValueAtTime: cyclePowerCostUSD,
+            assetPriceAtTime: currentBTCPrice,
+            source: 'power_cost',
+            reference: `${finalRef}:power`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: Math.max(0, newActiveBTC),
+            metadata: {
+              contractId: investment._id.toString(),
+              cycle: investment.currentCycle,
+              month: investment.currentMonth,
+              hardwareModel: frozenHardwareModel,
+              joulesPerTH: frozenJPerTH,
+              reason: 'Final cycle electricity cost (already netted into payout)'
+            },
+            session
+          });
+
+          console.log(`✅ Final-cycle ledger entries written for contract ${investment._id}`);
 
           const finalTxRef = `FINAL-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
           await Transaction.create([{
@@ -21932,6 +22021,65 @@ const completeMaturedInvestmentsCron = async () => {
           }
 
           await user.save({ session });
+		  
+		  
+		            /* ============================================================
+           * LEDGER: non-final month net-return sweep
+           *
+           * Money path:
+           *   active wallet  →  debit  monthProfitBTC (release)
+           *   matured wallet →  credit monthProfitBTC (payout)
+           *
+           * The capital deployed stays in the active wallet. Only the
+           * month's net mining returns are swept out.
+           * ============================================================ */
+          const monthRef = `month_sweep:${investment._id}:${investment.currentMonth}`;
+
+          const postActiveAfterSweep = Number(user.balances.active.get('btc') || 0);
+
+          await writeLedgerEntry({
+            user: userId,
+            wallet: 'matured',
+            asset: 'btc',
+            direction: 'credit',
+            amount: monthProfitBTC,
+            usdValueAtTime: monthProfitUSD,
+            assetPriceAtTime: currentBTCPrice,
+            source: 'mining_payout',
+            reference: monthRef,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: currentMaturedBTC + monthProfitBTC,
+            metadata: {
+              contractId: investment._id.toString(),
+              month: investment.currentMonth,
+              reason: `Month ${investment.currentMonth} net mining returns swept to matured wallet`
+            },
+            session
+          });
+
+          await writeLedgerEntry({
+            user: userId,
+            wallet: 'active',
+            asset: 'btc',
+            direction: 'debit',
+            amount: monthProfitBTC,
+            usdValueAtTime: monthProfitUSD,
+            assetPriceAtTime: currentBTCPrice,
+            source: 'cycle_return',
+            reference: `${monthRef}:release`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postActiveAfterSweep,
+            metadata: {
+              contractId: investment._id.toString(),
+              month: investment.currentMonth,
+              reason: 'Release of month profit from active pool'
+            },
+            session
+          });
+
+          console.log(`✅ Month-sweep ledger entries written for contract ${investment._id} (month ${investment.currentMonth})`);
 
           const sweepRef = `MONTH-PROFIT-SWEEP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
           await Transaction.create([{
@@ -38473,41 +38621,118 @@ app.post('/api/admin/investments/:id/cancel', adminProtect, restrictTo('super', 
     console.log(`   - BTC Amount: ${refundAmountBTC.toFixed(8)} BTC`);
     console.log(`   - BTC Price Used: $${realBTCPrice.toLocaleString()}`);
 
-    if (!user.balances) {
-      user.balances = { main: new Map(), active: new Map(), matured: new Map() };
+       /* ============================================================================
+     * Atomic cancellation refund + ledger writes.
+     *
+     * Money path:
+     *   active wallet  →  debit  originalBTCAmount (release principal)
+     *   matured wallet →  credit refundAmountBTC   (return to user)
+     * ========================================================================== */
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const userDoc = await User.findById(user._id).session(session);
+        if (!userDoc) {
+            throw new Error('User not found inside cancellation transaction');
+        }
+
+        if (!userDoc.balances) {
+            userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+        }
+        if (!userDoc.balances.matured) userDoc.balances.matured = new Map();
+        if (!userDoc.balances.active) userDoc.balances.active = new Map();
+
+        /* ---- Snapshot ---- */
+        const preMaturedBTC = Number(userDoc.balances.matured.get('btc') || 0);
+        const preActiveBTC  = Number(userDoc.balances.active.get('btc') || 0);
+
+        /* ---- Compute post-state ---- */
+        const postMaturedBTC = Number((preMaturedBTC + refundAmountBTC).toFixed(18));
+        const postMaturedUSD = Number((postMaturedBTC * realBTCPrice).toFixed(2));
+
+        let postActiveBTC = Number((preActiveBTC - originalBTCAmount).toFixed(18));
+        if (postActiveBTC <= 0.00000001) postActiveBTC = 0;
+        const postActiveUSD = Number((postActiveBTC * realBTCPrice).toFixed(2));
+
+        /* ---- Apply ---- */
+        userDoc.balances.matured.set('btc', postMaturedBTC);
+        userDoc.balances.matured.set('usd', postMaturedUSD);
+
+        if (postActiveBTC === 0) {
+            userDoc.balances.active.delete('btc');
+            userDoc.balances.active.delete('usd');
+        } else {
+            userDoc.balances.active.set('btc', postActiveBTC);
+            userDoc.balances.active.set('usd', postActiveUSD);
+        }
+        userDoc.markModified('balances');
+
+        await userDoc.save({ session });
+
+        /* ---- Ledger entries ---- */
+        const cancelRef = `contract_cancel:${investment._id}`;
+
+        await writeLedgerEntry({
+            user: user._id,
+            wallet: 'active',
+            asset: 'btc',
+            direction: 'debit',
+            amount: originalBTCAmount,
+            usdValueAtTime: originalBTCAmount * realBTCPrice,
+            assetPriceAtTime: realBTCPrice,
+            source: 'cycle_return',
+            reference: `${cancelRef}:release`,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postActiveBTC,
+            metadata: {
+                contractId: investment._id.toString(),
+                planName: investment.plan?.name || 'Unknown',
+                reason: 'Release of active principal on admin cancellation'
+            },
+            session
+        });
+
+        await writeLedgerEntry({
+            user: user._id,
+            wallet: 'matured',
+            asset: 'btc',
+            direction: 'credit',
+            amount: refundAmountBTC,
+            usdValueAtTime: refundAmountUSD,
+            assetPriceAtTime: realBTCPrice,
+            source: 'contract_cancellation_refund',
+            reference: cancelRef,
+            relatedEntity: investment._id,
+            relatedModel: 'Investment',
+            balanceAfter: postMaturedBTC,
+            metadata: {
+                contractId: investment._id.toString(),
+                planName: investment.plan?.name || 'Unknown',
+                cancelledBy: req.admin.name,
+                reason: reason || 'Cancelled by admin',
+                adminOnly: false
+            },
+            session
+        });
+
+        await session.commitTransaction();
+
+        user.balances = userDoc.balances;
+
+        console.log(`✅ Cancellation ledger entries written for contract ${investment._id}`);
+
+    } catch (txErr) {
+        await session.abortTransaction();
+        console.error('❌ Cancellation transaction failed:', txErr);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to record cancellation. No balances were changed.'
+        });
+    } finally {
+        session.endSession();
     }
-    if (!user.balances.matured) user.balances.matured = new Map();
-    if (!user.balances.active) user.balances.active = new Map();
-
-    const beforeMaturedBTC = user.balances.matured.get('btc') || 0;
-    const beforeMaturedUSD = user.balances.matured.get('usd') || 0;
-
-    console.log(`📊 MATURED WALLET BEFORE REFUND:`);
-    console.log(`   BTC Balance: ${beforeMaturedBTC.toFixed(8)} BTC`);
-    console.log(`   USD Value: $${beforeMaturedUSD.toLocaleString()}`);
-
-    const newMaturedBTC = beforeMaturedBTC + refundAmountBTC;
-    const newMaturedUSD = newMaturedBTC * realBTCPrice;
-    
-    user.balances.matured.set('btc', newMaturedBTC);
-    user.balances.matured.set('usd', newMaturedUSD);
-    
-    const beforeActiveBTC = user.balances.active.get('btc') || 0;
-    const newActiveBTCBalance = beforeActiveBTC - originalBTCAmount;
-    if (newActiveBTCBalance <= 0.00000001) {
-      user.balances.active.delete('btc');
-    } else {
-      user.balances.active.set('btc', newActiveBTCBalance);
-    }
-    
-    const newActiveUSDBalance = newActiveBTCBalance * realBTCPrice;
-    if (newActiveUSDBalance <= 0.01) {
-      user.balances.active.delete('usd');
-    } else {
-      user.balances.active.set('usd', newActiveUSDBalance);
-    }
-
-    await user.save();
 
     const updatedUser = await User.findById(user._id).select('balances');
     
