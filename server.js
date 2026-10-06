@@ -1915,7 +1915,7 @@ const PromoSchema = new mongoose.Schema({
   },
   category: {
     type: String,
-    enum: ['deposit', 'withdrawal', 'investment', 'general'],
+    enum: ['deposit', 'withdrawal', 'investment', 'registration'],
     default: 'general'
   },
   transactionType: {
