@@ -4791,320 +4791,400 @@ TransactionSchema.index({ createdAt: -1 });
 
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-const FinancialStatementSchema = new mongoose.Schema({
-    user: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: true,
-        index: true
-    },
-    statementType: {
-        type: String,
-        enum: ['weekly', 'monthly'],
-        required: true
-    },
-    period: {
-        startDate: { type: Date, required: true, index: true },
-        endDate: { type: Date, required: true, index: true },
-        generationDate: { type: Date, default: Date.now }
-    },
-    reference: {
-        type: String,
-        unique: true,
-        required: true
-    },
-    openingBalances: {
-        totalUSD: { type: Number, required: true },
-        mainWalletUSD: { type: Number, required: true },
-        activeWalletUSD: { type: Number, required: true },
-        maturedWalletUSD: { type: Number, required: true },
-        cryptoDetails: [{
-            asset: { type: String, required: true },
-            amount: { type: Number, required: true },
-            usdValue: { type: Number, required: true },
-            walletType: { type: String, enum: ['main', 'matured'] }
-        }],
-        timestamp: { type: Date, required: true }
-    },
-    closingBalances: {
-        totalUSD: { type: Number, required: true },
-        mainWalletUSD: { type: Number, required: true },
-        activeWalletUSD: { type: Number, required: true },
-        maturedWalletUSD: { type: Number, required: true },
-        cryptoDetails: [{
-            asset: { type: String, required: true },
-            amount: { type: Number, required: true },
-            usdValue: { type: Number, required: true },
-            walletType: { type: String, enum: ['main', 'matured'] }
-        }],
-        timestamp: { type: Date, required: true }
-    },
-    netChangeUSD: { type: Number, required: true },
-    transactions: {
-        list: [{
-            transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
-            type: {
-                type: String,
-                enum: [
-                    'deposit',
-                    'withdrawal',
-                    'transfer',
-                    'investment',
-                    'interest',
-                    'referral',
-                    'loan',
-                    'buy',
-                    'sell',
-                    'refund',
-                    'Promo'
-                ]
-            },
-            amountUSD: { type: Number, required: true },
-            asset: { type: String },
-            assetAmount: { type: Number },
-            status: { type: String, enum: ['pending', 'completed', 'failed', 'cancelled'] },
-            method: { type: String },
-            description: { type: String },
-            reference: { type: String },
-            feeUSD: { type: Number, default: 0 },
-            netAmountUSD: { type: Number, required: true },
-            exchangeRate: { type: Number },
-            createdAt: { type: Date, required: true },
-            processedAt: { type: Date }
-        }],
-        summary: {
-            totalDepositsUSD: { type: Number, default: 0 },
-            totalWithdrawalsUSD: { type: Number, default: 0 },
-            totalFeesPaidUSD: { type: Number, default: 0 },
-            totalTransfersUSD: { type: Number, default: 0 },
-            count: {
-                deposits: { type: Number, default: 0 },
-                withdrawals: { type: Number, default: 0 },
-                transfers: { type: Number, default: 0 },
-                refunds: { type: Number, default: 0 },
-                promos: { type: Number, default: 0 }
+
+
+
+
+
+const FinancialStatementSchema = new mongoose.Schema(
+    {
+        /* ============================================================
+         * IDENTITY
+         * ========================================================== */
+        user: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+            required: true,
+            index: true
+        },
+        statementType: {
+            type: String,
+            enum: ['weekly', 'monthly'],
+            required: true
+        },
+        period: {
+            startDate:      { type: Date, required: true, index: true },
+            endDate:        { type: Date, required: true, index: true },
+            generationDate: { type: Date, default: Date.now }
+        },
+        reference: {
+            type: String,
+            unique: true,
+            required: true
+        },
+
+        /* ============================================================
+         * OPENING / CLOSING BALANCES
+         * ========================================================== */
+        openingBalances: {
+            totalUSD:         { type: Number, required: true },
+            mainWalletUSD:    { type: Number, required: true },
+            activeWalletUSD:  { type: Number, required: true },
+            maturedWalletUSD: { type: Number, required: true },
+            cryptoDetails: [{
+                asset:      { type: String, required: true },
+                amount:     { type: Number, required: true },
+                usdValue:   { type: Number, required: true },
+                walletType: { type: String, enum: ['main', 'matured'] }
+            }],
+            timestamp: { type: Date, required: true }
+        },
+        closingBalances: {
+            totalUSD:         { type: Number, required: true },
+            mainWalletUSD:    { type: Number, required: true },
+            activeWalletUSD:  { type: Number, required: true },
+            maturedWalletUSD: { type: Number, required: true },
+            cryptoDetails: [{
+                asset:      { type: String, required: true },
+                amount:     { type: Number, required: true },
+                usdValue:   { type: Number, required: true },
+                walletType: { type: String, enum: ['main', 'matured'] }
+            }],
+            timestamp: { type: Date, required: true }
+        },
+        netChangeUSD: { type: Number, required: true },
+
+        /* ============================================================
+         * TRANSACTIONS
+         * ========================================================== */
+        transactions: {
+            list: [{
+                transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
+                type: {
+                    type: String,
+                    enum: [
+                        'deposit',
+                        'withdrawal',
+                        'transfer',
+                        'investment',
+                        'interest',
+                        'referral',
+                        'loan',
+                        'buy',
+                        'sell',
+                        'refund',
+                        'Promo'
+                    ]
+                },
+                amountUSD:    { type: Number, required: true },
+                asset:        { type: String },
+                assetAmount:  { type: Number },
+                status:       { type: String, enum: ['pending', 'completed', 'failed', 'cancelled'] },
+                method:       { type: String },
+                description:  { type: String },
+                reference:    { type: String },
+                feeUSD:       { type: Number, default: 0 },
+                netAmountUSD: { type: Number, required: true },
+                exchangeRate: { type: Number },
+                createdAt:    { type: Date, required: true },
+                processedAt:  { type: Date }
+            }],
+            summary: {
+                totalDepositsUSD:    { type: Number, default: 0 },
+                totalWithdrawalsUSD: { type: Number, default: 0 },
+                totalFeesPaidUSD:    { type: Number, default: 0 },
+                totalTransfersUSD:   { type: Number, default: 0 },
+                count: {
+                    deposits:    { type: Number, default: 0 },
+                    withdrawals: { type: Number, default: 0 },
+                    transfers:   { type: Number, default: 0 },
+                    refunds:     { type: Number, default: 0 },
+                    promos:      { type: Number, default: 0 }
+                }
             }
-        }
-    },
-    investments: {
-        active: [{
-            investmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
-            planName: { type: String, required: true },
-            principalUSD: { type: Number, required: true },
-            principalBTC: { type: Number },
-            expectedReturnUSD: { type: Number },
-            startDate: { type: Date },
-            endDate: { type: Date },
-            status: { type: String }
-        }],
-        matured: [{
-            investmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
-            planName: { type: String, required: true },
-            initialAmountUSD: { type: Number, required: true },
-            returnAmountUSD: { type: Number, required: true },
-            profitUSD: { type: Number, required: true },
-            profitPercentage: { type: Number, required: true },
-            completionDate: { type: Date, required: true },
-            btcPriceAtCompletion: { type: Number }
-        }],
-        started: [{
-            investmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
-            planName: { type: String, required: true },
-            amountUSD: { type: Number, required: true },
-            amountBTC: { type: Number },
-            startDate: { type: Date, required: true },
-            expectedReturnUSD: { type: Number, required: true }
-        }],
-        summary: {
-            totalPrincipalInvestedUSD: { type: Number, default: 0 },
-            totalReturnsEarnedUSD: { type: Number, default: 0 },
-            totalProfitUSD: { type: Number, default: 0 },
-            totalActiveInvestmentsCount: { type: Number, default: 0 },
-            totalActivePrincipalUSD: { type: Number, default: 0 }
-        }
-    },
-    trading: {
-        buys: [{
-            buyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Buy' },
-            asset: { type: String, required: true },
-            amountUSD: { type: Number, required: true },
-            assetAmount: { type: Number, required: true },
-            pricePerUnit: { type: Number, required: true },
-            createdAt: { type: Date, required: true },
-            status: { type: String }
-        }],
-        sells: [{
-            sellId: { type: mongoose.Schema.Types.ObjectId, ref: 'Sell' },
-            asset: { type: String, required: true },
-            amountUSD: { type: Number, required: true },
-            assetAmount: { type: Number, required: true },
-            pricePerUnit: { type: Number, required: true },
-            profitLossUSD: { type: Number, required: true },
-            profitLossPercentage: { type: Number, required: true },
-            createdAt: { type: Date, required: true },
-            status: { type: String }
-        }],
-        summary: {
-            totalBuyVolumeUSD: { type: Number, default: 0 },
-            totalSellVolumeUSD: { type: Number, default: 0 },
-            totalTradingProfitUSD: { type: Number, default: 0 },
-            totalTradingLossUSD: { type: Number, default: 0 },
-            netTradingPnLUSD: { type: Number, default: 0 }
-        }
-    },
-    fees: {
-        items: [{
-            source: { type: String, enum: ['investment_fee', 'withdrawal_fee', 'buy_fee', 'sell_fee', 'conversion_fee', 'loan_disbursement_fee'] },
-            amountUSD: { type: Number, required: true },
-            transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
-            description: { type: String },
-            date: { type: Date, required: true }
-        }],
-        summary: {
-            totalFeesUSD: { type: Number, default: 0 },
-            investmentFeesUSD: { type: Number, default: 0 },
-            withdrawalFeesUSD: { type: Number, default: 0 },
-            tradingFeesUSD: { type: Number, default: 0 },
-            conversionFeesUSD: { type: Number, default: 0 },
-            loanFeesUSD: { type: Number, default: 0 }
-        }
-    },
-    referrals: {
-        commissionsEarned: [{
-            commissionId: { type: mongoose.Schema.Types.ObjectId, ref: 'CommissionHistory' },
-            fromUser: {
-                userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-                name: { type: String }
-            },
-            amountUSD: { type: Number, required: true },
-            level: { type: Number },
-            sourceInvestmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
-            date: { type: Date, required: true }
-        }],
-        summary: {
-            totalReferralEarningsUSD: { type: Number, default: 0 },
-            directReferralEarningsUSD: { type: Number, default: 0 },
-            downlineCommissionEarningsUSD: { type: Number, default: 0 }
-        }
-    },
-    loans: {
-        activeLoans: [{
-            loanId: { type: mongoose.Schema.Types.ObjectId, ref: 'Loan' },
-            amountUSD: { type: Number, required: true },
-            remainingBalanceUSD: { type: Number, required: true },
-            interestRate: { type: Number, required: true },
-            startDate: { type: Date },
-            endDate: { type: Date },
-            status: { type: String }
-        }],
-        loanActivities: [{
-            loanId: { type: mongoose.Schema.Types.ObjectId, ref: 'Loan' },
-            type: { type: String, enum: ['disbursement', 'repayment', 'fee_charged'] },
-            amountUSD: { type: Number, required: true },
-            date: { type: Date, required: true },
-            reference: { type: String }
-        }],
-        summary: {
-            totalDisbursedUSD: { type: Number, default: 0 },
-            totalRepaidUSD: { type: Number, default: 0 },
-            currentOutstandingBalanceUSD: { type: Number, default: 0 },
-            totalInterestPaidUSD: { type: Number, default: 0 }
-        }
-    },
-    assetPerformance: [{
-        asset: { type: String, required: true },
-        openingBalance: { type: Number, required: true },
-        closingBalance: { type: Number, required: true },
-        netChangeAmount: { type: Number, required: true },
-        openingValueUSD: { type: Number, required: true },
-        closingValueUSD: { type: Number, required: true },
-        netChangeValueUSD: { type: Number, required: true },
-        priceChangePercentage: { type: Number, required: true },
-        realizedPnLUSD: { type: Number, default: 0 },
-        totalPnLUSD: { type: Number, default: 0 }
-    }],
-    cardPayments: [{
-        cardPaymentId: { type: mongoose.Schema.Types.ObjectId, ref: 'CardPayment' },
-        amountUSD: { type: Number, required: true },
-        cardType: { type: String },
-        last4: { type: String },
-        status: { type: String },
-        date: { type: Date, required: true }
-    }],
-    summary: {
-        totalInflowUSD: { type: Number, default: 0 },
-        totalOutflowUSD: { type: Number, default: 0 },
-        netCashFlowUSD: { type: Number, default: 0 },
-        totalProfitUSD: { type: Number, default: 0 },
-        totalLossUSD: { type: Number, default: 0 },
-        netProfitUSD: { type: Number, default: 0 },
-        roiPercentage: { type: Number, default: 0 },
-        realizedPnL: { type: Number, default: 0 },
-        unrealizedPnL: { type: Number, default: 0 },
-        assetPnLDetails: [{
-            asset: { type: String },
-            realizedPnL: { type: Number, default: 0 },
-            unrealizedPnL: { type: Number, default: 0 },
-            totalPnL: { type: Number, default: 0 }
-        }]
-    },
-    ipAddress: { type: String },
-    userAgent: { type: String },
-    location: { type: String },
-    isDelivered: { type: Boolean, default: false },
-    deliveredAt: { type: Date },
-    downloadUrl: { type: String }
-}, {
-    timestamps: true,
-    toJSON: { virtuals: true },
-    toObject: { virtuals: true }
-});
+        },
 
+        /* ============================================================
+         * INVESTMENTS
+         * ========================================================== */
+        investments: {
+            active: [{
+                investmentId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
+                planName:          { type: String, required: true },
+                principalUSD:      { type: Number, required: true },
+                principalBTC:      { type: Number },
+                expectedReturnUSD: { type: Number },
+                startDate:         { type: Date },
+                endDate:           { type: Date },
+                status:            { type: String }
+            }],
+            matured: [{
+                investmentId:         { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
+                planName:             { type: String, required: true },
+                initialAmountUSD:     { type: Number, required: true },
+                returnAmountUSD:      { type: Number, required: true },
+                profitUSD:            { type: Number, required: true },
+                profitPercentage:     { type: Number, required: true },
+                completionDate:       { type: Date, required: true },
+                btcPriceAtCompletion: { type: Number }
+            }],
+            started: [{
+                investmentId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
+                planName:          { type: String, required: true },
+                amountUSD:         { type: Number, required: true },
+                amountBTC:         { type: Number },
+                startDate:         { type: Date, required: true },
+                expectedReturnUSD: { type: Number, required: true }
+            }],
+            summary: {
+                totalPrincipalInvestedUSD:   { type: Number, default: 0 },
+                totalReturnsEarnedUSD:       { type: Number, default: 0 },
+                totalProfitUSD:              { type: Number, default: 0 },
+                totalActiveInvestmentsCount: { type: Number, default: 0 },
+                totalActivePrincipalUSD:     { type: Number, default: 0 }
+            }
+        },
 
+        /* ============================================================
+         * TRADING
+         * ========================================================== */
+        trading: {
+            buys: [{
+                buyId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Buy' },
+                asset:       { type: String, required: true },
+                amountUSD:   { type: Number, required: true },
+                assetAmount: { type: Number, required: true },
+                pricePerUnit:{ type: Number, required: true },
+                createdAt:   { type: Date, required: true },
+                status:      { type: String }
+            }],
+            sells: [{
+                sellId:               { type: mongoose.Schema.Types.ObjectId, ref: 'Sell' },
+                asset:                { type: String, required: true },
+                amountUSD:            { type: Number, required: true },
+                assetAmount:          { type: Number, required: true },
+                pricePerUnit:         { type: Number, required: true },
+                profitLossUSD:        { type: Number, required: true },
+                profitLossPercentage: { type: Number, required: true },
+                createdAt:            { type: Date, required: true },
+                status:               { type: String }
+            }],
+            summary: {
+                totalBuyVolumeUSD:    { type: Number, default: 0 },
+                totalSellVolumeUSD:   { type: Number, default: 0 },
+                totalTradingProfitUSD:{ type: Number, default: 0 },
+                totalTradingLossUSD:  { type: Number, default: 0 },
+                netTradingPnLUSD:     { type: Number, default: 0 }
+            }
+        },
+
+        /* ============================================================
+         * FEES
+         * ========================================================== */
+        fees: {
+            items: [{
+                source: {
+                    type: String,
+                    enum: [
+                        'investment_fee',
+                        'withdrawal_fee',
+                        'buy_fee',
+                        'sell_fee',
+                        'conversion_fee',
+                        'loan_disbursement_fee'
+                    ]
+                },
+                amountUSD:     { type: Number, required: true },
+                transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction' },
+                description:   { type: String },
+                date:          { type: Date, required: true }
+            }],
+            summary: {
+                totalFeesUSD:       { type: Number, default: 0 },
+                investmentFeesUSD:  { type: Number, default: 0 },
+                withdrawalFeesUSD:  { type: Number, default: 0 },
+                tradingFeesUSD:     { type: Number, default: 0 },
+                conversionFeesUSD:  { type: Number, default: 0 },
+                loanFeesUSD:        { type: Number, default: 0 }
+            }
+        },
+
+        /* ============================================================
+         * REFERRALS
+         * ========================================================== */
+        referrals: {
+            commissionsEarned: [{
+                commissionId: { type: mongoose.Schema.Types.ObjectId, ref: 'CommissionHistory' },
+                fromUser: {
+                    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+                    name:   { type: String }
+                },
+                amountUSD:          { type: Number, required: true },
+                level:              { type: Number },
+                sourceInvestmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Investment' },
+                date:               { type: Date, required: true }
+            }],
+            summary: {
+                totalReferralEarningsUSD:      { type: Number, default: 0 },
+                directReferralEarningsUSD:     { type: Number, default: 0 },
+                downlineCommissionEarningsUSD: { type: Number, default: 0 }
+            }
+        },
+
+        /* ============================================================
+         * LOANS
+         * ========================================================== */
+        loans: {
+            activeLoans: [{
+                loanId:               { type: mongoose.Schema.Types.ObjectId, ref: 'Loan' },
+                amountUSD:            { type: Number, required: true },
+                remainingBalanceUSD:  { type: Number, required: true },
+                interestRate:         { type: Number, required: true },
+                startDate:            { type: Date },
+                endDate:              { type: Date },
+                status:               { type: String }
+            }],
+            loanActivities: [{
+                loanId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Loan' },
+                type:      { type: String, enum: ['disbursement', 'repayment', 'fee_charged'] },
+                amountUSD: { type: Number, required: true },
+                date:      { type: Date, required: true },
+                reference: { type: String }
+            }],
+            summary: {
+                totalDisbursedUSD:            { type: Number, default: 0 },
+                totalRepaidUSD:               { type: Number, default: 0 },
+                currentOutstandingBalanceUSD: { type: Number, default: 0 },
+                totalInterestPaidUSD:         { type: Number, default: 0 }
+            }
+        },
+
+        /* ============================================================
+         * ASSET PERFORMANCE
+         * ========================================================== */
+        assetPerformance: [{
+            asset:                 { type: String, required: true },
+            openingBalance:        { type: Number, required: true },
+            closingBalance:        { type: Number, required: true },
+            netChangeAmount:       { type: Number, required: true },
+            openingValueUSD:       { type: Number, required: true },
+            closingValueUSD:       { type: Number, required: true },
+            netChangeValueUSD:     { type: Number, required: true },
+            priceChangePercentage: { type: Number, required: true },
+            realizedPnLUSD:        { type: Number, default: 0 },
+            totalPnLUSD:           { type: Number, default: 0 }
+        }],
+
+        /* ============================================================
+         * CARD PAYMENTS
+         * ========================================================== */
+        cardPayments: [{
+            cardPaymentId: { type: mongoose.Schema.Types.ObjectId, ref: 'CardPayment' },
+            amountUSD:     { type: Number, required: true },
+            cardType:      { type: String },
+            last4:         { type: String },
+            status:        { type: String },
+            date:          { type: Date, required: true }
+        }],
+
+        /* ============================================================
+         * SUMMARY
+         * ========================================================== */
+        summary: {
+            totalInflowUSD:    { type: Number, default: 0 },
+            totalOutflowUSD:   { type: Number, default: 0 },
+            netCashFlowUSD:    { type: Number, default: 0 },
+            totalProfitUSD:    { type: Number, default: 0 },
+            totalLossUSD:      { type: Number, default: 0 },
+            netProfitUSD:      { type: Number, default: 0 },
+            roiPercentage:     { type: Number, default: 0 },
+            realizedPnL:       { type: Number, default: 0 },
+            unrealizedPnL:     { type: Number, default: 0 },
+            assetPnLDetails: [{
+                asset:         { type: String },
+                realizedPnL:   { type: Number, default: 0 },
+                unrealizedPnL: { type: Number, default: 0 },
+                totalPnL:      { type: Number, default: 0 }
+            }]
+        },
+
+        /* ============================================================
+         * LEDGER SNAPSHOT  (immutable view of wallet state at period bounds)
+         * ========================================================== */
         ledgerSnapshot: {
             opening: { type: mongoose.Schema.Types.Mixed, default: {} },
             closing: { type: mongoose.Schema.Types.Mixed, default: {} }
         },
+
+        /* ============================================================
+         * MOVEMENTS  (append-only ledger entries grouped by source)
+         * ========================================================== */
         movements: {
-            onchainDeposits:    { type: [mongoose.Schema.Types.Mixed], default: [] },
-            onchainSweeps:      { type: [mongoose.Schema.Types.Mixed], default: [] },
-            rentalDebits:       { type: [mongoose.Schema.Types.Mixed], default: [] },
-            cycleReturns:       { type: [mongoose.Schema.Types.Mixed], default: [] },
-            cycleFees:          { type: [mongoose.Schema.Types.Mixed], default: [] },
-            powerCosts:         { type: [mongoose.Schema.Types.Mixed], default: [] },
-            miningPayouts:      { type: [mongoose.Schema.Types.Mixed], default: [] },
-            cancellationRefunds:{ type: [mongoose.Schema.Types.Mixed], default: [] },
-            referralCredits:    { type: [mongoose.Schema.Types.Mixed], default: [] },
-            promotionCredits:   { type: [mongoose.Schema.Types.Mixed], default: [] },
-            financingDraws:     { type: [mongoose.Schema.Types.Mixed], default: [] },
-            financingRepays:    { type: [mongoose.Schema.Types.Mixed], default: [] },
-            conversions:        { type: [mongoose.Schema.Types.Mixed], default: [] },
-            trades:             { type: [mongoose.Schema.Types.Mixed], default: [] },
-            adminAdjustments:   { type: [mongoose.Schema.Types.Mixed], default: [] },
-            withdrawals:        { type: [mongoose.Schema.Types.Mixed], default: [] },
-            internalTransfers:  { type: [mongoose.Schema.Types.Mixed], default: [] }
+            onchainDeposits:     { type: [mongoose.Schema.Types.Mixed], default: [] },
+            onchainSweeps:       { type: [mongoose.Schema.Types.Mixed], default: [] },
+            rentalDebits:        { type: [mongoose.Schema.Types.Mixed], default: [] },
+            cycleReturns:        { type: [mongoose.Schema.Types.Mixed], default: [] },
+            cycleFees:           { type: [mongoose.Schema.Types.Mixed], default: [] },
+            powerCosts:          { type: [mongoose.Schema.Types.Mixed], default: [] },
+            miningPayouts:       { type: [mongoose.Schema.Types.Mixed], default: [] },
+            cancellationRefunds: { type: [mongoose.Schema.Types.Mixed], default: [] },
+            referralCredits:     { type: [mongoose.Schema.Types.Mixed], default: [] },
+            promotionCredits:    { type: [mongoose.Schema.Types.Mixed], default: [] },
+            financingDraws:      { type: [mongoose.Schema.Types.Mixed], default: [] },
+            financingRepays:     { type: [mongoose.Schema.Types.Mixed], default: [] },
+            conversions:         { type: [mongoose.Schema.Types.Mixed], default: [] },
+            trades:              { type: [mongoose.Schema.Types.Mixed], default: [] },
+            adminAdjustments:    { type: [mongoose.Schema.Types.Mixed], default: [] },
+            withdrawals:         { type: [mongoose.Schema.Types.Mixed], default: [] },
+            internalTransfers:   { type: [mongoose.Schema.Types.Mixed], default: [] }
         },
+
+        /* ============================================================
+         * ACCOUNTING SUMMARY  (derived, presentation-ready figures)
+         * ========================================================== */
         accountingSummary: {
-            openingNetUSD:          { type: Number, default: 0 },
-            closingNetUSD:          { type: Number, default: 0 },
-            netCashFlowUSD:         { type: Number, default: 0 },
-            realizedMiningIncomeUSD:{ type: Number, default: 0 },
-            realizedTradingPnLUSD:  { type: Number, default: 0 },
-            unrealizedTradingPnLUSD:{ type: Number, default: 0 },
-            totalFeesUSD:           { type: Number, default: 0 },
-            netPositionChangeUSD:   { type: Number, default: 0 },
-            roiPercent:             { type: Number, default: 0 }
+            openingNetUSD:           { type: Number, default: 0 },
+            closingNetUSD:           { type: Number, default: 0 },
+            netCashFlowUSD:          { type: Number, default: 0 },
+            realizedMiningIncomeUSD: { type: Number, default: 0 },
+            realizedTradingPnLUSD:   { type: Number, default: 0 },
+            unrealizedTradingPnLUSD: { type: Number, default: 0 },
+            totalFeesUSD:            { type: Number, default: 0 },
+            netPositionChangeUSD:    { type: Number, default: 0 },
+            roiPercent:              { type: Number, default: 0 }
         },
 
+        /* ============================================================
+         * DELIVERY / METADATA
+         * ========================================================== */
+        ipAddress:   { type: String },
+        userAgent:   { type: String },
+        location:    { type: String },
+        isDelivered: { type: Boolean, default: false },
+        deliveredAt: { type: Date },
+        downloadUrl: { type: String }
+    },
+    {
+        timestamps: true,
+        toJSON: { virtuals: true },
+        toObject: { virtuals: true }
+    }
+);
 
-
+/* ============================================================
+ * INDEXES
+ * ========================================================== */
 FinancialStatementSchema.index({ user: 1, 'period.endDate': -1 });
 FinancialStatementSchema.index({ reference: 1 }, { unique: true });
 FinancialStatementSchema.index({ 'period.startDate': 1, 'period.endDate': 1 });
 FinancialStatementSchema.index({ statementType: 1, 'period.endDate': -1 });
 
+/* ============================================================
+ * MODEL
+ * ========================================================== */
 const FinancialStatement = mongoose.model('FinancialStatement', FinancialStatementSchema);
 
+console.log('✅ FinancialStatement model registered');
 
 
 
