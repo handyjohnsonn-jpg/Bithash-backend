@@ -4794,8 +4794,6 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 
 
-
-
 const FinancialStatementSchema = new mongoose.Schema(
     {
         /* ============================================================
@@ -4837,7 +4835,10 @@ const FinancialStatementSchema = new mongoose.Schema(
                 usdValue:   { type: Number, required: true },
                 walletType: { type: String, enum: ['main', 'matured'] }
             }],
-            timestamp: { type: Date, required: true }
+            // Default rather than required so a worker that forgets to pass
+            // this field cannot fail the entire statement generation batch.
+            // All callers should still pass the true period boundary.
+            timestamp: { type: Date, default: Date.now }
         },
         closingBalances: {
             totalUSD:         { type: Number, required: true },
@@ -4850,7 +4851,8 @@ const FinancialStatementSchema = new mongoose.Schema(
                 usdValue:   { type: Number, required: true },
                 walletType: { type: String, enum: ['main', 'matured'] }
             }],
-            timestamp: { type: Date, required: true }
+            // See note on openingBalances.timestamp above.
+            timestamp: { type: Date, default: Date.now }
         },
         netChangeUSD: { type: Number, required: true },
 
@@ -5185,7 +5187,6 @@ FinancialStatementSchema.index({ statementType: 1, 'period.endDate': -1 });
 const FinancialStatement = mongoose.model('FinancialStatement', FinancialStatementSchema);
 
 console.log('✅ FinancialStatement model registered');
-
 
 
 const UserEnrollmentSchema = new mongoose.Schema({
