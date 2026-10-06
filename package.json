@@ -30,6 +30,7 @@
     "@metamask/eth-sig-util": "^8.2.0",
     "@resvg/resvg-js": "^2.6.0",
     "blakejs": "^1.2.1",
+        "decimal.js": "^10.4.3",
     "bech32": "^2.0.0",
 "bech32": "^2.0.0",
     "@polkadot/keyring": "^13.5.2",
