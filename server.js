@@ -927,13 +927,15 @@ const UserSchema = new mongoose.Schema({
     }
   },
   
-  referralStats: {
+    referralStats: {
     totalReferrals: { type: Number, default: 0 },
     totalEarnings: { type: Number, default: 0 },
     availableBalance: { type: Number, default: 0 },
+    pendingBonus: { type: Number, default: 0 },
     withdrawn: { type: Number, default: 0 },
     referralTier: { type: Number, default: 1 },
   },
+  
   referralHistory: [{
     referredUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     amount: Number,
@@ -8166,200 +8168,302 @@ const checkCSRF = (req, res, next) => {
   next();
 };
 
-const calculateReferralCommissions = async (investment) => {
+
+
+
+
+/* ============================================================================
+ * recordPendingReferralCommission
+ * ----------------------------------------------------------------------------
+ * Called when an investment is CREATED.
+ *
+ * Does NOT touch the upline's wallet. It only:
+ *   1. Creates a CommissionHistory record with status='pending'
+ *   2. Decrements the relationship's remainingRounds
+ *   3. Increments the upline's referralStats.pendingBonus counter (USD)
+ *
+ * The actual wallet credit (in BTC) happens later inside
+ * releasePendingReferralCommissions() when the contract completes.
+ * ========================================================================== */
+const recordPendingReferralCommission = async (investment) => {
   try {
     const populatedInvestment = await Investment.findById(investment._id)
       .populate('user', 'firstName lastName email')
       .populate('plan');
 
     if (!populatedInvestment) {
-      console.log(`Investment not found: ${investment._id}`);
+      console.log(`[referral] Investment not found: ${investment._id}`);
       return;
     }
 
     const investmentId = populatedInvestment._id;
     const investorId = populatedInvestment.user._id;
-    const investmentAmount = populatedInvestment.amount;
-
-    console.log(`Checking downline commissions for investment: ${investmentId}, user: ${investorId}, amount: $${investmentAmount}`);
+    const investmentAmount = Number(populatedInvestment.amount) || 0;
 
     const relationship = await DownlineRelationship.findOne({
       downline: investorId,
       status: 'active',
       remainingRounds: { $gt: 0 }
-    }).populate('upline', 'firstName lastName email balances referralStats downlineStats');
+    });
 
     if (!relationship) {
-      console.log(`No active downline relationship found for user: ${investorId}`);
+      console.log(`[referral] No active downline relationship for user: ${investorId}`);
       return;
     }
 
-    const uplineId = relationship.upline._id;
-    const uplineUser = relationship.upline;
-    const commissionPercentage = relationship.commissionPercentage;
-    const commissionAmount = (investmentAmount * commissionPercentage) / 100;
+    const commissionPercentage = Number(relationship.commissionPercentage) || 0;
+    const commissionAmount = Number(((investmentAmount * commissionPercentage) / 100).toFixed(2));
 
-    console.log(`Downline commission: $${investmentAmount} * ${commissionPercentage}% = $${commissionAmount} for upline: ${uplineUser.email}`);
+    if (commissionAmount <= 0) {
+      console.log(`[referral] Zero commission, skipping. Investment: ${investmentId}`);
+      return;
+    }
+
+    const roundNumber = relationship.commissionRounds - relationship.remainingRounds + 1;
 
     const commissionHistory = await CommissionHistory.create({
-      upline: uplineId,
+      upline: relationship.upline,
       downline: investorId,
       investment: investmentId,
       investmentAmount: investmentAmount,
       commissionPercentage: commissionPercentage,
       commissionAmount: commissionAmount,
-      roundNumber: relationship.commissionRounds - relationship.remainingRounds + 1,
-      status: 'paid',
-      paidAt: new Date()
+      roundNumber: roundNumber,
+      status: 'pending'
     });
-
-        /* ============================================================================
-     * Atomic referral commission credit + ledger write.
-     *
-     * Money path:
-     *   upline main wallet → credit commissionAmount in USD
-     *
-     * The commission is denominated in USD, not crypto, so the ledger entry
-     * uses asset='usd' with assetPriceAtTime=1.
-     * ========================================================================== */
-    let updatedUpline;
-    {
-        const session = await mongoose.startSession();
-        session.startTransaction();
-        try {
-            const uplineDoc = await User.findById(uplineId).session(session);
-            if (!uplineDoc) throw new Error(`Upline user ${uplineId} not found`);
-
-            if (!uplineDoc.balances) {
-                uplineDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
-            }
-            if (!uplineDoc.balances.main) uplineDoc.balances.main = new Map();
-
-            const preUSD = Number(uplineDoc.balances.main.get('usd') || 0);
-            const postUSD = Number((preUSD + commissionAmount).toFixed(2));
-
-            uplineDoc.balances.main.set('usd', postUSD);
-            uplineDoc.referralStats.totalEarnings =
-                (uplineDoc.referralStats.totalEarnings || 0) + commissionAmount;
-            uplineDoc.referralStats.availableBalance =
-                (uplineDoc.referralStats.availableBalance || 0) + commissionAmount;
-            uplineDoc.downlineStats.totalCommissionEarned =
-                (uplineDoc.downlineStats.totalCommissionEarned || 0) + commissionAmount;
-            uplineDoc.downlineStats.thisMonthCommission =
-                (uplineDoc.downlineStats.thisMonthCommission || 0) + commissionAmount;
-            uplineDoc.markModified('balances.main');
-
-            await uplineDoc.save({ session });
-
-            await writeLedgerEntry({
-                user: uplineId,
-                wallet: 'main',
-                asset: 'usd',
-                direction: 'credit',
-                amount: commissionAmount,
-                usdValueAtTime: commissionAmount,
-                assetPriceAtTime: 1,
-                source: 'referral_commission',
-                reference: `referral_commission:${commissionHistory._id}`,
-                relatedEntity: commissionHistory._id,
-                relatedModel: 'CommissionHistory',
-                balanceAfter: postUSD,
-                metadata: {
-                    downlineUserId: investorId.toString(),
-                    downlineEmail: uplineUser.email,
-                    investmentId: investmentId.toString(),
-                    round: relationship.commissionRounds - relationship.remainingRounds + 1,
-                    totalRounds: relationship.commissionRounds,
-                    percentage: commissionPercentage,
-                    reason: 'Downline investment commission'
-                },
-                session
-            });
-
-            await session.commitTransaction();
-            updatedUpline = uplineDoc;
-
-            console.log(`✅ Referral ledger entry written for upline ${uplineUser.email}: $${commissionAmount}`);
-        } catch (txErr) {
-            await session.abortTransaction();
-            console.error('❌ Referral commission transaction failed:', txErr);
-            
-            return;
-        } finally {
-            session.endSession();
-        }
-    }
 
     relationship.remainingRounds -= 1;
     relationship.totalCommissionEarned += commissionAmount;
-    
     if (relationship.remainingRounds === 0) {
       relationship.status = 'completed';
-      console.log(`Commission rounds completed for relationship: ${relationship._id}`);
     }
-
     await relationship.save();
 
-    await Transaction.create({
-      user: uplineId,
-      type: 'referral',
-      amount: commissionAmount,
-      currency: 'USD',
-      status: 'completed',
-      method: 'INTERNAL',
-      reference: `DOWNLINE-COMM-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      details: {
-        commissionFrom: investorId,
-        investmentId: investmentId,
-        round: relationship.commissionRounds - relationship.remainingRounds + 1,
-        totalRounds: relationship.commissionRounds,
-        commissionType: 'downline',
-        downlineName: `${populatedInvestment.user.firstName} ${populatedInvestment.user.lastName}`,
-        percentage: commissionPercentage
-      },
-      fee: 0,
-      netAmount: commissionAmount
+    await User.findByIdAndUpdate(relationship.upline, {
+      $inc: { 'referralStats.pendingBonus': commissionAmount }
     });
 
-    await User.findByIdAndUpdate(uplineId, {
-      $push: {
-        referralHistory: {
-          referredUser: investorId,
-          amount: commissionAmount,
-          percentage: commissionPercentage,
-          level: 1,
-          date: new Date(),
-          status: 'available',
-          type: 'downline_commission'
-        }
-      }
-    });
-
-    const activeDownlinesCount = await DownlineRelationship.countDocuments({ 
-      upline: uplineId, 
+    const activeDownlinesCount = await DownlineRelationship.countDocuments({
+      upline: relationship.upline,
       status: 'active',
       remainingRounds: { $gt: 0 }
     });
 
-    await User.findByIdAndUpdate(uplineId, {
-      'downlineStats.activeDownlines': activeDownlinesCount
+    await User.findByIdAndUpdate(relationship.upline, {
+      $set: { 'downlineStats.activeDownlines': activeDownlinesCount }
     });
 
-    console.log(`Downline commission of $${commissionAmount} paid to upline ${uplineUser.email} for investment ${investmentId} (Round ${relationship.commissionRounds - relationship.remainingRounds + 1}/${relationship.commissionRounds})`);
+    console.log(
+      `[referral] PENDING commission recorded: $${commissionAmount} ` +
+      `for upline ${relationship.upline} from investment ${investmentId} ` +
+      `(round ${roundNumber}/${relationship.commissionRounds})`
+    );
 
-    await logActivity('downline_commission_paid', 'commission', commissionHistory._id, uplineId, 'User', null, {
-      amount: commissionAmount,
-      downline: investorId,
-      investment: investmentId,
-      round: relationship.commissionRounds - relationship.remainingRounds + 1,
-      totalRounds: relationship.commissionRounds,
-      percentage: commissionPercentage
-    });
-
+    await logActivity(
+      'downline_commission_pending',
+      'commission',
+      commissionHistory._id,
+      relationship.upline,
+      'User',
+      null,
+      {
+        amount: commissionAmount,
+        downline: investorId,
+        investment: investmentId,
+        round: roundNumber,
+        totalRounds: relationship.commissionRounds,
+        percentage: commissionPercentage,
+        status: 'pending'
+      }
+    );
   } catch (err) {
-    console.error('Downline commission calculation error:', err);
+    console.error('[referral] recordPendingReferralCommission error:', err);
   }
 };
+
+/* ============================================================================
+ * releasePendingReferralCommissions
+ * ----------------------------------------------------------------------------
+ * Called when a contract COMPLETES (inside the cron's contractComplete branch).
+ *
+ * For every CommissionHistory row tied to this investment with status
+ * 'pending', it:
+ *   1. Converts the pending USD commission to BTC at the current BTC price
+ *   2. Credits the upline's main wallet with that BTC amount
+ *   3. Moves the value from referralStats.pendingBonus -> totalEarnings /
+ *      availableBalance
+ *   4. Writes a ledger entry (source: referral_commission)
+ *   5. Writes a Transaction row of type 'referral'
+ *   6. Sets the CommissionHistory row to status 'paid'
+ *
+ * Idempotent: a commission can only be released once because the status
+ * flips from 'pending' to 'paid' inside a Mongo transaction.
+ * ========================================================================== */
+const releasePendingReferralCommissions = async (investment, btcPrice) => {
+  try {
+    const price = Number(btcPrice) > 0 ? Number(btcPrice) : 0;
+
+    const pendingCommissions = await CommissionHistory.find({
+      investment: investment._id,
+      status: 'pending'
+    }).populate('upline', 'firstName lastName email balances referralStats');
+
+    if (!pendingCommissions.length) return;
+
+    for (const comm of pendingCommissions) {
+      if (!comm.upline) {
+        console.warn(`[referral] Pending commission ${comm._id} has no upline; marking cancelled.`);
+        comm.status = 'cancelled';
+        await comm.save();
+        continue;
+      }
+
+      if (price <= 0) {
+        console.warn(`[referral] BTC price is 0, cannot release commission ${comm._id} yet.`);
+        continue;
+      }
+
+      const uplineId = comm.upline._id;
+      const commissionUSD = Number(comm.commissionAmount) || 0;
+      const commissionBTC = commissionUSD / price;
+
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+        const uplineDoc = await User.findById(uplineId).session(session);
+        if (!uplineDoc) throw new Error(`Upline ${uplineId} not found`);
+
+        if (!uplineDoc.balances) {
+          uplineDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+        }
+        if (!uplineDoc.balances.main) uplineDoc.balances.main = new Map();
+
+        const preBTC = Number(uplineDoc.balances.main.get('btc') || 0);
+        const postBTC = Number((preBTC + commissionBTC).toFixed(18));
+
+        let totalMainUsd = 0;
+        for (const [asset, bal] of uplineDoc.balances.main.entries()) {
+          if (asset === 'usd') continue;
+          if (!bal || bal <= 0) continue;
+          if (asset === 'btc') {
+            totalMainUsd += postBTC * price;
+          } else {
+            const p = await getCryptoPrice(asset.toUpperCase());
+            if (p > 0) totalMainUsd += Number(bal) * p;
+          }
+        }
+        totalMainUsd = Number(totalMainUsd.toFixed(2));
+
+        uplineDoc.balances.main.set('btc', postBTC);
+        uplineDoc.balances.main.set('usd', totalMainUsd);
+        uplineDoc.markModified('balances.main');
+
+        const pending = Number(uplineDoc.referralStats.pendingBonus || 0);
+        uplineDoc.referralStats.pendingBonus = Number(
+          Math.max(0, pending - commissionUSD).toFixed(2)
+        );
+        uplineDoc.referralStats.totalEarnings = Number(
+          ((uplineDoc.referralStats.totalEarnings || 0) + commissionUSD).toFixed(2)
+        );
+        uplineDoc.referralStats.availableBalance = Number(
+          ((uplineDoc.referralStats.availableBalance || 0) + commissionUSD).toFixed(2)
+        );
+
+        await uplineDoc.save({ session });
+
+        await writeLedgerEntry({
+          user: uplineId,
+          wallet: 'main',
+          asset: 'btc',
+          direction: 'credit',
+          amount: commissionBTC,
+          usdValueAtTime: commissionUSD,
+          assetPriceAtTime: price,
+          source: 'referral_commission',
+          reference: `referral_commission:${comm._id}:release`,
+          relatedEntity: comm._id,
+          relatedModel: 'CommissionHistory',
+          balanceAfter: postBTC,
+          metadata: {
+            investmentId: investment._id.toString(),
+            downlineUserId: comm.downline.toString(),
+            commissionUSD,
+            commissionBTC,
+            btcPrice: price,
+            round: comm.roundNumber,
+            reason: 'Downline commission released on contract completion'
+          },
+          session
+        });
+
+        await Transaction.create([{
+          user: uplineId,
+          type: 'referral',
+          amount: commissionUSD,
+          asset: 'BTC',
+          assetAmount: commissionBTC,
+          currency: 'USD',
+          status: 'completed',
+          method: 'INTERNAL',
+          reference: `DOWNLINE-COMM-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+          details: {
+            commissionFrom: comm.downline,
+            investmentId: investment._id,
+            commissionHistoryId: comm._id,
+            round: comm.roundNumber,
+            commissionType: 'downline',
+            percentage: comm.commissionPercentage,
+            btcPriceAtRelease: price,
+            releasedOnContractCompletion: true
+          },
+          fee: 0,
+          netAmount: commissionUSD,
+          exchangeRateAtTime: price
+        }], { session });
+
+        comm.status = 'paid';
+        comm.paidAt = new Date();
+        await comm.save({ session });
+
+        await session.commitTransaction();
+
+        console.log(
+          `[referral] RELEASED commission ${comm._id}: ` +
+          `${commissionBTC.toFixed(8)} BTC ($${commissionUSD}) to upline ${uplineId}`
+        );
+
+        try {
+          await logActivity(
+            'downline_commission_released',
+            'commission',
+            comm._id,
+            uplineId,
+            'System',
+            null,
+            {
+              amount: commissionUSD,
+              amountBTC: commissionBTC,
+              btcPrice: price,
+              downline: comm.downline,
+              investment: investment._id,
+              round: comm.roundNumber
+            }
+          );
+        } catch (_) {}
+      } catch (txErr) {
+        await session.abortTransaction();
+        console.error(`[referral] Failed to release commission ${comm._id}:`, txErr.message);
+      } finally {
+        session.endSession();
+      }
+    }
+  } catch (err) {
+    console.error('[referral] releasePendingReferralCommissions error:', err);
+  }
+};
+
+
 
 const recalculateAllUserBalances = async (io) => {
   try {
@@ -20844,7 +20948,7 @@ app.post('/api/investments', protect, [
       }]
     });
 
-    await calculateReferralCommissions(investment);
+       await recordPendingReferralCommission(investment);
 
     if (user.referredBy) {
       const referralBonusUSD = (amount * plan.referralBonus) / 100;
@@ -21952,6 +22056,19 @@ const completeMaturedInvestmentsCron = async () => {
           await session.commitTransaction();
 
           console.log(`✅ [CRON] Investment ${investment._id} completed (FINAL). Payout: capital deployed ${returnedPrincipalUSD.toFixed(2)} + net mining returns ${finalProfitUSD.toFixed(2)} = $${finalPayoutUSD.toFixed(2)}`);
+		  
+		  
+		  
+		  
+	
+          try {
+            await releasePendingReferralCommissions(investment, currentBTCPrice);
+          } catch (refErr) {
+            console.error(`[CRON] Referral release failed for ${investment._id}:`, refErr.message);
+          }
+		  
+		  
+		  
           completedCount++;
 
           try {
@@ -39684,7 +39801,34 @@ app.get('/api/admin/statements', adminProtect, async (req, res) => {
 
 
 
+app.get('/api/referrals/lookup/:code', async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    if (!code) {
+      return res.status(400).json({ status: 'fail', message: 'Referral code is required' });
+    }
 
+    const referrer = await User.findOne({ referralCode: code })
+      .select('firstName lastName')
+      .lean();
+
+    if (!referrer) {
+      return res.status(404).json({ status: 'fail', message: 'Referral code not found' });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        firstName: referrer.firstName || '',
+        lastName: referrer.lastName || '',
+        displayName: `${referrer.firstName || ''} ${referrer.lastName || ''}`.trim()
+      }
+    });
+  } catch (err) {
+    console.error('Referral lookup error:', err);
+    res.status(500).json({ status: 'error', message: 'Failed to look up referral code' });
+  }
+});
 
 
 
@@ -39748,6 +39892,8 @@ app.get('/api/referrals', protect, async (req, res) => {
     
     const availableBalance = user.balances?.main?.get('usd') || user.balances?.main?.usd || 0;
     
+        const pendingBonus = Number(user.referralStats?.pendingBonus || 0);
+
     res.status(200).json({
       status: 'success',
       data: {
@@ -39759,12 +39905,14 @@ app.get('/api/referrals', protect, async (req, res) => {
         pendingEarnings: pendingEarnings,
         totalCommission: totalCommission,
         availableBalance: availableBalance,
+        pendingBonus: pendingBonus,
         referralStats: {
           totalReferrals: totalReferrals,
           activeReferrals: activeReferrals,
           totalEarnings: totalEarnings,
           pendingEarnings: pendingEarnings,
-          totalCommission: totalCommission
+          totalCommission: totalCommission,
+          pendingBonus: pendingBonus
         }
       }
     });
