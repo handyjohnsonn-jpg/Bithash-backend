@@ -8281,24 +8281,7 @@ const recordPendingReferralCommission = async (investment) => {
   }
 };
 
-/* ============================================================================
- * releasePendingReferralCommissions
- * ----------------------------------------------------------------------------
- * Called when a contract COMPLETES (inside the cron's contractComplete branch).
- *
- * For every CommissionHistory row tied to this investment with status
- * 'pending', it:
- *   1. Converts the pending USD commission to BTC at the current BTC price
- *   2. Credits the upline's main wallet with that BTC amount
- *   3. Moves the value from referralStats.pendingBonus -> totalEarnings /
- *      availableBalance
- *   4. Writes a ledger entry (source: referral_commission)
- *   5. Writes a Transaction row of type 'referral'
- *   6. Sets the CommissionHistory row to status 'paid'
- *
- * Idempotent: a commission can only be released once because the status
- * flips from 'pending' to 'paid' inside a Mongo transaction.
- * ========================================================================== */
+
 const releasePendingReferralCommissions = async (investment, btcPrice) => {
   try {
     const price = Number(btcPrice) > 0 ? Number(btcPrice) : 0;
@@ -8462,6 +8445,147 @@ const releasePendingReferralCommissions = async (investment, btcPrice) => {
     console.error('[referral] releasePendingReferralCommissions error:', err);
   }
 };
+
+
+
+
+
+// ============================================================================
+// assignReferral
+// ----------------------------------------------------------------------------
+// SINGLE SOURCE OF TRUTH for linking a newly registered user to their
+// referrer (upline). Called from all three signup paths:
+//   1. POST /api/auth/signup         (email/password)
+//   2. POST /api/auth/google         (Google OAuth)
+//   3. POST /api/web3/signup         (Web3 wallet)
+//
+// It does four things:
+//   1. Finds the referrer by referralCode (case-insensitive, trimmed).
+//   2. Sets newUser.referredBy = referrer._id  (persisted).
+//   3. Creates the DownlineRelationship document  ← the missing piece
+//   4. Increments the referrer's referralStats.totalReferrals and
+//      downlineStats counters.
+//
+// Idempotent: a duplicate DownlineRelationship (unique index on downline)
+// is treated as success, not failure.
+// ============================================================================
+const assignReferral = async (newUser, rawReferralCode, req) => {
+    try {
+        if (!newUser || !rawReferralCode) {
+            return { success: false, reason: 'missing_input' };
+        }
+
+        const code = String(rawReferralCode).trim().toUpperCase();
+        if (!code) {
+            return { success: false, reason: 'empty_code' };
+        }
+
+        // ---- 1. Find the referrer ----
+        const referrer = await User.findOne({ referralCode: code }).select(
+            'firstName lastName email referralCode'
+        );
+        if (!referrer) {
+            console.warn(`[referral] Invalid referral code used during signup: ${code}`);
+            return { success: false, reason: 'invalid_code' };
+        }
+
+        // Prevent self-referral
+        if (referrer._id.equals(newUser._id)) {
+            console.warn(`[referral] User ${newUser._id} attempted self-referral.`);
+            return { success: false, reason: 'self_referral' };
+        }
+
+        // ---- 2. Set newUser.referredBy (only if not already set) ----
+        if (!newUser.referredBy) {
+            await User.updateOne(
+                { _id: newUser._id, referredBy: { $exists: false } },
+                { $set: { referredBy: referrer._id } }
+            );
+        }
+
+        // ---- 3. Create the DownlineRelationship (idempotent) ----
+        const settings = await CommissionSettings.findOne({ isActive: true })
+            .sort({ createdAt: -1 })
+            .lean();
+        const commissionPercentage = settings?.commissionPercentage ?? 5;
+        const commissionRounds = settings?.commissionRounds ?? 3;
+
+        try {
+            await DownlineRelationship.create({
+                upline: referrer._id,
+                downline: newUser._id,
+                commissionPercentage,
+                commissionRounds,
+                remainingRounds: commissionRounds,
+                totalCommissionEarned: 0,
+                status: 'active',
+                assignedBy: referrer._id,
+                assignedAt: new Date()
+            });
+        } catch (createErr) {
+            if (createErr && createErr.code === 11000) {
+                // Already exists — treat as success
+                console.log(`[referral] DownlineRelationship already exists for ${newUser._id}. Skipping.`);
+                return { success: true, reason: 'already_exists', referrerId: referrer._id };
+            }
+            throw createErr;
+        }
+
+        // ---- 4. Increment referrer counters ----
+        await User.updateOne(
+            { _id: referrer._id },
+            {
+                $inc: {
+                    'referralStats.totalReferrals': 1,
+                    'downlineStats.totalDownlines': 1
+                }
+            }
+        );
+
+        const activeCount = await DownlineRelationship.countDocuments({
+            upline: referrer._id,
+            status: 'active',
+            remainingRounds: { $gt: 0 }
+        });
+        await User.updateOne(
+            { _id: referrer._id },
+            { $set: { 'downlineStats.activeDownlines': activeCount } }
+        );
+
+        // ---- 5. Audit ----
+        try {
+            await logActivity(
+                'referral_assigned',
+                'User',
+                newUser._id,
+                newUser._id,
+                'System',
+                req || null,
+                {
+                    referrerId: referrer._id,
+                    referrerEmail: referrer.email,
+                    referralCode: code,
+                    commissionPercentage,
+                    commissionRounds
+                }
+            );
+        } catch (_) { /* audit failure must not block signup */ }
+
+        console.log(
+            `✅ [referral] ${newUser.email} linked to upline ${referrer.email} ` +
+            `(${commissionPercentage}% × ${commissionRounds} rounds)`
+        );
+        return { success: true, referrerId: referrer._id };
+    } catch (err) {
+        console.error('[referral] assignReferral failed:', err.message);
+        return { success: false, reason: 'exception', error: err.message };
+    }
+};
+
+
+
+
+
 
 
 
@@ -11391,7 +11515,6 @@ app.post('/api/auth/signup', [
             password: hashedPassword,
             city: userCity,
             referralCode: newReferralCode,
-            referredBy: referredByUser ? referredByUser._id : undefined,
             isVerified: false,
             accountType: userAccountType,
             authProvider: 'email',
@@ -11410,8 +11533,13 @@ app.post('/api/auth/signup', [
             }
         };
 
-        const newUser = await User.create(userData);
+                const newUser = await User.create(userData);
         console.log(`✅ New user created: ${newUser.email} (Account Type: ${newUser.accountType}, Auth Provider: email)`);
+
+        // ---- Link the new user to their referrer (if any) ----
+        if (referralCode) {
+            await assignReferral(newUser, referralCode, req);
+        }
 
         await createAuthLog({
             action: 'signup_initiated',
@@ -12407,7 +12535,7 @@ app.post('/api/auth/google', async (req, res) => {
     try {
         console.log('Google auth request received');
 
-        const { credential, isSignup = false, timezoneOffset = 0 } = req.body;
+                const { credential, isSignup = false, timezoneOffset = 0, referralCode } = req.body;
 
         if (!credential) {
             console.error('No credential provided');
@@ -12739,6 +12867,11 @@ app.post('/api/auth/google', async (req, res) => {
                 });
                 isNewUser = true;
                 console.log('New user created via Google SIGNUP:', originalEmail);
+
+                // ---- Link the new Google user to their referrer (if any) ----
+                if (referralCode) {
+                    await assignReferral(user, referralCode, req);
+                }
 
                 await createAuthLog({
                     action: 'google_signup_initiated',
@@ -14317,17 +14450,15 @@ app.post('/api/web3/signup', async (req, res) => {
         });
 
         if (referralCode) {
-            const referrer = await User.findOne({ referralCode: referralCode });
-            if (referrer) {
-                newUser.referredBy = referrer._id;
-                await newUser.save();
-                
-                web3User.referredBy = referrer._id;
-                await web3User.save();
+            // Use the centralized assignReferral so DownlineRelationship is created.
+            const refResult = await assignReferral(newUser, referralCode, req);
 
-                await User.findByIdAndUpdate(referrer._id, {
-                    $inc: { 'referralStats.totalReferrals': 1 }
-                });
+            // Keep Web3User mirror consistent with the resolved referrer.
+            if (refResult && refResult.success && refResult.referrerId) {
+                await Web3User.updateOne(
+                    { _id: web3User._id },
+                    { $set: { referredBy: refResult.referrerId } }
+                );
             }
         }
 
