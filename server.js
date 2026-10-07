@@ -8472,8 +8472,19 @@ const releasePendingReferralCommissions = async (investment, btcPrice) => {
 const assignReferral = async (newUser, rawReferralCode, req) => {
     try {
         if (!newUser || !rawReferralCode) {
+            console.warn(
+                `[referral] assignReferral called with missing input. ` +
+                `newUser=${newUser ? newUser._id : 'null'}, ` +
+                `rawReferralCode=${rawReferralCode}`
+            );
             return { success: false, reason: 'missing_input' };
         }
+
+        console.log(
+            `[referral] assignReferral invoked: ` +
+            `downline=${newUser._id} (${newUser.email}), ` +
+            `rawCode="${rawReferralCode}"`
+        );
 
         const code = String(rawReferralCode).trim().toUpperCase();
         if (!code) {
@@ -12635,6 +12646,7 @@ app.post('/api/auth/google', async (req, res) => {
 
         console.log('Google auth successful for:', email);
         console.log('isSignup flag:', isSignup);
+        console.log('referralCode received:', referralCode || '(none)');
 
         const originalEmail = email;
 
@@ -14335,6 +14347,8 @@ app.post('/api/web3/signup', async (req, res) => {
                 message: 'Email already in use. Please use a different email.'
             });
         }
+
+        console.log(`[web3/signup] referralCode received:`, referralCode || '(none)');
 
         const walletConnectData = decoded.walletConnectData || walletConnect || null;
 
@@ -26379,10 +26393,39 @@ app.get('/api/referrals/downline', protect, async (req, res) => {
         .sort({ createdAt: -1 })
         .lean();
 
+        const downlineIds = downlineRelationships
+            .map(r => r.downline && r.downline._id)
+            .filter(Boolean);
+
+        // Aggregate the total completed investment volume for every downline
+        // in a single query, so the dashboard's "Invested" column can show a
+        // real USD figure instead of just the round count.
+        const investmentTotals = await Investment.aggregate([
+            {
+                $match: {
+                    user: { $in: downlineIds },
+                    status: { $in: ['active', 'completed'] }
+                }
+            },
+            {
+                $group: {
+                    _id: '$user',
+                    totalInvestedUSD: { $sum: '$amount' }
+                }
+            }
+        ]);
+
+        const investmentTotalsByUser = new Map(
+            investmentTotals.map(row => [row._id.toString(), row.totalInvestedUSD])
+        );
+
         const referrals = downlineRelationships.map(relationship => {
             const downlineUser = relationship.downline;
             const roundsCompleted = relationship.commissionRounds - (relationship.remainingRounds || 0);
-            
+            const downlineIdStr = downlineUser && downlineUser._id
+                ? downlineUser._id.toString()
+                : null;
+
             return {
                 id: relationship._id,
                 fullName: downlineUser ? `${downlineUser.firstName} ${downlineUser.lastName}` : 'Anonymous User',
@@ -26391,6 +26434,9 @@ app.get('/api/referrals/downline', protect, async (req, res) => {
                 isActive: relationship.status === 'active',
                 investmentRounds: roundsCompleted,
                 totalEarned: relationship.totalCommissionEarned || 0,
+                totalInvested: downlineIdStr
+                    ? (investmentTotalsByUser.get(downlineIdStr) || 0)
+                    : 0,
                 status: relationship.status
             };
         });
