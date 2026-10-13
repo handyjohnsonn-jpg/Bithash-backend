@@ -58527,7 +58527,461 @@ app.get('/api/statements', protect, async (req, res) => {
 
 
 
+/* ============================================================================
+ * GET /api/mining/performance
+ * ----------------------------------------------------------------------------
+ * Returns real per-day mining performance for the authenticated user.
+ *
+ * Query params:
+ *   period  — 7 | 30 | 90 | 365 | 'all'   (default: 7)
+ *
+ * Response shape (matches html/index.html renderMiningChart + renderPerformanceSummary):
+ *   {
+ *     status: 'success',
+ *     data: {
+ *       summary: {
+ *         periodRewardsBTC,
+ *         rewardsChangePercent,
+ *         previousPeriodRewardsBTC,
+ *         averageHashrate,
+ *         hashrateChangePercent,
+ *         uptimePercent
+ *       },
+ *       series: [ { date, label, value }, ... ]   // one point per day, in BTC
+ *     },
+ *     // The chart renderer also accepts the array directly at the top level.
+ *     // We emit BOTH so the frontend can't break on either shape.
+ *     series: [ ... ]
+ *   }
+ *
+ * Data source (all real, from MongoDB):
+ *   Investment.cycleHistory[].{returnBTC, netPrincipalBTC, powerCostBTC, endDate, status, hashrate}
+ *   Investment.hashrateHistory[].{hashrate, calculatedAt, cycleNumber, monthNumber}
+ *   Investment.{currentHashrate, totalPowerCostBTC, cumulativeReturnBTC}
+ *
+ * Consistency guarantees:
+ *   - BTC amounts come only from persisted cycle returns, not from
+ *     re-simulating plan.percentage. This is the same net value that the
+ *     maturity cron credits to the user's matured wallet.
+ *   - Hashrate is read directly from hashrateHistory / currentHashrate,
+ *     exactly as it is set at activation and every month reset.
+ *   - UTC day bucketing, one point per day, zero-filled for empty days.
+ *   - "all" period uses the user's first investment createdAt.
+ *   - Rewards are bucketed by cycle END date (the moment the credit happened).
+ *   - Only active or completed investments are counted (cancelled/pending
+ *     investments produce no rewards and are excluded).
+ *   - Net reward per cycle = returnBTC - netPrincipalBTC - powerCostBTC.
+ * ========================================================================== */
 
+app.get('/api/mining/performance', protect, async (req, res) => {
+    const startedAt = Date.now();
+
+    try {
+        const userId = req.user._id;
+
+        /* ------------------------------------------------------------------
+         * 1. Resolve period (number of days) and window bounds
+         * ---------------------------------------------------------------- */
+        const rawPeriod = String(req.query.period || '7').toLowerCase();
+        const isAll = rawPeriod === 'all';
+
+        let periodDays = 7;
+        if (!isAll) {
+            const parsed = parseInt(rawPeriod, 10);
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+                return res.status(400).json({
+                    status: 'fail',
+                    message: 'Invalid period. Use 7, 30, 90, 365, or "all".'
+                });
+            }
+            // Clamp to a sane upper bound so a malicious caller cannot ask
+            // for a 100-year series and blow up memory.
+            periodDays = Math.min(parsed, 3650);
+        }
+
+        /* ------------------------------------------------------------------
+         * 2. Pull this user's mining contracts (active + completed only)
+         * ---------------------------------------------------------------- */
+        const investments = await Investment.find({
+            user: userId,
+            status: { $in: ['active', 'completed'] }
+        })
+            .select('status startDate endDate cycleHistory hashrateHistory currentHashrate totalPowerCostBTC cumulativeReturnBTC plan createdAt')
+            .populate('plan', 'name duration percentage')
+            .lean();
+
+        /* ------------------------------------------------------------------
+         * 3. Resolve the window end (now, UTC) and window start
+         * ---------------------------------------------------------------- */
+        const now = new Date();
+        const endOfWindow = new Date(Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            now.getUTCDate(),
+            23, 59, 59, 999
+        ));
+
+        let startOfWindow;
+        if (isAll) {
+            // Earliest investment createdAt, or fall back to 365 days
+            const earliest = investments.reduce((min, inv) => {
+                const t = inv.createdAt ? new Date(inv.createdAt).getTime() : Infinity;
+                return t < min ? t : min;
+            }, Infinity);
+
+            if (Number.isFinite(earliest)) {
+                const d = new Date(earliest);
+                startOfWindow = new Date(Date.UTC(
+                    d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(),
+                    0, 0, 0, 0
+                ));
+            } else {
+                startOfWindow = new Date(endOfWindow.getTime() - (365 - 1) * 86400000);
+            }
+
+            // Guard against a runaway range (cap at 3650 days)
+            const maxSpanMs = 3650 * 86400000;
+            if (endOfWindow.getTime() - startOfWindow.getTime() > maxSpanMs) {
+                startOfWindow = new Date(endOfWindow.getTime() - (3650 - 1) * 86400000);
+            }
+        } else {
+            startOfWindow = new Date(endOfWindow.getTime() - (periodDays - 1) * 86400000);
+            startOfWindow = new Date(Date.UTC(
+                startOfWindow.getUTCFullYear(),
+                startOfWindow.getUTCMonth(),
+                startOfWindow.getUTCDate(),
+                0, 0, 0, 0
+            ));
+        }
+
+        const windowMs = endOfWindow.getTime() - startOfWindow.getTime();
+        const totalDays = Math.max(1, Math.round(windowMs / 86400000) + 1);
+
+        /* ------------------------------------------------------------------
+         * 4. Bucket cycle rewards into UTC days
+         *
+         * A completed cycle credits its net reward on its endDate. That is
+         * the moment the payout actually hit the user's matured wallet, so
+         * it is the correct timestamp to bucket on.
+         *
+         * Net reward per cycle, consistent with the maturity cron:
+         *     net = (returnBTC - netPrincipalBTC) - powerCostBTC
+         * ---------------------------------------------------------------- */
+        const rewardByDay = new Map();  // 'YYYY-MM-DD' -> BTC (number)
+        let lifetimeLifetimeRewards = 0;
+
+        // Hashrate samples:  'YYYY-MM-DD' -> [{ hashrate, ts }]
+        const hashrateByDay = new Map();
+
+        // Track the very first day any activity exists so 'all' can
+        // accurately describe the previous period.
+        let firstActivityMs = Infinity;
+        let lastActivityMs = -Infinity;
+
+        for (const inv of investments) {
+            const cycles = Array.isArray(inv.cycleHistory) ? inv.cycleHistory : [];
+            const hrHistory = Array.isArray(inv.hashrateHistory) ? inv.hashrateHistory : [];
+
+            // -- Cycle rewards --
+            for (const c of cycles) {
+                if (c.status !== 'completed') continue;
+                if (!c.endDate) continue;
+
+                const endMs = new Date(c.endDate).getTime();
+                if (!Number.isFinite(endMs)) continue;
+
+                const returnBTC = Number(c.returnBTC) || 0;
+                const netPrincipalBTC = Number(c.netPrincipalBTC) || 0;
+                const powerCostBTC = Number(c.powerCostBTC) || 0;
+
+                // Gross earned this cycle (before power)
+                const grossEarnedBTC = Math.max(0, returnBTC - netPrincipalBTC);
+                // Net earned after power (what the user actually keeps)
+                const netEarnedBTC = Math.max(0, grossEarnedBTC - powerCostBTC);
+
+                lifetimeLifetimeRewards += netEarnedBTC;
+
+                if (endMs < firstActivityMs) firstActivityMs = endMs;
+                if (endMs > lastActivityMs) lastActivityMs = endMs;
+
+                // Only bucket if the cycle end lands inside the window
+                if (endMs < startOfWindow.getTime() || endMs > endOfWindow.getTime()) {
+                    continue;
+                }
+
+                const key = utcDayKey(new Date(endMs));
+                rewardByDay.set(key, (rewardByDay.get(key) || 0) + netEarnedBTC);
+            }
+
+            // -- Hashrate samples --
+            // The activation sample + every month-reset sample + the current
+            // live hashrate. We de-dupe by (day, hashrate) and average across
+            // contracts when several overlap.
+            const allSamples = [];
+
+            if (inv.currentHashrate && inv.currentHashrate > 0) {
+                allSamples.push({
+                    hashrate: Number(inv.currentHashrate) || 0,
+                    ts: now.getTime()
+                });
+            }
+
+            for (const h of hrHistory) {
+                if (!h || !h.hashrate || h.hashrate <= 0) continue;
+                const ts = h.calculatedAt ? new Date(h.calculatedAt).getTime() : NaN;
+                if (!Number.isFinite(ts)) continue;
+                allSamples.push({
+                    hashrate: Number(h.hashrate) || 0,
+                    ts
+                });
+                if (ts < firstActivityMs) firstActivityMs = ts;
+                if (ts > lastActivityMs) lastActivityMs = ts;
+            }
+
+            for (const s of allSamples) {
+                if (s.ts < startOfWindow.getTime() || s.ts > endOfWindow.getTime()) continue;
+                const key = utcDayKey(new Date(s.ts));
+                if (!hashrateByDay.has(key)) hashrateByDay.set(key, []);
+                hashrateByDay.get(key).push(s);
+            }
+        }
+
+        /* ------------------------------------------------------------------
+         * 5. Build the zero-filled daily series
+         * ---------------------------------------------------------------- */
+        const series = [];
+        let cursorMs = startOfWindow.getTime();
+
+        // Safety: hard cap the series length so a corrupted start date
+        // cannot produce a runaway response.
+        const MAX_POINTS = 3660;
+        let pointCount = 0;
+
+        while (cursorMs <= endOfWindow.getTime() && pointCount < MAX_POINTS) {
+            const d = new Date(cursorMs);
+            const key = utcDayKey(d);
+
+            const value = rewardByDay.has(key)
+                ? Number(rewardByDay.get(key).toFixed(8))
+                : 0;
+
+            series.push({
+                date: key,
+                label: formatSeriesLabel(d, totalDays),
+                value
+            });
+
+            cursorMs += 86400000;
+            pointCount++;
+        }
+
+        /* ------------------------------------------------------------------
+         * 6. Compute the summary block
+         * ---------------------------------------------------------------- */
+        const periodRewardsBTC = series.reduce((sum, p) => sum + (p.value || 0), 0);
+
+        // Previous period: same length, immediately before startOfWindow
+        let previousPeriodRewardsBTC = 0;
+        {
+            const prevEndMs = startOfWindow.getTime() - 1;
+            const prevStartMs = prevEndMs - (totalDays - 1) * 86400000;
+
+            for (const inv of investments) {
+                const cycles = Array.isArray(inv.cycleHistory) ? inv.cycleHistory : [];
+                for (const c of cycles) {
+                    if (c.status !== 'completed') continue;
+                    if (!c.endDate) continue;
+                    const endMs = new Date(c.endDate).getTime();
+                    if (!Number.isFinite(endMs)) continue;
+                    if (endMs < prevStartMs || endMs > prevEndMs) continue;
+
+                    const returnBTC = Number(c.returnBTC) || 0;
+                    const netPrincipalBTC = Number(c.netPrincipalBTC) || 0;
+                    const powerCostBTC = Number(c.powerCostBTC) || 0;
+                    const gross = Math.max(0, returnBTC - netPrincipalBTC);
+                    const net = Math.max(0, gross - powerCostBTC);
+                    previousPeriodRewardsBTC += net;
+                }
+            }
+        }
+
+        let rewardsChangePercent = null;
+        if (previousPeriodRewardsBTC > 0) {
+            rewardsChangePercent = Number(
+                (((periodRewardsBTC - previousPeriodRewardsBTC) / previousPeriodRewardsBTC) * 100).toFixed(2)
+            );
+        } else if (periodRewardsBTC > 0) {
+            // Went from zero to positive — undefined ratio, but a meaningful
+            // "up" signal. Return 100 to convey positive movement.
+            rewardsChangePercent = 100;
+        }
+
+        // Average hashrate across the window (TH/s), averaging all contracts
+        // on each day then averaging the day-averages.
+        let sumDayHashrates = 0;
+        let daysWithHashrate = 0;
+        for (const [, samples] of hashrateByDay.entries()) {
+            if (!samples.length) continue;
+            const dayTotal = samples.reduce((s, x) => s + (x.hashrate || 0), 0);
+            sumDayHashrates += dayTotal / samples.length;
+            daysWithHashrate += 1;
+        }
+        const averageHashrate = daysWithHashrate > 0
+            ? Number((sumDayHashrates / daysWithHashrate).toFixed(4))
+            : 0;
+
+        // Hashrate change: average over the second half of the window vs
+        // average over the first half.
+        let hashrateChangePercent = null;
+        if (series.length >= 4 && daysWithHashrate > 0) {
+            const mid = Math.floor(series.length / 2);
+
+            let firstHalfSum = 0, firstHalfDays = 0;
+            let secondHalfSum = 0, secondHalfDays = 0;
+
+            series.forEach((p, idx) => {
+                const samples = hashrateByDay.get(p.date);
+                if (!samples || !samples.length) return;
+                const dayAvg = samples.reduce((s, x) => s + (x.hashrate || 0), 0) / samples.length;
+                if (idx < mid) {
+                    firstHalfSum += dayAvg;
+                    firstHalfDays += 1;
+                } else {
+                    secondHalfSum += dayAvg;
+                    secondHalfDays += 1;
+                }
+            });
+
+            const firstAvg = firstHalfDays > 0 ? firstHalfSum / firstHalfDays : 0;
+            const secondAvg = secondHalfDays > 0 ? secondHalfSum / secondHalfDays : 0;
+
+            if (firstAvg > 0) {
+                hashrateChangePercent = Number(
+                    (((secondAvg - firstAvg) / firstAvg) * 100).toFixed(2)
+                );
+            } else if (secondAvg > 0) {
+                hashrateChangePercent = 100;
+            }
+        }
+
+        // Uptime: proportion of days in the window that have an active
+        // contract with a positive hashrate sample, relative to days that
+        // had ANY investment activity during the window.
+        let uptimePercent = null;
+        if (series.length > 0) {
+            const windowStartMs = startOfWindow.getTime();
+            const windowEndMs = endOfWindow.getTime();
+
+            // Days during the window where the user had at least one active
+            // contract (derived from hashrateHistory + currentHashrate).
+            const activeDays = new Set();
+            for (const [key] of hashrateByDay.entries()) {
+                const t = Date.parse(key + 'T00:00:00.000Z');
+                if (t >= windowStartMs && t <= windowEndMs) activeDays.add(key);
+            }
+
+            // Denominator: days between the later of (window start,
+            // user's first activity) and window end.
+            let denomStartMs = windowStartMs;
+            if (Number.isFinite(firstActivityMs) && firstActivityMs > windowStartMs) {
+                const fa = new Date(firstActivityMs);
+                denomStartMs = Date.UTC(fa.getUTCFullYear(), fa.getUTCMonth(), fa.getUTCDate());
+            }
+
+            const denomDays = Math.max(
+                1,
+                Math.round((windowEndMs - denomStartMs) / 86400000) + 1
+            );
+
+            uptimePercent = Number(
+                Math.min(100, (activeDays.size / denomDays) * 100).toFixed(2)
+            );
+        }
+
+        const summary = {
+            periodRewardsBTC:      Number(periodRewardsBTC.toFixed(8)),
+            rewardsChangePercent,
+            previousPeriodRewardsBTC: Number(previousPeriodRewardsBTC.toFixed(8)),
+            averageHashrate,
+            hashrateChangePercent,
+            uptimePercent
+        };
+
+        /* ------------------------------------------------------------------
+         * 7. Respond
+         *    The chart renderer accepts the array directly, and the summary
+         *    renderer reads data.summary. We expose both shapes so the
+         *    frontend cannot break on either.
+         * ---------------------------------------------------------------- */
+        const payload = {
+            status: 'success',
+            data: {
+                summary,
+                series
+            },
+            // Top-level array fallback for renderMiningChart(perfData)
+            series
+        };
+
+        const elapsed = Date.now() - startedAt;
+        if (process.env.NODE_ENV !== 'production' && elapsed > 1500) {
+            console.warn(`[mining/performance] slow response: ${elapsed}ms, period=${rawPeriod}`);
+        }
+
+        return res.status(200).json(payload);
+
+    } catch (err) {
+        console.error('[mining/performance] fatal error:', err);
+
+        try {
+            await SystemLog.create({
+                action: 'mining_performance_error',
+                entity: 'Investment',
+                performedBy: req.user?._id || null,
+                performedByModel: 'User',
+                performedByEmail: req.user?.email || null,
+                performedByName: req.user
+                    ? `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim()
+                    : null,
+                status: 'failed',
+                errorMessage: err.message,
+                errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                ip: getRealClientIP(req),
+                userAgent: req.headers['user-agent'] || 'Unknown',
+                metadata: {
+                    query: req.query,
+                    processingTimeMs: Date.now() - startedAt
+                }
+            });
+        } catch (_) { /* audit failure must not shadow the original error */ }
+
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to load mining performance'
+        });
+    }
+});
+
+/* ----------------------------------------------------------------------------
+ * Helpers used by /api/mining/performance
+ * -------------------------------------------------------------------------- */
+
+function utcDayKey(date) {
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(date.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
+
+function formatSeriesLabel(date, totalDays) {
+    if (totalDays > 180) {
+        return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+    }
+    if (totalDays > 60) {
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
 
 
 
