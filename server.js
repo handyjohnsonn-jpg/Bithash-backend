@@ -45999,7 +45999,6 @@ async function creditUserMainWallet({ user, assetUpper, cryptoAmount, usdValue, 
 }
 
 
-
 async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, networkName }) {
     const entry = ASSET_NETWORK_MAP[assetUpper];
     if (!entry) {
@@ -46022,15 +46021,69 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
         return { ok: false, error: `No treasury address available for ${assetUpper}` };
     }
 
+    /* ------------------------------------------------------------------
+     * Resolve the source derivation path.
+     *
+     * Priority:
+     *   1) The stored derivation path on the DepositAddress / Web3DepositAddress
+     *   2) Deterministically re-derive it from platformWallet using the owner
+     *
+     * EVM addresses are stored checksummed, so the DB lookup MUST be
+     * case-insensitive. XRP / TRON / Solana / UTXO are case-sensitive.
+     * ---------------------------------------------------------------- */
+    const isEvm = entry.type === 'evm';
+    const addressQuery = isEvm
+        ? { $regex: `^${String(address).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' }
+        : address;
+
+    let derivationPath = null;
+    let ownerUserId = null;
+
+    try {
+        const depositRecord = await DepositAddress.findOne({
+            asset: assetUpper.toLowerCase(),
+            address: addressQuery,
+            isActive: true
+        }).select('derivationPath userId address').lean();
+
+        if (depositRecord) {
+            derivationPath = depositRecord.derivationPath || null;
+            ownerUserId = depositRecord.userId || null;
+        } else {
+            const w3Record = await Web3DepositAddress.findOne({
+                asset: assetUpper,
+                address: addressQuery,
+                isActive: true
+            }).select('user address').lean();
+
+            if (w3Record) {
+                ownerUserId = w3Record.user || null;
+            }
+        }
+    } catch (lookupErr) {
+        console.warn('[sweep] deposit address lookup failed:', lookupErr.message);
+    }
+
+    if (!derivationPath && ownerUserId && typeof platformWallet.getDerivationPath === 'function') {
+        try {
+            derivationPath = platformWallet.getDerivationPath(assetUpper, ownerUserId.toString());
+            console.log(`[sweep] re-derived path for ${assetUpper} ${address}: ${derivationPath}`);
+        } catch (deriveErr) {
+            console.warn('[sweep] fallback derivation failed:', deriveErr.message);
+        }
+    }
+
+    if (!derivationPath) {
+        return {
+            ok: false,
+            error: `Cannot resolve derivation path for ${assetUpper} address ${address}. ` +
+                   `No DepositAddress record with derivationPath and no userId to re-derive from.`
+        };
+    }
+
     try {
         const operationId = `auto-sweep-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
 
-        // The existing manual sweep endpoint is admin-gated. To avoid adding
-        // routes, we drive the same pipeline (prepare → approve → sign →
-        // broadcast) through the platformWallet primitives directly.
-        //
-        // Because this is an automated internal call, we use a synthetic
-        // "system" admin identity for audit purposes only.
         const op = {
             operationId,
             operationType: 'sweep',
@@ -46038,7 +46091,7 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
             walletCollection: 'DepositAddress',
             sourceScope: 'user',
             sourceAddress: address,
-            derivationPath: null,
+            derivationPath,
             networkId: entry.network,
             chainId: entry.chainId,
             chainType: entry.type,
@@ -46053,27 +46106,16 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
             preview: null
         };
 
-        // Persist the operation for audit
         await wmStoreOperation(operationId, op);
 
-        // Resolve a derivation path if this is a user-derived address
-        const depositAddress = await DepositAddress.findOne({
-            asset: assetUpper.toLowerCase(),
-            address: address.toLowerCase(),
-            isActive: true
-        }).lean();
-        if (depositAddress && depositAddress.derivationPath) {
-            op.derivationPath = depositAddress.derivationPath;
-        }
-        await wmUpdateOperation(operationId, op);
-
-        // Broadcast via the same internal broadcaster used by the
-        // admin wallet-management router. This keeps a single code path.
         const broadcastResult = await broadcastSweepOperation(op);
         if (!broadcastResult || !broadcastResult.txHash) {
-            return { ok: false, error: broadcastResult && broadcastResult.error
-                ? broadcastResult.error
-                : 'Broadcast returned no tx hash' };
+            return {
+                ok: false,
+                error: broadcastResult && broadcastResult.error
+                    ? broadcastResult.error
+                    : 'Broadcast returned no tx hash'
+            };
         }
 
         return { ok: true, txHash: broadcastResult.txHash, operationId };
@@ -46089,7 +46131,6 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
 
 
 
-
 async function broadcastSweepOperation(operation) {
     const assetUpper = operation.asset;
     const entry = ASSET_NETWORK_MAP[assetUpper];
@@ -46097,10 +46138,36 @@ async function broadcastSweepOperation(operation) {
 
     try {
         /* ---------------- EVM (native or ERC-20) ---------------- */
-        if (entry.type === 'evm') {
-            const rpcUrl = RPC_PROVIDERS[entry.network];
-            if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
-            if (!operation.derivationPath) return { error: 'Missing derivation path for EVM sweep' };
+       if (entry.type === 'evm') {
+    const rpcUrl = RPC_PROVIDERS[entry.network];
+    if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
+
+    if (!operation.derivationPath) {
+        return { error: `Missing derivation path for EVM sweep (${assetUpper}, ${operation.sourceAddress})` };
+    }
+
+    if (!platformWallet || typeof platformWallet.isTreasuryReady !== 'function' || !platformWallet.isTreasuryReady()) {
+        return { error: 'Treasury wallet is disabled' };
+    }
+    if (!platformWallet.treasuryRoot) {
+        return { error: 'Treasury root not initialized' };
+    }
+
+    let child;
+    try {
+        child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+    } catch (deriveErr) {
+        return { error: `Invalid derivation path "${operation.derivationPath}": ${deriveErr.message}` };
+    }
+
+    const provider = new ethers.JsonRpcProvider(rpcUrl, entry.chainId, { staticNetwork: true });
+    const signer = new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
+
+    if (signer.address.toLowerCase() !== String(operation.sourceAddress).toLowerCase()) {
+        return {
+            error: `Derivation mismatch for EVM source: derived ${signer.address}, expected ${operation.sourceAddress} (path ${operation.derivationPath})`
+        };
+    }
 
             if (!platformWallet || !platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
                 return { error: 'Treasury wallet is disabled' };
@@ -46364,9 +46431,145 @@ async function sendAdminDepositEmail({ user, assetUpper, cryptoAmount, usdValue,
     }
 }
 
-/**
- * Dedicated admin-only email for the sweep lifecycle.
- */
+
+
+
+
+
+
+/* ============================================================================
+ * sendUserDepositCreditEmail
+ * ----------------------------------------------------------------------------
+ * Branded "deposit credited to your main wallet" email.
+ * Called by creditConfirmedDeposit() in the deposit monitor.
+ * Never throws — errors are logged and swallowed so a broken SMTP relay
+ * cannot block the credit pipeline.
+ * ========================================================================== */
+async function sendUserDepositCreditEmail({
+    user,
+    assetUpper,
+    cryptoAmount,
+    usdValue,
+    price,
+    txHash,
+    networkName,
+    newBalance,
+    reference
+}) {
+    if (!user || !user.email) return;
+
+    try {
+        const cryptoLogoUrl = getCryptoLogo(assetUpper);
+        const formattedCrypto = cryptoAmount.toLocaleString(undefined, {
+            minimumFractionDigits: 8, maximumFractionDigits: 8
+        });
+        const formattedUsd = usdValue.toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2
+        });
+        const formattedRate = (price || 0).toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2
+        });
+        const formattedBalance = (newBalance || 0).toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2
+        });
+        const ts = new Date().toLocaleString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            timeZoneName: 'short'
+        });
+
+        const explorerUrl = `${(ASSET_NETWORK_MAP[assetUpper] || {}).explorer || ''}${txHash}`;
+
+        const html = `
+          <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
+            <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
+              <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
+              <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
+              <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+            </div>
+
+            <div style="padding: 30px; background: #FFFFFF;">
+              <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
+                <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
+                  <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
+                    <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </div>
+                <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT CONFIRMED!</h2>
+                <p style="color: #065F46; font-size: 13px; margin: 0;">Your funds have been successfully credited</p>
+              </div>
+
+              <p style="color: #333333; line-height: 1.6;">Dear <strong>${escapeHtml(user.firstName || 'Valued Customer')}</strong>,</p>
+              <p style="color: #333333; line-height: 1.6;">Great news! Your deposit has been confirmed on the blockchain and credited to your <strong style="color: #10B981;">Main Wallet</strong>.</p>
+
+              <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
+                <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
+                  <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
+                  <div>
+                    <div style="font-weight: bold; font-size: 18px;">+ ${formattedCrypto} ${escapeHtml(assetUpper)}</div>
+                    <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsd} USD</div>
+                  </div>
+                </div>
+                <table style="width: 100%; border-collapse: collapse;">
+                  <tr><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${escapeHtml(assetUpper)} = $${formattedRate}</td></tr>
+                  <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(networkName || '')}</td></tr>
+                  <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${escapeHtml(txHash || '')}</td></tr>
+                  <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace; font-size: 11px;">${escapeHtml(reference || '')}</td></tr>
+                  <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>New Main Balance:</strong></td><td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">$${formattedBalance}</td></tr>
+                  <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Credited At:</strong></td><td style="padding: 8px 0; text-align: right;">${ts}</td></tr>
+                </table>
+              </div>
+
+              ${explorerUrl ? `<div style="text-align: center; margin: 20px 0;"><a href="${explorerUrl}" target="_blank" style="color: #F7A600; text-decoration: none;">🔍 View on Blockchain Explorer</a></div>` : ''}
+
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Dashboard</a>
+              </div>
+
+              <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${ts}</p>
+            </div>
+
+            <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
+              <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+              <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+              <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
+                <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> |
+                <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
+              </p>
+            </div>
+          </div>
+        `;
+
+        await infoTransporter.sendMail({
+            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+            to: user.email,
+            subject: `✅ Deposit Credited: ${formattedCrypto} ${assetUpper} — ₿itHash Capital`,
+            html
+        });
+
+        console.log(`📧 [deposit-credit] user email sent to ${user.email} for tx ${txHash}`);
+    } catch (err) {
+        console.error('[deposit-credit] user email failed:', err.message);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async function sendAdminSweepEmail({ user, assetUpper, cryptoAmount, treasuryAddress, sweepStatus, sweepTxHash, sweepError, networkName }) {
     const cryptoLogoUrl = getCryptoLogo(assetUpper);
     const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
@@ -47001,15 +47204,7 @@ async function processDetectedIncoming({ assetUpper, entry, address, tx, require
 		
 		
 		
-		// Inside processDetectedIncoming(), right before creating the Transaction:
-const existingPending = await DepositAsset.findOne({
-    'metadata.txHash': tx.txHash,
-    status: 'pending'
-}).lean();
-if (existingPending) {
-    result.skipped = 'pending_in_monitor';
-    return result;
-}
+
 		
 
         await Transaction.updateOne(
