@@ -46169,16 +46169,7 @@ async function broadcastSweepOperation(operation) {
         };
     }
 
-            if (!platformWallet || !platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
-                return { error: 'Treasury wallet is disabled' };
-            }
-            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
-            const provider = new ethers.JsonRpcProvider(rpcUrl, entry.chainId, { staticNetwork: true });
-            const signer = new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
 
-            if (signer.address.toLowerCase() !== String(operation.sourceAddress).toLowerCase()) {
-                return { error: 'Derivation mismatch for EVM source address' };
-            }
             await wmAssertChainId(provider, entry.chainId, assetUpper);
 
             const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
