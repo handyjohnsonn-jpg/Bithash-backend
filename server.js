@@ -264,6 +264,25 @@ redis.on('connect', () => {
 });
 
 
+if (typeof global.escapeHtml !== 'function') {
+    global.escapeHtml = function (s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    };
+}
+const escapeHtml = global.escapeHtml;
+
+
+
+
+
+
+
+
 /* ============================================================================
  * BULLMQ CONNECTION FACTORY
  * ----------------------------------------------------------------------------
@@ -35845,19 +35864,6 @@ async function markDepositFailed(dep, assetUpper, txHash, reason, chainState) {
 
 
 
-
-/* ============================================================================
- * GET /api/deposit/monitor
- * ----------------------------------------------------------------------------
- * Read-only status of a pending deposit. Polled by the frontend.
- *
- * NEVER emails. NEVER credits. NEVER sweeps. NEVER modifies state except
- * to refresh the cached confirmation count on the Transaction and
- * DepositAsset so the UI can show live progress.
- *
- * The actual credit + sweep is performed by startDepositMonitor()
- * running server-side (see Step 3).
- * ========================================================================== */
 app.get('/api/deposit/monitor', protect, async (req, res) => {
     try {
         const userId = req.user._id;
@@ -36261,14 +36267,21 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
 
-        if (!txStatus || txStatus.error) {
+        if (txStatus && txStatus.failed === true) {
             return res.status(400).json({
                 status: 'fail',
-                message: (txStatus && txStatus.error) || 'Transaction could not be verified on-chain'
+                message: 'The transaction failed on-chain and cannot be credited'
             });
         }
-        if (txStatus.failed === true) {
-            return res.status(400).json({ status: 'fail', message: 'The transaction failed on-chain' });
+
+        // A tx that is not yet mined is NOT an error. It is pending
+        // confirmation. We accept it, create the pending DepositAsset,
+        // and let the deposit watcher pick it up.
+        if (txStatus && txStatus.error && !txStatus.pending) {
+            return res.status(400).json({
+                status: 'fail',
+                message: txStatus.error
+            });
         }
 
         /* --- 8. Resolve & cross-check amount ------------------------- */
@@ -36424,25 +36437,140 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             console.error('[deposit/confirm] audit failed:', logErr.message);
         }
 
-        /* --- 13. Fire-and-forget: "awaiting confirmations" emails ---- */
+                /* --- 13. Fire-and-forget: "awaiting confirmations" emails ---- */
         setImmediate(() => {
-            dispatchDepositDetectedEmails({
-                user,
-                assetUpper,
-                creditedAmount,
-                usdValue,
-                currentPrice,
-                txHash: normalizedTxHash,
-                depositAddress,
-                walletAddress: walletAddress || user.web3Wallet?.address || null,
-                networkName,
-                networkInfo,
-                txStatus,
-                requiredConfirmations,
-                manualReference,
-                submittedAt,
-                req
-            }).catch((e) => console.error('[deposit/confirm] bg failed:', e));
+            (async () => {
+                try {
+                    const userDoc = user;
+                    const cryptoLogoUrl = getCryptoLogo(assetUpper);
+                    const formattedAmount = creditedAmount.toLocaleString(undefined, {
+                        minimumFractionDigits: 8,
+                        maximumFractionDigits: 8
+                    });
+                    const formattedUsd = usdValue.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+                    const formattedPrice = currentPrice.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+                    const submittedAt = new Date().toLocaleString('en-US', {
+                        year: 'numeric', month: 'long', day: 'numeric',
+                        hour: '2-digit', minute: '2-digit', second: '2-digit',
+                        timeZoneName: 'short'
+                    });
+                    const explorerUrl = `${(ASSET_NETWORK_MAP[assetUpper] || {}).explorer || ''}${normalizedTxHash}`;
+
+                    /* ---- User email ---- */
+                    try {
+                        await infoTransporter.sendMail({
+                            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
+                            to: userDoc.email,
+                            subject: `💰 Incoming ${assetUpper} Deposit Detected — ₿itHash Capital`,
+                            html: `
+                                <div style="font-family:'Inter',sans-serif;max-width:600px;margin:0 auto;background:#FFFFFF;">
+                                  <div style="text-align:center;padding:30px 20px;background:linear-gradient(135deg,#0B0E11 0%,#11151C 100%);">
+                                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" style="width:60px;height:60px;margin-bottom:15px;">
+                                    <h1 style="color:#FFF;font-size:28px;margin:0;font-weight:bold;">₿itHash</h1>
+                                    <p style="color:#B7BDC6;font-size:14px;margin:10px 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
+                                  </div>
+                                  <div style="padding:30px;background:#FFF;">
+                                    <div style="background:#FEF3C7;border-radius:12px;padding:16px 20px;text-align:center;margin-bottom:25px;">
+                                      <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius:50%;margin-bottom:8px;">
+                                      <h2 style="color:#F7A600;font-size:20px;margin:0 0 4px;font-weight:700;">INCOMING TRANSACTION DETECTED</h2>
+                                      <p style="color:#92400E;font-size:13px;margin:0;">Your deposit is being confirmed on the blockchain</p>
+                                    </div>
+                                    <p style="color:#333;line-height:1.6;">Dear <strong>${userDoc.firstName || 'Valued Customer'}</strong>,</p>
+                                    <p style="color:#333;line-height:1.6;">We detected an incoming <strong>${assetUpper}</strong> deposit. It is awaiting network confirmations.</p>
+                                    <div style="background:#F5F5F5;padding:20px;border-radius:12px;margin:20px 0;">
+                                      <div style="display:flex;gap:12px;padding-bottom:12px;border-bottom:1px solid #E2E8F0;margin-bottom:12px;">
+                                        <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius:50%;">
+                                        <div>
+                                          <div style="font-weight:bold;font-size:18px;">${formattedAmount} ${assetUpper}</div>
+                                          <div style="color:#64748B;font-size:12px;">≈ $${formattedUsd} USD</div>
+                                        </div>
+                                      </div>
+                                      <table style="width:100%;border-collapse:collapse;">
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Exchange Rate:</strong></td><td style="padding:8px 0;text-align:right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Network:</strong></td><td style="padding:8px 0;text-align:right;">${escapeHtml(networkName || '')}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Deposit Address:</strong></td><td style="padding:8px 0;text-align:right;font-size:11px;word-break:break-all;">${escapeHtml(depositAddress)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Transaction ID:</strong></td><td style="padding:8px 0;text-align:right;font-size:11px;word-break:break-all;">${escapeHtml(normalizedTxHash)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Reference:</strong></td><td style="padding:8px 0;text-align:right;font-family:monospace;font-size:11px;">${escapeHtml(manualReference)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Confirmations:</strong></td><td style="padding:8px 0;text-align:right;">${txStatus.confirmations || 0} / ${requiredConfirmations}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Status:</strong></td><td style="padding:8px 0;text-align:right;"><span style="background:#F7A600;color:#000;padding:2px 10px;border-radius:20px;font-size:12px;">Pending Confirmation</span></td></tr>
+                                      </table>
+                                    </div>
+                                    <div style="background:#FEF3C7;border-left:4px solid #F7A600;padding:16px 20px;border-radius:8px;margin:20px 0;">
+                                      <p style="color:#92400E;margin:0 0 8px;font-weight:600;">ⓘ What Happens Next?</p>
+                                      <p style="color:#78350F;margin:0;font-size:14px;">Your deposit will be credited to your Main Wallet once it reaches ${requiredConfirmations} confirmations and is approved. This typically takes a few minutes.</p>
+                                    </div>
+                                    ${explorerUrl ? `<div style="text-align:center;margin:20px 0;"><a href="${explorerUrl}" target="_blank" style="color:#F7A600;text-decoration:none;">🔍 View on Blockchain Explorer</a></div>` : ''}
+                                    <div style="text-align:center;margin:30px 0;"><a href="https://www.bithashcapital.live/dashboard" style="background:#F7A600;color:#000;padding:12px 30px;text-decoration:none;border-radius:999px;font-weight:600;display:inline-block;">Track Your Deposit</a></div>
+                                    <p style="color:#666;font-size:12px;margin-top:30px;">Email sent: ${submittedAt}</p>
+                                  </div>
+                                  <div style="text-align:center;padding:20px;background:#0B0E11;border-top:1px solid #1E2329;">
+                                    <p style="color:#6C7480;font-size:12px;margin:5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
+                                    <p style="color:#6C7480;font-size:12px;margin:5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
+                                  </div>
+                                </div>
+                            `
+                        });
+                        console.log(`[deposit/confirm] user pending email sent to ${userDoc.email} for tx ${normalizedTxHash}`);
+                    } catch (e) {
+                        console.error('[deposit/confirm] user pending email failed:', e.message);
+                    }
+
+                    /* ---- Admin email ---- */
+                    try {
+                        await supportTransporter.sendMail({
+                            from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
+                            to: 'thieretw@gmail.com',
+                            subject: `⏳ Pending Deposit Detected: ${userDoc.firstName || ''} ${userDoc.lastName || ''} +${formattedAmount} ${assetUpper}`,
+                            html: `
+                                <div style="font-family:'Inter',sans-serif;max-width:600px;margin:0 auto;background:#FFFFFF;">
+                                  <div style="text-align:center;padding:30px 20px;background:linear-gradient(135deg,#0B0E11 0%,#11151C 100%);">
+                                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" style="width:60px;height:60px;margin-bottom:15px;">
+                                    <h1 style="color:#FFF;font-size:28px;margin:0;font-weight:bold;">₿itHash</h1>
+                                  </div>
+                                  <div style="padding:30px;background:#FFF;">
+                                    <div style="background:#EFF6FF;border-radius:12px;padding:16px 20px;text-align:center;margin-bottom:25px;">
+                                      <h2 style="color:#3B82F6;font-size:20px;margin:0 0 4px;font-weight:700;">PENDING DEPOSIT DETECTED</h2>
+                                      <p style="color:#1E40AF;font-size:13px;margin:0;">${escapeHtml(userDoc.firstName || '')} ${escapeHtml(userDoc.lastName || '')} — awaiting on-chain confirmation</p>
+                                    </div>
+                                    <p style="color:#333;line-height:1.6;">A pending deposit has been submitted. No admin action is required yet — this is an informational alert.</p>
+                                    <div style="background:#F5F5F5;padding:20px;border-radius:12px;margin:20px 0;">
+                                      <table style="width:100%;border-collapse:collapse;">
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>User:</strong></td><td style="padding:8px 0;text-align:right;">${escapeHtml(userDoc.firstName || '')} ${escapeHtml(userDoc.lastName || '')} (${escapeHtml(userDoc.email || '')})</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Asset:</strong></td><td style="padding:8px 0;text-align:right;"><img src="${cryptoLogoUrl}" width="16" height="16" style="border-radius:50%;vertical-align:middle;"> ${escapeHtml(assetUpper)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Amount:</strong></td><td style="padding:8px 0;text-align:right;">${formattedAmount} ${assetUpper} (≈ $${formattedUsd})</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Exchange Rate:</strong></td><td style="padding:8px 0;text-align:right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Network:</strong></td><td style="padding:8px 0;text-align:right;">${escapeHtml(networkName || '')}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Deposit Address:</strong></td><td style="padding:8px 0;text-align:right;font-size:11px;word-break:break-all;">${escapeHtml(depositAddress)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Transaction ID:</strong></td><td style="padding:8px 0;text-align:right;font-size:11px;word-break:break-all;">${escapeHtml(normalizedTxHash)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Reference:</strong></td><td style="padding:8px 0;text-align:right;font-family:monospace;font-size:11px;">${escapeHtml(manualReference)}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Confirmations:</strong></td><td style="padding:8px 0;text-align:right;">${txStatus.confirmations || 0} / ${requiredConfirmations}</td></tr>
+                                        <tr style="border-top:1px solid #E2E8F0;"><td style="padding:8px 0;"><strong>Detected At:</strong></td><td style="padding:8px 0;text-align:right;">${submittedAt}</td></tr>
+                                      </table>
+                                    </div>
+                                    ${explorerUrl ? `<div style="background:#FEF3C7;border-left:4px solid #F7A600;padding:16px 20px;border-radius:8px;margin:20px 0;"><p style="color:#92400E;margin:0 0 8px;font-weight:600;">ⓘ Verify on chain</p><p style="color:#78350F;margin:0;font-size:13px;">🔍 <a href="${explorerUrl}" target="_blank" style="color:#F7A600;">View on Blockchain Explorer</a></p></div>` : ''}
+                                    <div style="text-align:center;margin:30px 0;"><a href="https://www.bithashcapital.live/admin/deposits/pending" style="background:#F7A600;color:#000;padding:12px 30px;text-decoration:none;border-radius:999px;font-weight:600;display:inline-block;">Review Pending Deposits</a></div>
+                                    <p style="color:#666;font-size:12px;margin-top:30px;">Alert sent: ${submittedAt}</p>
+                                  </div>
+                                </div>
+                            `
+                        });
+                        console.log(`[deposit/confirm] admin pending email sent for tx ${normalizedTxHash}`);
+                    } catch (e) {
+                        console.error('[deposit/confirm] admin pending email failed:', e.message);
+                    }
+
+                    /* ---- One-time notify guard so the background watcher does not double-send ---- */
+                    try { await markPendingNotified(normalizedTxHash); } catch (_) {}
+                } catch (bgErr) {
+                    console.error('[deposit/confirm] pending email bg failed:', bgErr);
+                }
+            })();
         });
 
         /* --- 14. Respond -------------------------------------------- */
@@ -45237,16 +45365,101 @@ const DEPOSIT_LIMITS = {
 async function checkEVMTx(txHash, rpcUrl, requiredConfirmations = 12) {
     try {
         const provider = new ethers.JsonRpcProvider(rpcUrl);
-        
-        const tx = await provider.getTransaction(txHash);
+
+        // 1. Look up the transaction. If it truly does not exist yet,
+        //    return "pending" instead of an error so the caller does
+        //    not abort. A freshly broadcast tx may take 2-30s to
+        //    propagate to the RPC.
+        let tx = null;
+        try {
+            tx = await provider.getTransaction(txHash);
+        } catch (err) {
+            tx = null;
+        }
+
         if (!tx) {
-            return { confirmed: false, confirmations: 0, requiredConfirmations, error: 'Transaction not found' };
+            return {
+                confirmed: false,
+                pending: true,
+                confirmations: 0,
+                requiredConfirmations,
+                error: null,
+                reason: 'Transaction not yet visible on this RPC',
+                failed: false
+            };
         }
-        
-        const receipt = await provider.getTransactionReceipt(txHash);
+
+        // 2. Look up the receipt. Ethers v6 returns null until the tx
+        //    is mined. We DO NOT treat null as an error. The deposit
+        //    watcher will keep polling.
+        let receipt = null;
+        try {
+            receipt = await provider.getTransactionReceipt(txHash);
+        } catch (err) {
+            receipt = null;
+        }
+
         if (!receipt) {
-            return { confirmed: false, confirmations: 0, requiredConfirmations, error: 'Receipt not found' };
+            return {
+                confirmed: false,
+                pending: true,
+                confirmations: 0,
+                requiredConfirmations,
+                blockNumber: null,
+                blockHash: null,
+                status: 'pending',
+                to: tx.to,
+                from: tx.from,
+                value: tx.value ? ethers.formatEther(tx.value) : '0',
+                gasUsed: '0',
+                error: null,
+                reason: 'Receipt not yet available (tx likely unmined)',
+                failed: false
+            };
         }
+
+        // 3. Receipt exists. Check success / confirmations.
+        if (receipt.status !== 1) {
+            return {
+                confirmed: false,
+                confirmations: 0,
+                requiredConfirmations,
+                failed: true,
+                status: 'failed',
+                error: 'Transaction reverted on-chain'
+            };
+        }
+
+        const currentBlock = await provider.getBlockNumber().catch(() => receipt.blockNumber);
+        const confirmations = Math.max(0, currentBlock - receipt.blockNumber);
+
+        return {
+            confirmed: confirmations >= requiredConfirmations,
+            pending: confirmations < requiredConfirmations,
+            confirmations,
+            requiredConfirmations,
+            blockNumber: receipt.blockNumber,
+            blockHash: receipt.blockHash,
+            status: 'success',
+            to: receipt.to,
+            from: tx.from,
+            value: tx.value ? ethers.formatEther(tx.value) : '0',
+            gasUsed: receipt.gasUsed ? receipt.gasUsed.toString() : '0',
+            error: null,
+            failed: false
+        };
+    } catch (error) {
+        console.error('EVM check error:', error.message);
+        return {
+            confirmed: false,
+            pending: true,
+            confirmations: 0,
+            requiredConfirmations,
+            error: error.message || 'EVM RPC error',
+            failed: false
+        };
+    }
+}
         
         if (receipt.status !== 1) {
             return { confirmed: false, confirmations: 0, requiredConfirmations, failed: true, error: 'Transaction failed' };
@@ -45796,36 +46009,36 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
     }
 }
 
-/**
- * Internal broadcaster for automated sweeps. Mirrors the sign+broadcast
- * logic in the wallet-management router but operates on the platform
- * wallet primitives directly. Kept here so we do NOT add routes.
- */
+
+
+
+
+
+
+
+
 async function broadcastSweepOperation(operation) {
     const assetUpper = operation.asset;
     const entry = ASSET_NETWORK_MAP[assetUpper];
     if (!entry) return { error: `Unsupported asset: ${assetUpper}` };
 
-    // For EVM chains and Solana we can sign+broadcast in-process.
-    // For UTXO we rely on the existing wmSignAndBroadcast helper.
-    // For XRP/TRON/Polkadot/Aptos we use the existing helpers.
-
     try {
-        // EVM path
+        /* ---------------- EVM (native or ERC-20) ---------------- */
         if (entry.type === 'evm') {
             const rpcUrl = RPC_PROVIDERS[entry.network];
             if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
+            if (!operation.derivationPath) return { error: 'Missing derivation path for EVM sweep' };
 
-            if (!operation.derivationPath) {
-                return { error: 'Missing derivation path for EVM sweep' };
+            if (!platformWallet || !platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
             }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const provider = new ethers.JsonRpcProvider(rpcUrl, entry.chainId, { staticNetwork: true });
+            const signer = new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
 
-            const signer = wmGetUserEvmSigner(operation.derivationPath, entry.chainId, rpcUrl);
-            if (signer.address.toLowerCase() !== operation.sourceAddress.toLowerCase()) {
+            if (signer.address.toLowerCase() !== String(operation.sourceAddress).toLowerCase()) {
                 return { error: 'Derivation mismatch for EVM source address' };
             }
-
-            const provider = signer.provider;
             await wmAssertChainId(provider, entry.chainId, assetUpper);
 
             const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
@@ -45833,12 +46046,12 @@ async function broadcastSweepOperation(operation) {
 
             const feeData = await provider.getFeeData();
             const priority = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
-            let baseFee = feeData.maxFeePerGas || feeData.gasPrice;
+            let base = feeData.maxFeePerGas || feeData.gasPrice;
             try {
                 const latest = await provider.getBlock('latest');
-                if (latest && latest.baseFeePerGas) baseFee = latest.baseFeePerGas;
+                if (latest && latest.baseFeePerGas) base = latest.baseFeePerGas;
             } catch (_) {}
-            const maxFeePerGas = (baseFee * 2n) + priority;
+            const maxFeePerGas = (base * 2n) + priority;
             const maxPriorityFeePerGas = priority > maxFeePerGas ? maxFeePerGas : priority;
 
             let gasLimit;
@@ -45850,34 +46063,22 @@ async function broadcastSweepOperation(operation) {
                 const iface = new ethers.Interface(WM_ERC20_ABI);
                 data = iface.encodeFunctionData('transfer', [
                     operation.destinationAddress,
-                    ethers.parseUnits(operation.amount, tokenCfg.decimals)
+                    ethers.parseUnits(String(operation.amount), tokenCfg.decimals)
                 ]);
                 to = tokenCfg.contract;
                 try {
-                    const est = await provider.estimateGas({
-                        from: operation.sourceAddress, to, data, value: 0n
-                    });
+                    const est = await provider.estimateGas({ from: signer.address, to, data, value: 0n });
                     gasLimit = (est * 120n) / 100n;
                 } catch (_) { gasLimit = 65000n; }
             } else {
-                const requested = ethers.parseUnits(String(operation.amount), 18);
-                const balance = await provider.getBalance(operation.sourceAddress);
-                const approxFee = 21000n * maxFeePerGas;
-                if (balance <= approxFee) {
-                    return { error: 'Insufficient native balance for gas' };
-                }
-                value = requested;
+                value = ethers.parseUnits(String(operation.amount), 18);
                 gasLimit = 21000n;
             }
 
             const txRequest = {
                 chainId: entry.chainId,
-                to,
-                value,
-                data,
-                gasLimit,
-                maxFeePerGas,
-                maxPriorityFeePerGas,
+                to, value, data, gasLimit,
+                maxFeePerGas, maxPriorityFeePerGas,
                 type: 2,
                 nonce: await signer.getNonce('pending')
             };
@@ -45887,9 +46088,13 @@ async function broadcastSweepOperation(operation) {
             return { txHash: response.hash };
         }
 
-        // Solana path
+        /* ---------------- Solana ---------------- */
         if (entry.type === 'solana') {
-            const keypair = wmGetSolanaKeypair(operation.derivationPath, 'user');
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const keypair = Keypair.fromSeed(child.privateKey.slice(0, 32));
             if (keypair.publicKey.toBase58() !== operation.sourceAddress) {
                 return { error: 'Derivation mismatch for Solana source address' };
             }
@@ -45910,24 +46115,31 @@ async function broadcastSweepOperation(operation) {
             return { txHash: sig };
         }
 
-        // UTXO path
+        /* ---------------- UTXO ---------------- */
         if (entry.type === 'utxo') {
             const result = await wmSignAndBroadcast({
                 assetUpper,
                 derivationPath: operation.derivationPath,
                 fromAddress: operation.sourceAddress,
                 toAddress: operation.destinationAddress,
-                amount: operation.amount,
+                amount: String(operation.amount),
                 memo: operation.memo,
-                scope: 'user'
+                scope: 'treasury'
             });
             return { txHash: result.txHash };
         }
 
-        // XRP path
+        /* ---------------- XRP ---------------- */
         if (entry.type === 'xrp') {
-            const { wallet, derivedAddress } = wmGetXrpWallet(operation.derivationPath, 'user');
-            if (derivedAddress !== operation.sourceAddress) {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const wallet = new xrpl.Wallet(
+                child.publicKey.toString('hex'),
+                child.privateKey.toString('hex').toUpperCase()
+            );
+            if (wallet.classicAddress !== operation.sourceAddress) {
                 return { error: 'Derivation mismatch for XRP source address' };
             }
             const client = new xrpl.Client(RPC_PROVIDERS.XRP);
@@ -45943,17 +46155,25 @@ async function broadcastSweepOperation(operation) {
                 const signed = wallet.sign(prepared);
                 const res = await client.submitAndWait(signed.tx_blob);
                 const meta = res.result && res.result.meta;
-                const ok = typeof meta === 'object' ? meta.TransactionResult === 'tesSUCCESS' : false;
-                if (!ok) return { error: `XRP sweep failed: ${(meta && meta.TransactionResult) || 'unknown'}` };
+                if (!meta || meta.TransactionResult !== 'tesSUCCESS') {
+                    return { error: `XRP sweep failed: ${(meta && meta.TransactionResult) || 'unknown'}` };
+                }
                 return { txHash: res.result.hash };
             } finally {
                 try { await client.disconnect(); } catch (_) {}
             }
         }
 
-        // TRON path
+        /* ---------------- TRON ---------------- */
         if (entry.type === 'tron') {
-            const { tronWeb, privHex, address } = wmGetTronAccount(operation.derivationPath, 'user');
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const privHex = child.privateKey.toString('hex');
+            const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+            tronWeb.setPrivateKey(privHex);
+            const address = TronWeb.address.fromPrivateKey(privHex);
             if (address !== operation.sourceAddress) {
                 return { error: 'Derivation mismatch for TRON source address' };
             }
@@ -45967,12 +46187,13 @@ async function broadcastSweepOperation(operation) {
             return { txHash: res.txid || signed.txID };
         }
 
-        // Polkadot
+        /* ---------------- Polkadot ---------------- */
         if (entry.type === 'polkadot') {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
             const api = await wmGetPolkadotApi();
-            const root = platformWallet.root;
-            if (!root) return { error: 'User wallet root not initialized' };
-            const child = root.derivePath(operation.derivationPath);
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
             const keyring = new Keyring({ type: 'sr25519' });
             const pair = keyring.addFromSeed(child.privateKey);
             if (pair.address !== operation.sourceAddress) {
@@ -45987,97 +46208,22 @@ async function broadcastSweepOperation(operation) {
             return { txHash: hash.toHex() };
         }
 
-        // Cardano (ADA) — no in-process broadcaster here; return an error
-        // so the sweep is left for the admin wallet-management UI.
-        if (entry.type === 'cardano') {
-            return { error: 'Automated Cardano sweeps require admin wallet-management action.' };
-        }
-
         return { error: `Automated sweep not implemented for chain type: ${entry.type}` };
     } catch (err) {
+        console.error('[sweep] broadcast error:', err.message);
         return { error: err.message || 'Broadcast failed' };
     }
 }
 
-/**
- * Branded deposit-credit email to the user.
- * Uses the same visual language as the existing professional email templates.
- */
-async function sendUserDepositCreditEmail({ user, assetUpper, cryptoAmount, usdValue, price, txHash, networkName, newBalance, reference }) {
-    const cryptoLogoUrl = getCryptoLogo(assetUpper);
-    const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
-    const formattedUsd = usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const formattedPrice = (price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const formattedNewBalance = (newBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const ts = new Date().toLocaleString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
 
-    const html = `
-      <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-        <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-          <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-          <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-          <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-        </div>
-        <div style="padding: 30px; background: #FFFFFF;">
-          <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-            <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-              <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
-            <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">DEPOSIT CONFIRMED</h2>
-            <p style="color: #065F46; font-size: 13px; margin: 0;">Your funds have been credited to your Main Wallet</p>
-          </div>
-          <p style="color: #333333; line-height: 1.6;">Dear <strong>${user.firstName || 'Valued Customer'}</strong>,</p>
-          <p style="color: #333333; line-height: 1.6;">Great news! Your on-chain ${assetUpper} deposit has been detected, confirmed, and credited to your Main Wallet.</p>
-          <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-            <div style="display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #E2E8F0; margin-bottom: 12px;">
-              <img src="${cryptoLogoUrl}" width="32" height="32" style="border-radius: 50%;">
-              <div>
-                <div style="font-weight: bold; font-size: 18px;">+ ${formattedCrypto} ${assetUpper}</div>
-                <div style="color: #64748B; font-size: 12px;">≈ $${formattedUsd} USD</div>
-              </div>
-            </div>
-            <table style="width: 100%; border-collapse: collapse;">
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Exchange Rate:</strong></td><td style="padding: 8px 0; text-align: right;">1 ${assetUpper} = $${formattedPrice}</td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Network:</strong></td><td style="padding: 8px 0; text-align: right;">${escapeHtml(networkName || '')}</td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Wallet Credited:</strong></td><td style="padding: 8px 0; text-align: right;"><span style="background: #10B981; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px;">Main Wallet</span></td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Transaction ID:</strong></td><td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${escapeHtml(txHash || '')}</td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Reference:</strong></td><td style="padding: 8px 0; text-align: right; font-family: monospace; font-size: 11px;">${escapeHtml(reference || '')}</td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>New Main Wallet Balance:</strong></td><td style="padding: 8px 0; text-align: right; font-weight: bold; color: #10B981;">$${formattedNewBalance}</td></tr>
-              <tr style="border-top: 1px solid #E2E8F0;"><td style="padding: 8px 0;"><strong>Processed At:</strong></td><td style="padding: 8px 0; text-align: right;">${ts}</td></tr>
-            </table>
-          </div>
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="https://www.bithashcapital.live/dashboard" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">View Transaction</a>
-          </div>
-          <p style="color: #666666; font-size: 12px; margin-top: 30px;">Email sent: ${ts}</p>
-        </div>
-        <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-          <p style="color: #6C7480; font-size: 12px; margin: 5px 0;"><a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a></p>
-        </div>
-      </div>
-    `;
 
-    try {
-        await infoTransporter.sendMail({
-            from: `₿itHash Capital <${process.env.EMAIL_INFO_USER}>`,
-            to: user.email,
-            subject: `✅ Deposit Confirmed: +${formattedCrypto} ${assetUpper} - ₿itHash Capital`,
-            html
-        });
-    } catch (e) {
-        console.error('[deposit-watcher] user credit email failed:', e.message);
-    }
-}
 
-/**
- * Branded admin email for deposit credit + sweep lifecycle.
- */
+
+
+
+
+
+
 async function sendAdminDepositEmail({ user, assetUpper, cryptoAmount, usdValue, price, txHash, networkName, reference, sweepStatus, sweepTxHash, sweepError }) {
     const cryptoLogoUrl = getCryptoLogo(assetUpper);
     const formattedCrypto = cryptoAmount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 });
