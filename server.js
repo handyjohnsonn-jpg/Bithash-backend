@@ -46131,6 +46131,17 @@ async function sweepToTreasury({ assetUpper, address, cryptoAmount, txHash, netw
 
 
 
+/* ============================================================================
+ * broadcastSweepOperation
+ * ----------------------------------------------------------------------------
+ * Signs and broadcasts an on-chain sweep from a user deposit address
+ * (or another treasury source) to the destination treasury address.
+ *
+ * Supports: EVM (native + ERC-20), UTXO (BTC/LTC/DOGE), Solana, XRP, TRON,
+ *           Polkadot.
+ *
+ * Returns: { txHash } on success, { error } on failure. Never throws.
+ * ========================================================================== */
 async function broadcastSweepOperation(operation) {
     const assetUpper = operation.asset;
     const entry = ASSET_NETWORK_MAP[assetUpper];
@@ -46138,48 +46149,212 @@ async function broadcastSweepOperation(operation) {
 
     try {
         /* ---------------- EVM (native or ERC-20) ---------------- */
-       if (entry.type === 'evm') {
-    const rpcUrl = RPC_PROVIDERS[entry.network];
-    if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
+        if (entry.type === 'evm') {
+            const rpcUrl = RPC_PROVIDERS[entry.network];
+            if (!rpcUrl) return { error: `No RPC for ${entry.network}` };
 
-    if (!operation.derivationPath) {
-        return { error: `Missing derivation path for EVM sweep (${assetUpper}, ${operation.sourceAddress})` };
-    }
+            if (!operation.derivationPath) {
+                return { error: `Missing derivation path for EVM sweep (${assetUpper}, ${operation.sourceAddress})` };
+            }
 
-    if (!platformWallet || typeof platformWallet.isTreasuryReady !== 'function' || !platformWallet.isTreasuryReady()) {
-        return { error: 'Treasury wallet is disabled' };
-    }
-    if (!platformWallet.treasuryRoot) {
-        return { error: 'Treasury root not initialized' };
-    }
-
-    let child;
-    try {
-        child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
-    } catch (deriveErr) {
-        return { error: `Invalid derivation path "${operation.derivationPath}": ${deriveErr.message}` };
-    }
-
-    const provider = new ethers.JsonRpcProvider(rpcUrl, entry.chainId, { staticNetwork: true });
-    const signer = new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
-
-    if (signer.address.toLowerCase() !== String(operation.sourceAddress).toLowerCase()) {
-        return {
-            error: `Derivation mismatch for EVM source: derived ${signer.address}, expected ${operation.sourceAddress} (path ${operation.derivationPath})`
-        };
-    }
-
-            if (!platformWallet || !platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+            if (!platformWallet || typeof platformWallet.isTreasuryReady !== 'function' || !platformWallet.isTreasuryReady()) {
                 return { error: 'Treasury wallet is disabled' };
             }
-            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            if (!platformWallet.treasuryRoot) {
+                return { error: 'Treasury root not initialized' };
+            }
+
+            let child;
+            try {
+                child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            } catch (deriveErr) {
+                return { error: `Invalid derivation path "${operation.derivationPath}": ${deriveErr.message}` };
+            }
+
             const provider = new ethers.JsonRpcProvider(rpcUrl, entry.chainId, { staticNetwork: true });
             const signer = new ethers.Wallet('0x' + child.privateKey.toString('hex'), provider);
 
             if (signer.address.toLowerCase() !== String(operation.sourceAddress).toLowerCase()) {
-                return { error: 'Derivation mismatch for EVM source address' };
+                return {
+                    error: `Derivation mismatch for EVM source: derived ${signer.address}, expected ${operation.sourceAddress} (path ${operation.derivationPath})`
+                };
             }
+
             await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+            const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
+            const isERC20 = !!(tokenCfg && tokenCfg.contract);
+
+            const feeData = await provider.getFeeData();
+            const priority = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+            let base = feeData.maxFeePerGas || feeData.gasPrice;
+            try {
+                const latest = await provider.getBlock('latest');
+                if (latest && latest.baseFeePerGas) base = latest.baseFeePerGas;
+            } catch (_) {}
+            const maxFeePerGas = (base * 2n) + priority;
+            const maxPriorityFeePerGas = priority > maxFeePerGas ? maxFeePerGas : priority;
+
+            let gasLimit;
+            let data = '0x';
+            let value = 0n;
+            let to = operation.destinationAddress;
+
+            if (isERC20) {
+                const iface = new ethers.Interface(WM_ERC20_ABI);
+                data = iface.encodeFunctionData('transfer', [
+                    operation.destinationAddress,
+                    ethers.parseUnits(String(operation.amount), tokenCfg.decimals)
+                ]);
+                to = tokenCfg.contract;
+                try {
+                    const est = await provider.estimateGas({ from: signer.address, to, data, value: 0n });
+                    gasLimit = (est * 120n) / 100n;
+                } catch (_) { gasLimit = 65000n; }
+            } else {
+                value = ethers.parseUnits(String(operation.amount), 18);
+                gasLimit = 21000n;
+            }
+
+            const txRequest = {
+                chainId: entry.chainId,
+                to, value, data, gasLimit,
+                maxFeePerGas, maxPriorityFeePerGas,
+                type: 2,
+                nonce: await signer.getNonce('pending')
+            };
+
+            const signed = await signer.signTransaction(txRequest);
+            const response = await provider.broadcastTransaction(signed);
+            return { txHash: response.hash };
+        }
+
+        /* ---------------- Solana ---------------- */
+        if (entry.type === 'solana') {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const keypair = Keypair.fromSeed(child.privateKey.slice(0, 32));
+            if (keypair.publicKey.toBase58() !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for Solana source address' };
+            }
+            const connection = new Connection(RPC_PROVIDERS.SOLANA, 'confirmed');
+            const lamports = Math.round(Number(operation.amount) * 1e9);
+            const tx = new SolanaTransaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: keypair.publicKey,
+                    toPubkey: new PublicKey(operation.destinationAddress),
+                    lamports
+                })
+            );
+            const { blockhash } = await connection.getLatestBlockhash('finalized');
+            tx.recentBlockhash = blockhash;
+            tx.feePayer = keypair.publicKey;
+            tx.sign(keypair);
+            const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+            return { txHash: sig };
+        }
+
+        /* ---------------- UTXO ---------------- */
+        if (entry.type === 'utxo') {
+            const result = await wmSignAndBroadcast({
+                assetUpper,
+                derivationPath: operation.derivationPath,
+                fromAddress: operation.sourceAddress,
+                toAddress: operation.destinationAddress,
+                amount: String(operation.amount),
+                memo: operation.memo,
+                scope: 'treasury'
+            });
+            return { txHash: result.txHash };
+        }
+
+        /* ---------------- XRP ---------------- */
+        if (entry.type === 'xrp') {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const wallet = new xrpl.Wallet(
+                child.publicKey.toString('hex'),
+                child.privateKey.toString('hex').toUpperCase()
+            );
+            if (wallet.classicAddress !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for XRP source address' };
+            }
+            const client = new xrpl.Client(RPC_PROVIDERS.XRP);
+            await client.connect();
+            try {
+                const txJson = {
+                    TransactionType: 'Payment',
+                    Account: operation.sourceAddress,
+                    Amount: xrpl.xrpToDrops(String(operation.amount)),
+                    Destination: operation.destinationAddress
+                };
+                const prepared = await client.autofill(txJson);
+                const signed = wallet.sign(prepared);
+                const res = await client.submitAndWait(signed.tx_blob);
+                const meta = res.result && res.result.meta;
+                if (!meta || meta.TransactionResult !== 'tesSUCCESS') {
+                    return { error: `XRP sweep failed: ${(meta && meta.TransactionResult) || 'unknown'}` };
+                }
+                return { txHash: res.result.hash };
+            } finally {
+                try { await client.disconnect(); } catch (_) {}
+            }
+        }
+
+        /* ---------------- TRON ---------------- */
+        if (entry.type === 'tron') {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const privHex = child.privateKey.toString('hex');
+            const tronWeb = new TronWeb({ fullHost: RPC_PROVIDERS.TRON });
+            tronWeb.setPrivateKey(privHex);
+            const address = TronWeb.address.fromPrivateKey(privHex);
+            if (address !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for TRON source address' };
+            }
+            const sun = Math.round(Number(operation.amount) * 1e6);
+            const unsigned = await tronWeb.transactionBuilder.sendTrx(
+                operation.destinationAddress, sun, operation.sourceAddress
+            );
+            const signed = await tronWeb.trx.sign(unsigned, privHex);
+            const res = await tronWeb.trx.sendRawTransaction(signed);
+            if (!res || !res.result) return { error: 'TRON broadcast rejected' };
+            return { txHash: res.txid || signed.txID };
+        }
+
+        /* ---------------- Polkadot ---------------- */
+        if (entry.type === 'polkadot') {
+            if (!platformWallet.isTreasuryReady || !platformWallet.isTreasuryReady()) {
+                return { error: 'Treasury wallet is disabled' };
+            }
+            const api = await wmGetPolkadotApi();
+            const child = platformWallet.treasuryRoot.derivePath(operation.derivationPath);
+            const keyring = new Keyring({ type: 'sr25519' });
+            const pair = keyring.addFromSeed(child.privateKey);
+            if (pair.address !== operation.sourceAddress) {
+                return { error: 'Derivation mismatch for Polkadot source address' };
+            }
+            const decimals = api.registry.chainDecimals[0];
+            const planck = BigInt(Math.round(Number(operation.amount) * 10 ** decimals));
+            const tx = api.tx.balances.transferKeepAlive(operation.destinationAddress, planck.toString());
+            const nonce = await api.rpc.system.accountNextIndex(operation.sourceAddress);
+            const signed = tx.sign(pair, { nonce });
+            const hash = await signed.send();
+            return { txHash: hash.toHex() };
+        }
+
+        return { error: `Automated sweep not implemented for chain type: ${entry.type}` };
+    } catch (err) {
+        console.error('[sweep] broadcast error:', err.message);
+        return { error: err.message || 'Broadcast failed' };
+    }
+}
 
             const tokenCfg = platformWallet.erc20TokenConfig?.[assetUpper];
             const isERC20 = !!(tokenCfg && tokenCfg.contract);
