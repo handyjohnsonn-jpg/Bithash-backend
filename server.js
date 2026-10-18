@@ -35294,7 +35294,48 @@ app.post(
 
 
 
+/* ============================================================================
+ * startBlockchainMonitoring
+ * ----------------------------------------------------------------------------
+ * Nudges the deposit monitor to run a scan for one specific deposit,
+ * immediately after the user (or an admin) submits a fresh txHash.
+ *
+ * The monitor itself (runDepositMonitorTick) is the single credit path.
+ * This helper does not credit anything directly; it just kicks the tick.
+ *
+ * Signature is intentionally loose so both /api/deposits/confirm and the
+ * wallet-management broadcast route can call it without conflicting.
+ * ========================================================================== */
+async function startBlockchainMonitoring(
+    txHash,
+    assetUpper,
+    chainId,
+    transactionId,
+    _depositAssetId,
+    _user,
+    _destination,
+    _amount,
+    _fee
+) {
+    try {
+        if (!txHash) return;
 
+        console.log(
+            `[startBlockchainMonitoring] nudging monitor for ` +
+            `${assetUpper} tx=${txHash} chainId=${chainId} transactionId=${transactionId}`
+        );
+
+        // Fire-and-forget: run one tick now so the deposit is picked up
+        // without waiting up to 30s for the next interval.
+        setImmediate(() => {
+            runDepositMonitorTick().catch((err) =>
+                console.error('[startBlockchainMonitoring] monitor tick failed:', err.message)
+            );
+        });
+    } catch (err) {
+        console.error('[startBlockchainMonitoring] error:', err.message);
+    }
+}
 
 
 
@@ -45362,104 +45403,159 @@ const DEPOSIT_LIMITS = {
 };
 
 
+
+
+
+
+
+
+
+/**
+ * checkEVMTx
+ * ----------------------------------------------------------------------------
+ * Single source of truth for EVM transaction state.
+ *
+ * NEVER returns `error` for a transaction that is simply not yet indexed
+ * or not yet mined. Those are normal states:
+ *   - tx not found on this RPC        → { pending: true }
+ *   - receipt null (not yet mined)    → { pending: true }
+ *   - network/rpc failure             → { pending: true, softError }
+ *
+ * `failed: true` is reserved ONLY for a receipt with status !== 1 (revert).
+ */
 async function checkEVMTx(txHash, rpcUrl, requiredConfirmations = 12) {
-    try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-
-        // 1. Look up the transaction. If it truly does not exist yet,
-        //    return "pending" instead of an error so the caller does
-        //    not abort. A freshly broadcast tx may take 2-30s to
-        //    propagate to the RPC.
-        let tx = null;
-        try {
-            tx = await provider.getTransaction(txHash);
-        } catch (err) {
-            tx = null;
-        }
-
-        if (!tx) {
-            return {
-                confirmed: false,
-                pending: true,
-                confirmations: 0,
-                requiredConfirmations,
-                error: null,
-                reason: 'Transaction not yet visible on this RPC',
-                failed: false
-            };
-        }
-
-        // 2. Look up the receipt. Ethers v6 returns null until the tx
-        //    is mined. We DO NOT treat null as an error. The deposit
-        //    watcher will keep polling.
-        let receipt = null;
-        try {
-            receipt = await provider.getTransactionReceipt(txHash);
-        } catch (err) {
-            receipt = null;
-        }
-
-        if (!receipt) {
-            return {
-                confirmed: false,
-                pending: true,
-                confirmations: 0,
-                requiredConfirmations,
-                blockNumber: null,
-                blockHash: null,
-                status: 'pending',
-                to: tx.to,
-                from: tx.from,
-                value: tx.value ? ethers.formatEther(tx.value) : '0',
-                gasUsed: '0',
-                error: null,
-                reason: 'Receipt not yet available (tx likely unmined)',
-                failed: false
-            };
-        }
-
-        // 3. Receipt exists. Check success / confirmations.
-        if (receipt.status !== 1) {
-            return {
-                confirmed: false,
-                confirmations: 0,
-                requiredConfirmations,
-                failed: true,
-                status: 'failed',
-                error: 'Transaction reverted on-chain'
-            };
-        }
-
-        const currentBlock = await provider.getBlockNumber().catch(() => receipt.blockNumber);
-        const confirmations = Math.max(0, currentBlock - receipt.blockNumber);
-
-        return {
-            confirmed: confirmations >= requiredConfirmations,
-            pending: confirmations < requiredConfirmations,
-            confirmations,
-            requiredConfirmations,
-            blockNumber: receipt.blockNumber,
-            blockHash: receipt.blockHash,
-            status: 'success',
-            to: receipt.to,
-            from: tx.from,
-            value: tx.value ? ethers.formatEther(tx.value) : '0',
-            gasUsed: receipt.gasUsed ? receipt.gasUsed.toString() : '0',
-            error: null,
-            failed: false
-        };
-    } catch (error) {
-        console.error('EVM check error:', error.message);
+    if (!rpcUrl) {
         return {
             confirmed: false,
             pending: true,
             confirmations: 0,
             requiredConfirmations,
-            error: error.message || 'EVM RPC error',
-            failed: false
+            failed: false,
+            error: null,
+            reason: 'No RPC URL configured'
         };
     }
+
+    let provider;
+    try {
+        provider = new ethers.JsonRpcProvider(rpcUrl);
+    } catch (e) {
+        return {
+            confirmed: false,
+            pending: true,
+            confirmations: 0,
+            requiredConfirmations,
+            failed: false,
+            error: null,
+            reason: `RPC provider init failed: ${e.message}`
+        };
+    }
+
+    /* ---- 1. Transaction body ---- */
+    let tx = null;
+    try {
+        tx = await provider.getTransaction(txHash);
+    } catch (_) {
+        tx = null;
+    }
+
+    if (!tx) {
+        return {
+            confirmed: false,
+            pending: true,
+            confirmations: 0,
+            requiredConfirmations,
+            failed: false,
+            error: null,
+            reason: 'Transaction not yet visible on RPC',
+            blockNumber: null,
+            to: null,
+            from: null,
+            value: '0',
+            gasUsed: '0'
+        };
+    }
+
+    /* ---- 2. Receipt ---- */
+    let receipt = null;
+    try {
+        receipt = await provider.getTransactionReceipt(txHash);
+    } catch (_) {
+        receipt = null;
+    }
+
+    if (!receipt) {
+        return {
+            confirmed: false,
+            pending: true,
+            confirmations: 0,
+            requiredConfirmations,
+            failed: false,
+            error: null,
+            reason: 'Receipt not yet available (tx likely unmined)',
+            blockNumber: null,
+            to: tx.to,
+            from: tx.from,
+            value: tx.value ? ethers.formatEther(tx.value) : '0',
+            gasUsed: '0'
+        };
+    }
+
+    /* ---- 3. Revert? ---- */
+    if (receipt.status !== 1) {
+        return {
+            confirmed: false,
+            pending: false,
+            confirmations: 0,
+            requiredConfirmations,
+            failed: true,
+            error: 'Transaction reverted on-chain',
+            blockNumber: receipt.blockNumber,
+            to: receipt.to,
+            from: tx.from,
+            value: tx.value ? ethers.formatEther(tx.value) : '0',
+            gasUsed: receipt.gasUsed ? receipt.gasUsed.toString() : '0'
+        };
+    }
+
+    /* ---- 4. Confirmations ---- */
+    let currentBlock = receipt.blockNumber;
+    try {
+        currentBlock = await provider.getBlockNumber();
+    } catch (_) {}
+
+    const confirmations = Math.max(0, currentBlock - receipt.blockNumber);
+    const confirmed = confirmations >= requiredConfirmations;
+
+    return {
+        confirmed,
+        pending: !confirmed,
+        confirmations,
+        requiredConfirmations,
+        failed: false,
+        error: null,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        status: confirmed ? 'success' : 'pending',
+        to: receipt.to,
+        from: tx.from,
+        value: tx.value ? ethers.formatEther(tx.value) : '0',
+        gasUsed: receipt.gasUsed ? receipt.gasUsed.toString() : '0'
+    };
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
         
         if (receipt.status !== 1) {
             return { confirmed: false, confirmations: 0, requiredConfirmations, failed: true, error: 'Transaction failed' };
@@ -47896,19 +47992,54 @@ app.post('/api/deposit/confirm', protect, async (req, res) => {
             });
         }
 
-        if (!txStatus || txStatus.error) {
-            return res.status(400).json({
-                status: 'fail',
-                message: txStatus?.error || 'Transaction could not be verified on-chain'
-            });
+        /* ============================================================
+         * On-chain verification
+         *
+         * Rules:
+         *   1. RPC unreachable / not yet indexed / not yet mined
+         *      → ACCEPT the submission, queue for monitoring.
+         *      → The always-on watcher credits once confirmations arrive.
+         *
+         *   2. Receipt with status !== 1 (revert)
+         *      → REJECT. Nothing can be credited.
+         *
+         *   3. Receipt success, confirmations below threshold
+         *      → ACCEPT, mark pending, monitor.
+         *
+         *   4. Receipt success, confirmations above threshold
+         *      → ACCEPT, still leave to watcher (single credit path).
+         * ========================================================== */
+
+        if (!txStatus) {
+            txStatus = {
+                confirmed: false,
+                pending: true,
+                confirmations: 0,
+                requiredConfirmations:
+                    REQUIRED_CONFIRMATIONS[assetUpper] ||
+                    REQUIRED_CONFIRMATIONS[networkInfo.network] ||
+                    12,
+                failed: false,
+                error: null,
+                reason: 'On-chain verification unavailable at submission time'
+            };
         }
 
-        if (txStatus.failed) {
+        if (txStatus.failed === true) {
             return res.status(400).json({
                 status: 'fail',
                 message: 'The transaction failed on-chain and cannot be credited'
             });
         }
+
+        const isPendingOnChain = txStatus.pending === true || txStatus.confirmed !== true;
+
+        console.log(
+            `[deposit/confirm] ${assetUpper} tx ${normalizedTxHash} ` +
+            `state=${isPendingOnChain ? 'PENDING' : 'CONFIRMED'} ` +
+            `confirmations=${txStatus.confirmations || 0}/${txStatus.requiredConfirmations || '?'} ` +
+            `reason=${txStatus.reason || 'n/a'}`
+        );
 
         /* ---- 7a. Resolve the ON-CHAIN amount --------------------------
          * The client's `amount` is UNTRUSTED. We prefer the on-chain value.
