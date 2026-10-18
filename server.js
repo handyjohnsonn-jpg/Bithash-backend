@@ -35273,37 +35273,722 @@ app.post(
 );
 
 
-/**
+
+
+
+
+
+
+/* ============================================================================
+ * DEPOSIT MONITOR — SINGLE BACKGROUND LOOP
+ * ----------------------------------------------------------------------------
+ * Every 30 seconds:
+ *   For each DepositAsset with status='pending' AND metadata.txHash:
+ *     1. Refresh confirmation count from chain.
+ *     2. If confirmations >= required:
+ *          a. Atomic credit to user's main wallet + ledger entry
+ *          b. Mark DepositAsset completed
+ *          c. Mark Transaction completed
+ *          d. Best-effort sweep to treasury (records result on tx)
+ *          e. Send "deposit credited" email to user + admin
+ *          f. Send "sweep" email to admin
+ *          g. Emit socket events
+ *     3. If on-chain failure detected: mark failed + email user.
+ *
+ * Idempotency: each credit is guarded by:
+ *   - Transaction.details.creditedAt being unset (atomic claim)
+ *   - DepositAsset.status being 'pending'
+ *   - A Redis lock keyed by (asset, txHash)
+ *
+ * Does NOT interfere with the existing startDepositWatcher(), which scans
+ * DepositAddress for *brand new* transfers. This monitor handles deposits
+ * the user has already submitted via /api/deposits/confirm.
+ * ========================================================================== */
+
+const DEPOSIT_MONITOR_INTERVAL_MS = 30 * 1000;
+let depositMonitorTimer = null;
+let depositMonitorRunning = false;
+
+async function runDepositMonitorTick() {
+    if (depositMonitorRunning) return;
+    depositMonitorRunning = true;
+    const startedAt = Date.now();
+
+    try {
+        const depositSettings = await getDepositSettings();
+
+        // Only the newest 200 pending deposits are worth scanning. Anything
+        // older has either been credited, failed, or expired.
+        const pending = await DepositAsset.find({
+            status: 'pending',
+            'metadata.txHash': { $exists: true, $ne: null }
+        })
+            .sort({ createdAt: -1 })
+            .limit(200)
+            .populate('user', 'firstName lastName email')
+            .lean();
+
+        if (pending.length === 0) {
+            depositMonitorRunning = false;
+            return;
+        }
+
+        let credited = 0, failed = 0, stillPending = 0;
+
+        for (const dep of pending) {
+            try {
+                const assetUpper = (dep.asset || '').toUpperCase();
+                if (!ASSET_NETWORK_MAP[assetUpper]) continue;
+
+                const entry = ASSET_NETWORK_MAP[assetUpper];
+                const chainId = entry.chainId;
+                const txHash = dep.metadata.txHash;
+
+                // Fresh on-chain read
+                let chainState;
+                try {
+                    chainState = await checkTransactionOnBlockchain(txHash, assetUpper, chainId);
+                } catch (e) {
+                    chainState = { error: e.message };
+                }
+                if (!chainState || chainState.error) {
+                    stillPending++;
+                    continue;
+                }
+
+                const confirmations = chainState.confirmations || 0;
+                const required = resolveRequiredConfirmations(assetUpper, depositSettings);
+
+                // Persist the live count
+                try {
+                    await DepositAsset.updateOne(
+                        { _id: dep._id },
+                        { $set: {
+                            'metadata.confirmations': confirmations,
+                            'metadata.lastChecked': new Date(),
+                            'metadata.blockNumber': chainState.blockNumber || null
+                        }}
+                    );
+                    if (dep.transactionId) {
+                        await Transaction.updateOne(
+                            { _id: dep.transactionId },
+                            { $set: {
+                                'details.confirmations': confirmations,
+                                'details.blockNumber': chainState.blockNumber || null
+                            }}
+                        );
+                    }
+                } catch (_) {}
+
+                /* ---- On-chain failure -------------------------------- */
+                if (chainState.failed) {
+                    await markDepositFailed(dep, assetUpper, txHash, 'Transaction failed on-chain', chainState);
+                    failed++;
+                    continue;
+                }
+
+                /* ---- Not enough confirmations yet -------------------- */
+                if (confirmations < required) {
+                    stillPending++;
+                    continue;
+                }
+
+                /* ---- Ready: credit + sweep --------------------------- */
+                const creditResult = await creditConfirmedDeposit(dep, assetUpper, txHash, chainState, depositSettings);
+                if (creditResult.credited) {
+                    credited++;
+                } else if (creditResult.failed) {
+                    failed++;
+                } else {
+                    stillPending++;
+                }
+            } catch (rowErr) {
+                console.error(`[deposit-monitor] row ${dep._id} failed:`, rowErr.message);
+                failed++;
+            }
+        }
+
+        if (credited || failed) {
+            console.log(`[deposit-monitor] tick done in ${Date.now() - startedAt}ms — credited=${credited}, failed=${failed}, pending=${stillPending}`);
+        }
+    } catch (err) {
+        console.error('[deposit-monitor] tick fatal:', err.message);
+    } finally {
+        depositMonitorRunning = false;
+    }
+}
+
+function startDepositMonitor() {
+    if (depositMonitorTimer) return;
+    // first tick after 20s
+    setTimeout(() => {
+        runDepositMonitorTick();
+        depositMonitorTimer = setInterval(runDepositMonitorTick, DEPOSIT_MONITOR_INTERVAL_MS);
+    }, 20000);
+    console.log(`🔎 Deposit monitor started (every ${DEPOSIT_MONITOR_INTERVAL_MS / 1000}s)`);
+}
+
+function stopDepositMonitor() {
+    if (depositMonitorTimer) {
+        clearInterval(depositMonitorTimer);
+        depositMonitorTimer = null;
+    }
+}
+
+
+
+
+
+/* ============================================================================
+ * creditConfirmedDeposit
+ * ----------------------------------------------------------------------------
+ * Atomically claims a pending deposit, credits the user's main wallet
+ * (with a ledger entry), marks both records completed, sweeps to treasury,
+ * and sends all the completion emails.
+ *
+ * Fully idempotent. Safe to call from multiple ticks / processes.
+ * ========================================================================== */
+async function creditConfirmedDeposit(dep, assetUpper, txHash, chainState, depositSettings) {
+    const assetLower = assetUpper.toLowerCase();
+    const userId = dep.user && dep.user._id ? dep.user._id : dep.user;
+
+    if (!userId) {
+        return { credited: false, failed: true, error: 'Deposit has no user' };
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+        return { credited: false, failed: true, error: 'User not found' };
+    }
+
+    /* --- Per-txHash Redis lock ------------------------------------- */
+    const lockKey = `deposit-credit:lock:${assetUpper}:${txHash}`;
+    let lockAcquired = false;
+    try {
+        if (redis && typeof redis.set === 'function') {
+            const r = await redis.set(lockKey, '1', 'EX', 180, 'NX');
+            lockAcquired = r === 'OK';
+            if (!lockAcquired) {
+                return { credited: false, failed: false, skipped: 'locked' };
+            }
+        } else {
+            lockAcquired = true;
+        }
+    } catch (_) {
+        lockAcquired = true;
+    }
+
+    try {
+        /* --- Atomic claim on the Transaction ---------------------- */
+        const txn = await Transaction.findById(dep.transactionId);
+        if (!txn) {
+            return { credited: false, failed: true, error: 'Transaction not found' };
+        }
+        if (txn.status === 'completed' && txn.details?.creditedAt) {
+            return { credited: false, failed: false, skipped: 'already_credited' };
+        }
+
+        const claimResult = await Transaction.findOneAndUpdate(
+            {
+                _id: txn._id,
+                'details.creditedAt': { $exists: false }
+            },
+            {
+                $set: {
+                    'details.creditedAt': new Date(),
+                    'details.creditOperationId': crypto.randomBytes(8).toString('hex')
+                }
+            },
+            { new: false }
+        );
+        if (!claimResult) {
+            return { credited: false, failed: false, skipped: 'already_claimed' };
+        }
+
+        /* --- Compute values ---------------------------------------- */
+        const cryptoAmount = Number(dep.amount) || 0;
+        const price = Number(dep.metadata?.exchangeRate) || 0;
+        const usdForDisplay = price > 0 ? Number((cryptoAmount * price).toFixed(2)) : Number(dep.usdValue) || 0;
+        const networkName = dep.metadata?.network || ASSET_NETWORK_MAP[assetUpper].network;
+
+        /* --- Atomic credit + ledger ------------------------------- */
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        let credit;
+        try {
+            const userDoc = await User.findById(userId).session(session);
+            if (!userDoc) throw new Error('User disappeared');
+
+            if (!userDoc.balances) {
+                userDoc.balances = { main: new Map(), active: new Map(), matured: new Map() };
+            }
+            if (!userDoc.balances.main) userDoc.balances.main = new Map();
+
+            const preCrypto = Number(userDoc.balances.main.get(assetLower) || 0);
+            const postCrypto = Number((preCrypto + cryptoAmount).toFixed(18));
+
+            // Recompute main USD display
+            let totalMainUsd = 0;
+            for (const [asset, bal] of userDoc.balances.main.entries()) {
+                if (asset === 'usd') continue;
+                if (!bal || bal <= 0) continue;
+                if (asset === assetLower) {
+                    totalMainUsd += postCrypto * (price > 0 ? price : 0);
+                } else {
+                    try {
+                        const p = await getCryptoPrice(asset.toUpperCase());
+                        if (p > 0) totalMainUsd += Number(bal) * p;
+                    } catch (_) {}
+                }
+            }
+            totalMainUsd = Number(totalMainUsd.toFixed(2));
+
+            userDoc.balances.main.set(assetLower, postCrypto);
+            userDoc.balances.main.set('usd', totalMainUsd);
+            userDoc.markModified('balances.main');
+            await userDoc.save({ session });
+
+            await writeLedgerEntry({
+                user: userId,
+                wallet: 'main',
+                asset: assetLower,
+                direction: 'credit',
+                amount: cryptoAmount,
+                usdValueAtTime: usdForDisplay,
+                assetPriceAtTime: price > 0 ? price : (usdForDisplay / Math.max(cryptoAmount, 1e-18)),
+                source: 'onchain_deposit',
+                reference: `onchain_deposit:${txHash}`,
+                relatedEntity: txn._id,
+                relatedModel: 'Transaction',
+                balanceAfter: postCrypto,
+                metadata: {
+                    txHash,
+                    network: networkName,
+                    assetUpper,
+                    confirmations: chainState.confirmations || 0,
+                    requiredConfirmations: resolveRequiredConfirmations(assetUpper, depositSettings)
+                },
+                session
+            });
+
+            await session.commitTransaction();
+            credit = { newCrypto: postCrypto, usdForDisplay, totalMainUsd };
+        } catch (creditErr) {
+            await session.abortTransaction();
+            // Release the claim so the next tick can retry
+            try {
+                await Transaction.updateOne(
+                    { _id: txn._id },
+                    { $unset: { 'details.creditedAt': '', 'details.creditOperationId': '' } }
+                );
+            } catch (_) {}
+            console.error(`[deposit-monitor] credit failed for ${txHash}:`, creditErr.message);
+            return { credited: false, failed: true, error: creditErr.message };
+        } finally {
+            session.endSession();
+        }
+
+        /* --- Mark records completed ------------------------------ */
+        const creditedAt = new Date();
+        await DepositAsset.updateOne(
+            { _id: dep._id },
+            { $set: {
+                status: 'completed',
+                confirmedAt: creditedAt,
+                'metadata.creditedAt': creditedAt
+            }}
+        );
+        await Transaction.updateOne(
+            { _id: txn._id },
+            { $set: {
+                status: 'completed',
+                processedAt: creditedAt,
+                'details.confirmations': chainState.confirmations || 0,
+                'details.newMainBalanceCrypto': credit.newCrypto,
+                'details.newMainBalanceUsd': credit.totalMainUsd
+            }}
+        );
+
+        /* --- Best-effort sweep to treasury ----------------------- */
+        let sweepStatus = 'skipped';
+        let sweepTxHash = null;
+        let sweepError = 'Treasury disabled';
+        const depositAddress = dep.metadata?.toAddress;
+
+        try {
+            const treasuryReady = platformWallet && typeof platformWallet.isTreasuryReady === 'function' && platformWallet.isTreasuryReady();
+            if (treasuryReady && depositAddress) {
+                const sweep = await sweepToTreasury({
+                    assetUpper,
+                    address: depositAddress,
+                    cryptoAmount,
+                    txHash,
+                    networkName
+                });
+                if (sweep && sweep.ok) {
+                    sweepStatus = 'broadcast';
+                    sweepTxHash = sweep.txHash;
+                    sweepError = null;
+                } else {
+                    sweepStatus = 'failed';
+                    sweepError = (sweep && sweep.error) || 'sweep returned not-ok';
+                }
+            } else {
+                sweepError = treasuryReady ? 'depositAddress missing' : 'Treasury not enabled';
+            }
+        } catch (sweepErr) {
+            sweepStatus = 'failed';
+            sweepError = sweepErr.message || 'sweep threw';
+            console.error('[deposit-monitor] sweep failed:', sweepErr.message);
+        }
+
+        await Transaction.updateOne(
+            { _id: txn._id },
+            { $set: {
+                'details.sweep': {
+                    status: sweepStatus,
+                    txHash: sweepTxHash,
+                    error: sweepError,
+                    attemptedAt: new Date().toISOString()
+                }
+            }}
+        );
+
+        /* --- Emails (fire and forget) ----------------------------- */
+        setImmediate(() => {
+            (async () => {
+                try {
+                    await sendUserDepositCreditEmail({
+                        user,
+                        assetUpper,
+                        cryptoAmount,
+                        usdValue: usdForDisplay,
+                        price,
+                        txHash,
+                        networkName,
+                        newBalance: credit.totalMainUsd,
+                        reference: txn.reference
+                    });
+                } catch (e) { console.error('[deposit-monitor] user email failed:', e.message); }
+
+                try {
+                    await sendAdminDepositEmail({
+                        user,
+                        assetUpper,
+                        cryptoAmount,
+                        usdValue: usdForDisplay,
+                        price,
+                        txHash,
+                        networkName,
+                        reference: txn.reference,
+                        sweepStatus,
+                        sweepTxHash,
+                        sweepError
+                    });
+                } catch (e) { console.error('[deposit-monitor] admin email failed:', e.message); }
+
+                try {
+                    const treasuryAddress = (() => {
+                        try {
+                            const d = platformWallet.getOrGenerateTreasuryAddress(assetUpper, 0);
+                            return d && d.address ? d.address : null;
+                        } catch (_) { return null; }
+                    })();
+
+                    await sendAdminSweepEmail({
+                        user,
+                        assetUpper,
+                        cryptoAmount,
+                        treasuryAddress,
+                        sweepStatus,
+                        sweepTxHash,
+                        sweepError,
+                        networkName
+                    });
+                } catch (e) { console.error('[deposit-monitor] sweep email failed:', e.message); }
+            })().catch((e) => console.error('[deposit-monitor] email bg failed:', e));
+        });
+
+        /* --- Sockets + audit ------------------------------------- */
+        try {
+            const io = global.io;
+            if (io) {
+                io.to(`user_${user._id}`).emit('balance_update', {
+                    main: user.balances.main.get('usd') || 0,
+                    active: user.balances.active?.get('usd') || 0,
+                    matured: user.balances.matured?.get('usd') || 0
+                });
+                io.to(`user_${user._id}`).emit('crypto_balance_update', {
+                    currency: assetLower,
+                    walletType: 'main',
+                    balance: credit.newCrypto,
+                    usdValue: usdForDisplay
+                });
+                io.to(`user_${user._id}`).emit('deposit_credited', {
+                    txHash,
+                    asset: assetUpper,
+                    amount: cryptoAmount,
+                    usdValue: usdForDisplay,
+                    creditedAt: creditedAt.toISOString()
+                });
+            }
+        } catch (_) {}
+
+        try {
+            await SystemLog.create({
+                action: 'deposit_auto_credited',
+                entity: 'Transaction',
+                entityId: txn._id,
+                performedBy: userId,
+                performedByModel: 'System',
+                performedByEmail: user.email,
+                performedByName: `${user.firstName} ${user.lastName}`,
+                status: 'success',
+                metadata: {
+                    asset: assetUpper,
+                    cryptoAmount,
+                    usdValue: usdForDisplay,
+                    txHash,
+                    network: networkName,
+                    confirmations: chainState.confirmations || 0,
+                    requiredConfirmations: resolveRequiredConfirmations(assetUpper, depositSettings),
+                    sweepStatus, sweepTxHash, sweepError,
+                    reference: txn.reference
+                }
+            });
+        } catch (_) {}
+
+        console.log(`✅ [deposit-monitor] Credited ${cryptoAmount} ${assetUpper} (${txHash}) to user ${user.email}. Sweep: ${sweepStatus}`);
+        return { credited: true };
+
+    } finally {
+        if (lockAcquired) {
+            try { if (redis && typeof redis.del === 'function') await redis.del(lockKey); } catch (_) {}
+        }
+    }
+}
+
+async function markDepositFailed(dep, assetUpper, txHash, reason, chainState) {
+    try {
+        await DepositAsset.updateOne(
+            { _id: dep._id, status: 'pending' },
+            { $set: {
+                status: 'failed',
+                'metadata.failedAt': new Date(),
+                'metadata.failureReason': reason
+            }}
+        );
+        if (dep.transactionId) {
+            await Transaction.updateOne(
+                { _id: dep.transactionId, status: 'pending' },
+                { $set: {
+                    status: 'failed',
+                    adminNotes: reason,
+                    processedAt: new Date(),
+                    'details.chainStatus': 'failed',
+                    'details.failureReason': reason
+                }}
+            );
+        }
+
+        const userId = dep.user && dep.user._id ? dep.user._id : dep.user;
+        const user = userId ? await User.findById(userId).select('email firstName lastName').lean() : null;
+
+        if (user && user.email) {
+            try {
+                await sendProfessionalEmail({
+                    email: user.email,
+                    template: 'deposit_rejected',
+                    data: {
+                        name: user.firstName,
+                        amount: (dep.usdValue || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+                        cryptoAmount: (dep.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 }),
+                        cryptoAsset: assetUpper,
+                        cryptoLogoUrl: getCryptoLogo(assetUpper),
+                        method: assetUpper,
+                        reference: txHash,
+                        reason,
+                        exchangeRate: (dep.metadata?.exchangeRate || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                    }
+                });
+            } catch (e) { console.error('[deposit-monitor] failed email error:', e.message); }
+        }
+
+        try {
+            await SystemLog.create({
+                action: 'deposit_onchain_failed',
+                entity: 'Transaction',
+                entityId: dep.transactionId || dep._id,
+                performedBy: userId,
+                performedByModel: 'System',
+                status: 'failed',
+                errorMessage: reason,
+                metadata: { txHash, asset: assetUpper, chainState }
+            });
+        } catch (_) {}
+    } catch (e) {
+        console.error('[deposit-monitor] markDepositFailed error:', e.message);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ============================================================================
+ * GET /api/deposit/monitor
+ * ----------------------------------------------------------------------------
+ * Read-only status of a pending deposit. Polled by the frontend.
+ *
+ * NEVER emails. NEVER credits. NEVER sweeps. NEVER modifies state except
+ * to refresh the cached confirmation count on the Transaction and
+ * DepositAsset so the UI can show live progress.
+ *
+ * The actual credit + sweep is performed by startDepositMonitor()
+ * running server-side (see Step 3).
+ * ========================================================================== */
+app.get('/api/deposit/monitor', protect, async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const txHash = String(req.query.txHash || '').trim();
+        const assetUpper = String(req.query.asset || '').toUpperCase();
+
+        if (!txHash) {
+            return res.status(400).json({ status: 'fail', message: 'txHash query parameter is required' });
+        }
+        if (!assetUpper || !ASSET_NETWORK_MAP[assetUpper]) {
+            return res.status(400).json({ status: 'fail', message: 'A valid asset query parameter is required' });
+        }
+
+        const assetLower = assetUpper.toLowerCase();
+        const entry = ASSET_NETWORK_MAP[assetUpper];
+        const chainId = entry.chainId;
+
+        // Find by txHash AND user (so users can only see their own)
+        const tx = await Transaction.findOne({
+            user: userId,
+            type: 'deposit',
+            'details.txHash': txHash
+        }).lean();
+
+        if (!tx) {
+            return res.status(404).json({ status: 'fail', message: 'No deposit found for this txHash' });
+        }
+
+        // Re-check live confirmations
+        let confirmations = Number(tx.details?.confirmations) || 0;
+        let requiredConfirmations = Number(tx.details?.requiredConfirmations) || REQUIRED_CONFIRMATIONS[entry.network] || 12;
+        let chainStatus = 'pending';
+        let blockNumber = null;
+
+        try {
+            const live = await checkTransactionOnBlockchain(txHash, assetUpper, chainId);
+            if (live) {
+                confirmations = live.confirmations || 0;
+                requiredConfirmations = live.requiredConfirmations || requiredConfirmations;
+                blockNumber = live.blockNumber || null;
+                if (live.failed) chainStatus = 'failed';
+                else if (live.confirmed) chainStatus = 'confirmed';
+                else chainStatus = 'pending';
+            }
+        } catch (liveErr) {
+            console.warn('[deposit/monitor] live check failed:', liveErr.message);
+        }
+
+        // Cheap refresh of cached counters so the UI reflects reality.
+        // This is NOT a state transition; it only updates display fields.
+        try {
+            await Promise.all([
+                Transaction.updateOne(
+                    { _id: tx._id },
+                    { $set: {
+                        'details.confirmations': confirmations,
+                        'details.blockNumber': blockNumber,
+                        'details.chainStatus': chainStatus
+                    }}
+                ),
+                DepositAsset.updateOne(
+                    { transactionId: tx._id },
+                    { $set: {
+                        'metadata.confirmations': confirmations,
+                        'metadata.lastChecked': new Date()
+                    }}
+                )
+            ]);
+        } catch (_) {}
+
+        const isReady = chainStatus === 'confirmed' && confirmations >= requiredConfirmations;
+        const isCredited = tx.status === 'completed';
+
+        return res.status(200).json({
+            status: 'success',
+            data: {
+                transactionId: tx._id,
+                reference: tx.reference,
+                asset: assetUpper,
+                amount: tx.assetAmount || tx.amount,
+                usdValue: tx.amount,
+                txHash,
+                network: entry.network,
+                confirmations,
+                requiredConfirmations,
+                chainStatus,
+                blockNumber,
+                transactionStatus: tx.status,
+                credited: isCredited,
+                // "ready" means "will be credited on next monitor tick"
+                readyForCredit: isReady && !isCredited,
+                creditedAt: tx.details?.creditedAt || tx.processedAt || null,
+                sweep: tx.details?.sweep || null,
+                explorerUrl: `${entry.explorer || ''}${txHash}`,
+                estimatedSecondsRemaining: isReady
+                    ? 0
+                    : Math.max(0, (requiredConfirmations - confirmations)) * (await estimateNetworkBlockTimeSeconds(entry.network).catch(() => 12))
+            }
+        });
+    } catch (err) {
+        console.error('[deposit/monitor] fatal:', err);
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to check deposit status' });
+    }
+});
+
+
+
+
+
+
+
+
+/* ============================================================================
  * POST /api/deposits/confirm
+ * ----------------------------------------------------------------------------
+ * SINGLE SOURCE OF TRUTH for on-chain deposit submission.
  *
- * Called by the frontend after the user's wallet broadcasts an on-chain
- * deposit. This route does NOT credit the user — it records the deposit
- * in 'pending' state so an admin can approve it via
- * POST /api/admin/deposits/:id/approve.
+ * Called by the frontend after the user's wallet broadcasts a tx.
  *
- * The on-chain transaction is verified here before any record is written,
- * so a forged txHash cannot enter the queue.
+ * 1. Validates the deposit address belongs to the user.
+ * 2. Verifies the transaction on-chain (source of truth for amount).
+ * 3. Creates a DepositAsset (status='pending') — this is what the
+ *    background monitor watches.
+ * 4. Creates a Transaction (status='pending', deterministic reference).
+ * 5. Sends ONE "deposit detected / awaiting confirmations" email to
+ *    the user AND to the admin (deduped via Redis per txHash).
+ * 6. Returns 202 with monitoring=true.
  *
- * Request body:
- *   {
- *     txHash:         string  (required, >= 16 chars)
- *     asset:          string  (required, e.g. "eth", "usdt")
- *     amount:         number  (required, client-claimed crypto amount)
- *     depositAddress: string  (required, the address the user sent to)
- *     walletAddress:  string  (optional, the user's linked wallet)
- *     network:        string  (optional)
- *     chainId:        number  (optional)
- *     contractAddress:string  (optional, for ERC-20 / TRC-20)
- *     tokenDecimals:  number  (optional, for ERC-20 / TRC-20)
- *   }
- *
- * Response:
- *   201 { status: 'success', data: { transaction, depositAsset } }
- *   400 { status: 'fail', message }
- *   401 { status: 'fail', message }   (auth)
- *   409 { status: 'fail', data: {...} } (duplicate)
- *   500 { status: 'error', message }
- */
+ * DOES NOT credit. DOES NOT sweep. The background monitor does that
+ * only after the required on-chain confirmations are reached.
+ * ========================================================================== */
 app.post('/api/deposits/confirm', protect, async (req, res) => {
     const startedAt = Date.now();
     const userId = req.user._id;
@@ -35312,9 +35997,6 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
     let lockAcquired = false;
 
     try {
-        // -----------------------------------------------------------------
-        // 1. Input validation
-        // -----------------------------------------------------------------
         const {
             txHash,
             asset,
@@ -35346,9 +36028,6 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
         const assetUpper = asset.toUpperCase();
         const assetLower = asset.toLowerCase();
 
-        // -----------------------------------------------------------------
-        // 2. Asset support
-        // -----------------------------------------------------------------
         if (!ASSET_NETWORK_MAP[assetUpper]) {
             return res.status(400).json({ status: 'fail', message: `Unsupported asset: ${assetUpper}` });
         }
@@ -35356,22 +36035,13 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
         const networkInfo = ASSET_NETWORK_MAP[assetUpper];
         const chainIdNum = Number(bodyChainId) || networkInfo.chainId || 1;
 
-        // -----------------------------------------------------------------
-        // 3. Load user
-        // -----------------------------------------------------------------
         const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({ status: 'fail', message: 'User not found' });
-        }
+        if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
         if (user.status !== 'active') {
             return res.status(403).json({ status: 'fail', message: 'Your account is not active' });
         }
 
-        // -----------------------------------------------------------------
-        // 4. Verify deposit address ownership
-        //    EVM addresses are stored checksummed, so match case-insensitively.
-        //    Non-EVM addresses are case-sensitive.
-        // -----------------------------------------------------------------
+        /* --- Verify deposit address ownership ---------------------------- */
         const isEvm = networkInfo.type === 'evm';
         const addressQuery = isEvm
             ? { $regex: `^${String(depositAddress).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' }
@@ -35388,65 +36058,36 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             return res.status(400).json({ status: 'fail', message: 'Invalid deposit address for this asset' });
         }
 
-        // -----------------------------------------------------------------
-        // 5. Deterministic idempotency key
-        //    Same (asset, txHash) always maps to the same reference.
-        // -----------------------------------------------------------------
+        /* --- Deterministic idempotency key ------------------------------ */
         const shortHash = normalizedTxHash.slice(-24);
-        const manualReference = `DEP-MAN-${assetUpper}-${shortHash}`;
-        const autoReference = makeDepositReference(assetUpper, depositAddress, normalizedTxHash);
+        const manualReference = `DEP-AUTO-${assetUpper}-${depositAddress.slice(-10)}-${shortHash}`;
 
-        // Hard dedupe
-        const alreadyCreditedTx = await Transaction.findOne({
+        const alreadyCredited = await Transaction.findOne({
             $or: [
                 { reference: manualReference },
-                { reference: autoReference },
                 { 'details.txHash': normalizedTxHash, type: 'deposit' }
             ],
             status: { $in: ['completed', 'pending'] }
         }).lean();
 
-        if (alreadyCreditedTx) {
-            // Audit the duplicate attempt
-            try {
-                await SystemLog.create({
-                    action: 'deposit_duplicate_rejected',
-                    entity: 'Transaction',
-                    entityId: alreadyCreditedTx._id,
-                    performedBy: userId,
-                    performedByModel: 'User',
-                    performedByEmail: user.email,
-                    performedByName: `${user.firstName} ${user.lastName}`,
-                    status: 'failed',
-                    ip: getRealClientIP(req),
-                    userAgent: req.headers['user-agent'] || 'Unknown',
-                    metadata: {
-                        txHash: normalizedTxHash,
-                        asset: assetUpper,
-                        existingReference: alreadyCreditedTx.reference,
-                        existingStatus: alreadyCreditedTx.status,
-                        depositAddress
-                    }
-                });
-            } catch (_) {}
-
+        if (alreadyCredited) {
             return res.status(409).json({
                 status: 'fail',
                 message: 'This transaction has already been submitted.',
                 data: {
-                    transactionId: alreadyCreditedTx._id,
-                    reference: alreadyCreditedTx.reference,
-                    status: alreadyCreditedTx.status
+                    transactionId: alreadyCredited._id,
+                    reference: alreadyCredited.reference,
+                    status: alreadyCredited.status
                 }
             });
         }
 
-        // Distributed lock — serialize concurrent submissions of the same txHash
+        /* --- Distributed lock ------------------------------------------- */
         lockKey = `deposit:confirm:lock:${assetUpper}:${normalizedTxHash}`;
         try {
             if (redis && typeof redis.set === 'function') {
-                const lockResult = await redis.set(lockKey, userId.toString(), 'EX', 120, 'NX');
-                lockAcquired = lockResult === 'OK';
+                const r = await redis.set(lockKey, userId.toString(), 'EX', 120, 'NX');
+                lockAcquired = r === 'OK';
                 if (!lockAcquired) {
                     return res.status(429).json({
                         status: 'fail',
@@ -35461,15 +36102,9 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             lockAcquired = true;
         }
 
-        // -----------------------------------------------------------------
-        // 6. Price lookup
-        // -----------------------------------------------------------------
+        /* --- Price lookup ----------------------------------------------- */
         let currentPrice = 0;
-        try {
-            currentPrice = await getCryptoPrice(assetUpper);
-        } catch (priceErr) {
-            console.error('[deposit/confirm] price fetch failed:', priceErr.message);
-        }
+        try { currentPrice = await getCryptoPrice(assetUpper); } catch (_) {}
         if (!currentPrice || currentPrice <= 0) {
             return res.status(503).json({
                 status: 'error',
@@ -35477,9 +36112,7 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
 
-        // -----------------------------------------------------------------
-        // 7. On-chain verification — the source of truth
-        // -----------------------------------------------------------------
+        /* --- On-chain verification -------------------------------------- */
         let txStatus;
         try {
             txStatus = await checkTransactionOnBlockchain(normalizedTxHash, assetUpper, chainIdNum);
@@ -35498,33 +36131,20 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
         if (txStatus.failed) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'The transaction failed on-chain and cannot be credited'
-            });
+            return res.status(400).json({ status: 'fail', message: 'The transaction failed on-chain' });
         }
 
-        // ---- Resolve the on-chain amount --------------------------------
+        /* --- Resolve on-chain amount ------------------------------------ */
         let onChainAmount = null;
-
-        if (typeof txStatus.value !== 'undefined' && txStatus.value !== null) {
-            const rawValue = Number(txStatus.value);
-            if (Number.isFinite(rawValue) && rawValue > 0) {
-                if (networkInfo.type === 'utxo') {
-                    onChainAmount = rawValue / 1e8;
-                } else if (networkInfo.type === 'tron') {
-                    onChainAmount = rawValue;
-                } else {
-                    onChainAmount = rawValue;
-                }
+        if (txStatus.value != null) {
+            const raw = Number(txStatus.value);
+            if (Number.isFinite(raw) && raw > 0) {
+                onChainAmount = networkInfo.type === 'utxo' ? raw / 1e8 : raw;
             }
         }
-
-        if (typeof txStatus.amount !== 'undefined' && txStatus.amount !== null) {
-            const rawAmount = Number(txStatus.amount);
-            if (Number.isFinite(rawAmount) && rawAmount > 0) {
-                onChainAmount = rawAmount;
-            }
+        if (txStatus.amount != null) {
+            const raw = Number(txStatus.amount);
+            if (Number.isFinite(raw) && raw > 0) onChainAmount = raw;
         }
 
         if (onChainAmount !== null) {
@@ -35540,31 +36160,20 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
         const creditedAmount = onChainAmount !== null ? onChainAmount : clientAmount;
         const usdValue = creditedAmount * currentPrice;
 
-        // ---- Min / max gates against USD value --------------------------
-        if (usdValue < DEPOSIT_LIMITS.minUSD) {
+        /* --- DB-configured minimum deposit ------------------------------ */
+        const depositSettings = await getDepositSettings();
+        if (usdValue < depositSettings.minimumDepositUSD) {
             return res.status(400).json({
                 status: 'fail',
-                message: `Minimum deposit is $${DEPOSIT_LIMITS.minUSD} USD. This deposit is worth $${usdValue.toFixed(2)} USD.`,
-                minUSD: DEPOSIT_LIMITS.minUSD
-            });
-        }
-        if (usdValue > DEPOSIT_LIMITS.maxUSD) {
-            return res.status(400).json({
-                status: 'fail',
-                message: `Maximum deposit is $${DEPOSIT_LIMITS.maxUSD} USD per transaction. This deposit is worth $${usdValue.toFixed(2)} USD.`,
-                maxUSD: DEPOSIT_LIMITS.maxUSD
+                message: `Minimum deposit is $${depositSettings.minimumDepositUSD} USD. This deposit is worth $${usdValue.toFixed(2)} USD.`,
+                minUSD: depositSettings.minimumDepositUSD
             });
         }
 
-        // -----------------------------------------------------------------
-        // 8. Persist — Transaction first, then DepositAsset
-        //    Transaction.reference has a UNIQUE index, so a race here can
-        //    only produce one winning insert.
-        // -----------------------------------------------------------------
+        /* --- Persist: Transaction first (unique ref) -------------------- */
         const networkName = txStatus.network || networkInfo.network || platformWallet.getNetworkName(assetUpper);
         const submittedAt = new Date();
-        const requiredConfirmations =
-            resolveRequiredConfirmations(assetUpper, await getDepositSettings());
+        const requiredConfirmations = resolveRequiredConfirmations(assetUpper, depositSettings);
 
         let transactionDoc;
         try {
@@ -35593,10 +36202,8 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                     onChainAmountVerified: onChainAmount !== null,
                     clientClaimedAmount: clientAmount,
                     creditedAmount,
-                    requiresAdminApproval: true,
+                    requiresAdminApproval: false,     // ← auto-credit after confirmations
                     adminApproved: false,
-                    adminApprovedAt: null,
-                    adminApprovedBy: null,
                     submittedBy: 'manual_confirm',
                     contractAddress: bodyContractAddress || null,
                     tokenDecimals: Number.isFinite(Number(bodyTokenDecimals)) ? Number(bodyTokenDecimals) : null,
@@ -35613,17 +36220,13 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 return res.status(409).json({
                     status: 'fail',
                     message: 'This transaction has already been submitted.',
-                    data: existing ? {
-                        transactionId: existing._id,
-                        reference: existing.reference,
-                        status: existing.status
-                    } : null
+                    data: existing ? { transactionId: existing._id, reference: existing.reference, status: existing.status } : null
                 });
             }
             throw createErr;
         }
 
-        // Mirror DepositAsset — compensating delete on failure
+        /* --- Persist: DepositAsset (this is what the monitor scans) ----- */
         let depositAssetDoc;
         try {
             depositAssetDoc = await DepositAsset.create({
@@ -35643,9 +36246,7 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                     confirmations: txStatus.confirmations || 0,
                     requiredConfirmations,
                     submittedAt,
-                    requiresAdminApproval: true,
-                    adminApproved: false,
-                    adminApprovedAt: null,
+                    requiresAdminApproval: false,
                     onChainAmountVerified: onChainAmount !== null
                 }
             });
@@ -35655,79 +36256,46 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 { $set: {
                     'details.depositId': depositAssetDoc._id,
                     'details.depositAssetId': depositAssetDoc._id
-                } }
+                }}
             );
         } catch (assetErr) {
-            console.error('[deposit/confirm] DepositAsset creation failed, rolling back Transaction:', assetErr.message);
+            console.error('[deposit/confirm] DepositAsset create failed, rolling back:', assetErr.message);
             try { await Transaction.deleteOne({ _id: transactionDoc._id }); } catch (_) {}
-            return res.status(500).json({
-                status: 'error',
-                message: 'Failed to record deposit. Please try again.'
-            });
+            return res.status(500).json({ status: 'error', message: 'Failed to record deposit. Please try again.' });
         }
 
-        // -----------------------------------------------------------------
-        // 9. Audit log (synchronous — must exist before responding)
-        // -----------------------------------------------------------------
+        /* --- Audit ------------------------------------------------------ */
         try {
             await logActivity(
-                'deposit_initiated',
-                'Transaction',
-                transactionDoc._id,
-                userId,
-                'User',
-                req,
+                'deposit_initiated', 'Transaction', transactionDoc._id,
+                userId, 'User', req,
                 {
-                    asset: assetUpper,
-                    amount: creditedAmount,
-                    usdValue,
-                    txHash: normalizedTxHash,
-                    depositAddress,
-                    network: networkName,
-                    confirmations: txStatus.confirmations || 0,
-                    requiredConfirmations,
-                    requiresAdminApproval: true,
-                    onChainAmountVerified: onChainAmount !== null
+                    asset: assetUpper, amount: creditedAmount, usdValue,
+                    txHash: normalizedTxHash, depositAddress,
+                    network: networkName, confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations, onChainAmountVerified: onChainAmount !== null
                 }
             );
-        } catch (logErr) {
-            console.error('[deposit/confirm] audit log failed:', logErr.message);
-        }
+        } catch (logErr) { console.error('[deposit/confirm] audit failed:', logErr.message); }
 
-        // -----------------------------------------------------------------
-        // 10. Fire-and-forget side effects
-        //     HTTP response returns immediately; emails and sockets run
-        //     after the response in a detached async block.
-        // -----------------------------------------------------------------
+        /* --- Fire-and-forget: "awaiting confirmations" emails ----------- */
         setImmediate(() => {
             (async () => {
-                // Mark notified so the watcher's own notification path doesn't duplicate.
                 try {
-                    await Transaction.updateOne(
-                        { _id: transactionDoc._id },
-                        { $set: { 'details.notifiedAt': new Date() } }
-                    );
-                } catch (_) {}
+                    const dedupeKey = `deposit-detected-email:${normalizedTxHash}`;
+                    let already = false;
+                    try {
+                        if (redis && typeof redis.get === 'function') {
+                            already = (await redis.get(dedupeKey)) === '1';
+                        }
+                    } catch (_) {}
+                    if (already) return;
+                    try {
+                        if (redis && typeof redis.setex === 'function') {
+                            await redis.setex(dedupeKey, 60 * 60 * 24 * 7, '1');
+                        }
+                    } catch (_) {}
 
-                try {
-                    const io = req.app.get('io');
-                    if (io) {
-                        io.to(`user_${userId}`).emit('deposit_initiated', {
-                            transactionId: transactionDoc._id,
-                            asset: assetUpper,
-                            amount: creditedAmount,
-                            usdValue,
-                            status: 'pending_admin_approval',
-                            txHash: normalizedTxHash,
-                            reference: manualReference,
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                } catch (socketErr) {
-                    console.error('[deposit/confirm] socket emit failed:', socketErr.message);
-                }
-
-                try {
                     await sendPendingDepositUserEmail({
                         user,
                         assetUpper,
@@ -35743,11 +36311,7 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                         reference: manualReference,
                         createdAt: submittedAt
                     });
-                } catch (emailErr) {
-                    console.error('[deposit/confirm] user pending email failed:', emailErr.message);
-                }
 
-                try {
                     await sendPendingDepositAdminEmail({
                         user,
                         assetUpper,
@@ -35766,19 +36330,15 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                         requestIp: getRealClientIP(req)
                     });
                 } catch (emailErr) {
-                    console.error('[deposit/confirm] admin pending email failed:', emailErr.message);
+                    console.error('[deposit/confirm] pending email failed:', emailErr.message);
                 }
-            })().catch((bgErr) => {
-                console.error('[deposit/confirm] background task failed:', bgErr);
-            });
+            })().catch((e) => console.error('[deposit/confirm] bg failed:', e));
         });
 
-        // -----------------------------------------------------------------
-        // 11. Respond
-        // -----------------------------------------------------------------
-        return res.status(201).json({
+        /* --- Respond ---------------------------------------------------- */
+        return res.status(202).json({
             status: 'success',
-            message: 'Deposit transaction received. Awaiting blockchain confirmation and admin approval.',
+            message: 'Deposit received. Awaiting blockchain confirmations.',
             data: {
                 transaction: {
                     id: transactionDoc._id,
@@ -35786,25 +36346,21 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                     asset: assetUpper,
                     amount: creditedAmount,
                     usdValue,
-                    status: 'pending_admin_approval',
+                    status: 'pending',
                     txHash: normalizedTxHash,
                     depositAddress,
                     network: networkName,
                     createdAt: transactionDoc.createdAt,
-                    requiresAdminApproval: true,
                     confirmations: txStatus.confirmations || 0,
                     requiredConfirmations,
                     onChainAmountVerified: onChainAmount !== null
                 },
-                depositAsset: {
-                    id: depositAssetDoc._id,
-                    status: 'pending'
-                }
+                monitoring: true,
+                monitorUrl: `/api/deposit/monitor?txHash=${normalizedTxHash}&asset=${assetUpper}`
             }
         });
     } catch (err) {
-        console.error('[deposit/confirm] fatal error:', err);
-
+        console.error('[deposit/confirm] fatal:', err);
         try {
             await SystemLog.create({
                 action: 'deposit_confirm_error',
@@ -35816,34 +36372,31 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
                 ip: getRealClientIP(req),
                 userAgent: req.headers['user-agent'] || 'Unknown',
-                metadata: {
-                    txHash: req.body && req.body.txHash,
-                    asset: req.body && req.body.asset,
-                    amount: req.body && req.body.amount,
-                    depositAddress: req.body && req.body.depositAddress,
-                    processingTimeMs: Date.now() - startedAt
-                }
+                metadata: { txHash: req.body?.txHash, asset: req.body?.asset, amount: req.body?.amount, depositAddress: req.body?.depositAddress, processingTimeMs: Date.now() - startedAt }
             });
-        } catch (logErr) {
-            console.error('[deposit/confirm] error log failed:', logErr.message);
-        }
-
-        return res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to confirm deposit'
-        });
+        } catch (_) {}
+        return res.status(500).json({ status: 'error', message: err.message || 'Failed to confirm deposit' });
     } finally {
         if (lockAcquired && lockKey) {
-            try {
-                if (redis && typeof redis.del === 'function') {
-                    await redis.del(lockKey);
-                }
-            } catch (unlockErr) {
-                console.warn('[deposit/confirm] lock release failed:', unlockErr.message);
-            }
+            try { if (redis && typeof redis.del === 'function') await redis.del(lockKey); } catch (_) {}
         }
     }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -45963,27 +46516,6 @@ async function scanTronAddressIncoming(assetUpper, address) {
 
 
 
-
-
-/**
- * Process a single detected incoming transaction.
- *
- * Order of operations:
- *   1. Acquire the idempotency lock.
- *   2. Skip if this (asset, address, txHash) is already credited.
- *   3. Enforce confirmation threshold.
- *   4. Enforce the DB-configured minimum deposit in USD.
- *   5. Resolve ownership of the deposit address.
- *   6. Insert the Transaction (status: 'pending') and matching DepositAsset.
- *   7. Credit the user's main wallet.
- *   8. Mark both records completed.
- *   9. Sweep to treasury (best-effort; recorded on the transaction).
- *  10. Send user + admin emails.
- *  11. Emit sockets and write the audit log.
- *
- * The credit is written only after the deposit records exist, so any
- * failure in steps 6–7 rolls back cleanly and the next tick retries.
- */
 async function processDetectedIncoming({ assetUpper, entry, address, tx, requiredConfirmations, depositSettings, networkName }) {
     const result = { detected: false, credited: false, swept: false, skipped: null };
 
@@ -46128,6 +46660,20 @@ async function processDetectedIncoming({ assetUpper, entry, address, tx, require
         }
 
         result.credited = true;
+		
+		
+		
+		
+		// Inside processDetectedIncoming(), right before creating the Transaction:
+const existingPending = await DepositAsset.findOne({
+    'metadata.txHash': tx.txHash,
+    status: 'pending'
+}).lean();
+if (existingPending) {
+    result.skipped = 'pending_in_monitor';
+    return result;
+}
+		
 
         await Transaction.updateOne(
             { _id: txn._id },
@@ -47606,237 +48152,23 @@ app.post('/api/deposit/confirm', protect, async (req, res) => {
     }
 });
 
-app.post('/api/deposit/monitor', protect, async (req, res) => {
-    try {
-        const {
-            asset,
-            amount,
-            depositAddress,
-            walletAddress,
-            network,
-            txHash
-        } = req.body;
 
-        const userId = req.user._id;
-        const user = await User.findById(userId);
-        
-        if (!user) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'User not found'
-            });
-        }
 
-        const assetUpper = asset.toUpperCase();
-        const assetLower = asset.toLowerCase();
 
-        let depositRecord = await DepositAsset.findOne({
-            user: userId,
-            asset: assetLower,
-            'metadata.toAddress': depositAddress,
-            status: 'pending'
-        }).sort({ createdAt: -1 });
 
-        if (!depositRecord) {
-            return res.status(404).json({
-                status: 'fail',
-                message: 'Deposit record not found'
-            });
-        }
 
-        const txHashToCheck = txHash || depositRecord.metadata?.txHash;
-        
-        if (!txHashToCheck) {
-            return res.status(400).json({
-                status: 'fail',
-                message: 'No transaction hash found for this deposit'
-            });
-        }
 
-        const networkInfo = ASSET_NETWORK_MAP[assetUpper] || { network: 'Unknown', chainId: 1 };
-        const chainIdNum = networkInfo.chainId || 1;
-        
-        const txStatus = await checkTransactionOnBlockchain(txHashToCheck, assetUpper, chainIdNum);
-        
-        await DepositAsset.findByIdAndUpdate(depositRecord._id, {
-            $set: {
-                'metadata.confirmations': txStatus.confirmations || 0,
-                'metadata.blockchainStatus': txStatus,
-                'metadata.lastChecked': new Date()
-            }
-        });
 
-        await Transaction.findByIdAndUpdate(depositRecord.transactionId, {
-            $set: {
-                'details.confirmations': txStatus.confirmations || 0,
-                'details.blockchainStatus': txStatus,
-                'details.readyForAdminApproval': txStatus.confirmed || false
-            }
-        });
 
-        const io = req.app.get('io');
-        if (io) {
-            io.to(`user_${userId}`).emit('deposit_status_update', {
-                transactionId: depositRecord.transactionId,
-                asset: assetUpper,
-                amount: amount,
-                confirmations: txStatus.confirmations || 0,
-                requiredConfirmations: txStatus.requiredConfirmations || 12,
-                status: txStatus.confirmed ? 'ready_for_admin' : 'pending',
-                timestamp: new Date().toISOString(),
-                requiresAdminApproval: true,
-                isConfirmedOnBlockchain: txStatus.confirmed || false
-            });
-        }
 
-        if (txStatus.confirmed && txStatus.confirmations >= txStatus.requiredConfirmations) {
-            await DepositAsset.findByIdAndUpdate(depositRecord._id, {
-                $set: {
-                    'metadata.readyForAdminApproval': true,
-                    'metadata.confirmedAt': new Date()
-                }
-            });
 
-            await Transaction.findByIdAndUpdate(depositRecord.transactionId, {
-                $set: {
-                    'details.readyForAdminApproval': true,
-                    'details.confirmedAt': new Date()
-                }
-            });
 
-            const brandHeader = `
-                <div style="text-align: center; padding: 30px 20px 20px 20px; background: linear-gradient(135deg, #0B0E11 0%, #11151C 100%);">
-                    <img src="https://media.bithashcapital.live/ChatGPT%20Image%20Mar%2029%2C%202026%2C%2004_52_02%20PM.png" alt="₿itHash Logo" style="width: 60px; height: 60px; margin-bottom: 15px;">
-                    <h1 style="color: #FFFFFF; font-size: 28px; margin: 0; font-weight: bold;">₿itHash</h1>
-                    <p style="color: #B7BDC6; font-size: 14px; margin: 10px 0 0 0;"><i><strong>Where Your Financial Goals Become Reality</strong></i></p>
-                </div>
-            `;
 
-            const brandFooter = `
-                <div style="text-align: center; padding: 20px; background: #0B0E11; border-top: 1px solid #1E2329;">
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">&copy; ${new Date().getFullYear()} ₿itHash Capital. All rights reserved.</p>
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">800 Plant St, Wilmington, DE 19801, United States</p>
-                    <p style="color: #6C7480; font-size: 12px; margin: 5px 0;">
-                        <a href="mailto:support@bithashcapital.live" style="color: #F7A600; text-decoration: none;">support@bithashcapital.live</a> | 
-                        <a href="https://www.bithashcapital.live" style="color: #F7A600; text-decoration: none;">www.bithashcapital.live</a>
-                    </p>
-                </div>
-            `;
 
-            const confirmationHtml = `
-                <div style="font-family: 'Inter', sans-serif; max-width: 600px; margin: 0 auto; background: #FFFFFF;">
-                    ${brandHeader}
-                    <div style="padding: 30px; background: #FFFFFF;">
-                        <div style="background: #ECFDF5; border-radius: 12px; padding: 16px 20px; text-align: center; margin-bottom: 25px;">
-                            <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px;">
-                                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <circle cx="12" cy="12" r="10" stroke="#10B981" stroke-width="2"/>
-                                    <path d="M8 12L11 15L16 9" stroke="#10B981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                </svg>
-                                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                    <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z" stroke="#F7A600" stroke-width="2" fill="none"/>
-                                    <circle cx="12" cy="9" r="2.5" stroke="#F7A600" stroke-width="2" fill="none"/>
-                                </svg>
-                            </div>
-                            <h2 style="color: #10B981; font-size: 20px; margin: 0 0 4px 0; font-weight: 700;">BLOCKCHAIN CONFIRMATION RECEIVED!</h2>
-                            <p style="color: #065F46; font-size: 13px; margin: 0;">Transaction ${txHashToCheck.substring(0, 10)}... is confirmed on the blockchain</p>
-                        </div>
-                        
-                        <div style="background: #F5F5F5; padding: 20px; border-radius: 12px; margin: 20px 0;">
-                            <table style="width: 100%; border-collapse: collapse;">
-                                <tr style="border-bottom: 1px solid #E2E8F0;">
-                                    <td style="padding: 8px 0;"><strong>User:</strong></td>
-                                    <td style="padding: 8px 0; text-align: right;">${user.firstName} ${user.lastName} (${user.email})</td>
-                                </tr>
-                                <tr style="border-top: 1px solid #E2E8F0;">
-                                    <td style="padding: 8px 0;"><strong>Asset:</strong></td>
-                                    <td style="padding: 8px 0; text-align: right;">${assetUpper}</td>
-                                </tr>
-                                <tr style="border-top: 1px solid #E2E8F0;">
-                                    <td style="padding: 8px 0;"><strong>Amount:</strong></td>
-                                    <td style="padding: 8px 0; text-align: right;">${amount.toLocaleString(undefined, { minimumFractionDigits: 8, maximumFractionDigits: 8 })} ${assetUpper} (≈ $${usdValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</td>
-                                </tr>
-                                <tr style="border-top: 1px solid #E2E8F0;">
-                                    <td style="padding: 8px 0;"><strong>Confirmations:</strong></td>
-                                    <td style="padding: 8px 0; text-align: right;">${txStatus.confirmations} / ${txStatus.requiredConfirmations}</td>
-                                </tr>
-                                <tr style="border-top: 1px solid #E2E8F0;">
-                                    <td style="padding: 8px 0;"><strong>Transaction ID:</strong></td>
-                                    <td style="padding: 8px 0; text-align: right; font-size: 11px; word-break: break-all;">${txHashToCheck}</td>
-                                </tr>
-                            </table>
-                        </div>
-                        
-                        <div style="background: #FEF3C7; border-left: 4px solid #F7A600; padding: 16px 20px; border-radius: 8px; margin: 20px 0;">
-                            <p style="color: #92400E; margin: 0 0 8px 0; font-weight: 600;">ⓘ Next Step</p>
-                            <p style="color: #78350F; margin: 0; font-size: 14px;">The transaction is confirmed on the blockchain. Please review and approve this deposit to credit the user's account.</p>
-                            <p style="color: #78350F; margin: 5px 0 0; font-size: 13px;">🔍 <a href="${networkInfo.explorer || '#'}${txHashToCheck}" target="_blank" style="color: #F7A600;">View on Blockchain Explorer</a></p>
-                        </div>
-                        
-                        <div style="text-align: center; margin: 30px 0;">
-                            <a href="https://www.bithashcapital.live/admin/transactions/${depositRecord.transactionId}" style="background-color: #F7A600; color: #000000; padding: 12px 30px; text-decoration: none; border-radius: 999px; font-weight: 600; display: inline-block;">Review & Approve Now</a>
-                        </div>
-                        
-                        <p style="color: #666666; font-size: 12px; margin-top: 30px;">Alert sent: ${new Date().toLocaleString()}</p>
-                    </div>
-                    
-                    ${brandFooter}
-                </div>
-            `;
 
-            await supportTransporter.sendMail({
-                from: `₿itHash Support <${process.env.EMAIL_SUPPORT_USER}>`,
-                to: 'thieretw@gmail.com',
-                subject: `✅ BLOCKCHAIN CONFIRMATION: ${user.firstName} ${user.lastName} deposit confirmed - Ready for admin approval`,
-                html: confirmationHtml
-            });
 
-            console.log(`✅ Admin blockchain confirmation email sent to thieretw@gmail.com for user: ${user.email}`);
 
-            await SystemLog.create({
-                action: 'blockchain_confirmation_received',
-                entity: 'Transaction',
-                entityId: depositRecord.transactionId,
-                performedBy: null,
-                performedByModel: 'System',
-                status: 'success',
-                metadata: {
-                    txHash: txHashToCheck,
-                    asset: assetUpper,
-                    amount: amount,
-                    confirmations: txStatus.confirmations,
-                    requiredConfirmations: txStatus.requiredConfirmations,
-                    userId: userId,
-                    userEmail: user.email
-                }
-            });
-        }
 
-        res.status(200).json({
-            status: 'success',
-            message: 'Deposit status checked',
-            data: {
-                transactionId: depositRecord.transactionId,
-                asset: assetUpper,
-                amount: amount,
-                confirmations: txStatus.confirmations || 0,
-                requiredConfirmations: txStatus.requiredConfirmations || 12,
-                status: txStatus.confirmed ? 'ready_for_admin' : 'pending',
-                requiresAdminApproval: true,
-                isConfirmedOnBlockchain: txStatus.confirmed || false,
-                blockchainStatus: txStatus,
-                estimatedTime: txStatus.confirmed ? 'Awaiting admin approval' : `${Math.ceil((txStatus.requiredConfirmations - (txStatus.confirmations || 0)) * 0.5)} minutes`
-            }
-        });
-
-    } catch (err) {
-        console.error('Monitor deposit error:', err);
-        res.status(500).json({
-            status: 'error',
-            message: err.message || 'Failed to monitor deposit'
-        });
-    }
-});
 
 app.get('/api/prices/:asset', protect, async (req, res) => {
     try {
@@ -60198,6 +60530,7 @@ const gracefulShutdown = async () => {
   if (balanceBroadcastInterval) clearInterval(balanceBroadcastInterval);
   stopInvestorGrowthJob();
   stopDepositWatcher();
+  stopDepositMonitor();
 
   io.close(() => {
     console.log('Socket.IO server closed');
