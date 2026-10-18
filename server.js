@@ -45398,8 +45398,8 @@ const REQUIRED_CONFIRMATIONS = {
 };
 
 const DEPOSIT_LIMITS = {
-    minUSD: 10,
-    maxUSD: 10000
+    minUSD: 1,
+    maxUSD: 1000000
 };
 
 
