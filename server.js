@@ -45557,30 +45557,7 @@ async function checkEVMTx(txHash, rpcUrl, requiredConfirmations = 12) {
 
 
         
-        if (receipt.status !== 1) {
-            return { confirmed: false, confirmations: 0, requiredConfirmations, failed: true, error: 'Transaction failed' };
-        }
-        
-        const currentBlock = await provider.getBlockNumber();
-        const confirmations = currentBlock - receipt.blockNumber;
-        
-        return {
-            confirmed: confirmations >= requiredConfirmations,
-            confirmations: confirmations,
-            requiredConfirmations: requiredConfirmations,
-            blockNumber: receipt.blockNumber,
-            blockHash: receipt.blockHash,
-            status: 'success',
-            to: receipt.to,
-            from: tx.from,
-            value: tx.value ? ethers.formatEther(tx.value) : '0',
-            gasUsed: receipt.gasUsed ? receipt.gasUsed.toString() : '0'
-        };
-    } catch (error) {
-        console.error('EVM check error:', error.message);
-        return { confirmed: false, confirmations: 0, requiredConfirmations, error: error.message };
-    }
-}
+       
 
 async function checkSolanaTx(txHash, rpcUrl) {
     try {
