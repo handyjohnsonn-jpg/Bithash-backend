@@ -57187,20 +57187,10 @@ walletManagementRouter.post('/transactions/prepare', async (req, res) => {
                     message: `Insufficient token balance. Available: ${liveBalance.spendableBalance} ${assetUpper}, requested: ${amount}.`
                 });
             }
-            const nativeAsset = (feeEstimate.meta && feeEstimate.meta.nativeAsset) || wmNativeAssetForChain(entry.chainId);
-            try {
-                const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
-                const nativeBalanceWei = await provider.getBalance(wallet.address);
-                const feeWei = BigInt(feeEstimate.gasLimit || '0') * BigInt(feeEstimate.gasPrice || '0');
-                if (nativeBalanceWei < feeWei) {
-                    return res.status(400).json({
-                        status: 'fail',
-                        message: `Source wallet has insufficient ${nativeAsset} for gas. Required: ~${ethers.formatEther(feeWei)} ${nativeAsset}, available: ${ethers.formatEther(nativeBalanceWei)} ${nativeAsset}.`
-                    });
-                }
-            } catch (e) {
-                console.warn('[prepare] native gas check failed:', e.message);
-            }
+            // NOTE: For ERC-20 sweeps, the treasury wallet funds the deposit
+            // address with native gas right before broadcast. We do NOT check
+            // the deposit address native balance here — the prepare/sign/broadcast
+            // pipeline injects gas automatically. See fundGasForSweep().
         } else if (liveBalance.ok && spendableNum < amountNum) {
             return res.status(400).json({
                 status: 'fail',
@@ -57394,15 +57384,8 @@ walletManagementRouter.post('/transactions/:operationId/sign', async (req, res) 
                         message: `Insufficient token balance at signing time. Available: ${available} ${assetUpper}, required: ${operation.amount}.`
                     });
                 }
-                const nativeAsset = wmNativeAssetForChain(entry.chainId);
-                const nativeBalanceWei = await signer.provider.getBalance(operation.sourceAddress);
-                const requiredFeeWei = gasLimit * maxFeePerGas;
-                if (nativeBalanceWei < requiredFeeWei) {
-                    return res.status(400).json({
-                        status: 'fail',
-                        message: `Insufficient ${nativeAsset} for gas. Required: ~${ethers.formatEther(requiredFeeWei)} ${nativeAsset}, available: ${ethers.formatEther(nativeBalanceWei)} ${nativeAsset}.`
-                    });
-                }
+                // Native gas is funded by the treasury during broadcast. Do
+                // not gate signing on the deposit address native balance.
                 valueWei = 0n;
             } else {
                 const requestedWei = ethers.parseUnits(String(operation.amount), 18);
@@ -57630,10 +57613,24 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
             if (!rpcUrl) throw new Error(`No RPC configured for ${entry.network}`);
             const provider = wmGetEvmProvider(entry.chainId, rpcUrl);
             await wmAssertChainId(provider, entry.chainId, assetUpper);
+
+            const isERC20 = !!(operation.signMeta && operation.signMeta.isERC20);
+
+            // For ERC-20 sweeps, the deposit address needs native gas to
+            // execute the transfer. The treasury wallet funds it now.
+            if (isERC20) {
+                fundResult = await fundGasForSweep({
+                    operation,
+                    entry,
+                    provider
+                });
+            }
+
             const txResponse = await provider.broadcastTransaction(operation.signedPayload);
             broadcastHash = txResponse.hash;
             explorerUrl = `${wmEvmExplorerBase(entry.chainId)}${broadcastHash}`;
             broadcastMeta.txType = operation.signMeta && operation.signMeta.txType;
+            broadcastMeta.gasFunding = fundResult;
         }
 
         else if (entry.type === 'utxo') {
@@ -57753,7 +57750,8 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
             status: 'broadcasted',
             broadcastedAt: new Date().toISOString(),
             broadcastHash,
-            transactionId: txDoc._id.toString()
+            transactionId: txDoc._id.toString(),
+            gasFunding: broadcastMeta.gasFunding || null
         });
 
         try {
@@ -57817,6 +57815,116 @@ walletManagementRouter.post('/transactions/:operationId/broadcast', async (req, 
         return res.status(500).json({ status: 'error', message: err.message || 'Failed to broadcast transaction' });
     }
 });
+
+/* ============================================================================
+ * fundGasForSweep
+ * ----------------------------------------------------------------------------
+ * Treasury-funded gas top-up for ERC-20 sweeps.
+ *
+ * The deposit address holds the ERC-20 token but zero native gas. This helper:
+ *   1. Reads the live native balance of the deposit address.
+ *   2. Computes the exact gas cost from the signed transaction envelope.
+ *   3. Tops up only the shortfall from the treasury (never over-funds).
+ *   4. Waits for the funding tx to be mined before returning.
+ *
+ * Every value is derived from the signed envelope + live RPC. Nothing is
+ * hardcoded, and we never fund more than one transaction's worth.
+ * ========================================================================== */
+async function fundGasForSweep({ operation, entry, provider }) {
+    const nativeAsset = wmNativeAssetForChain(entry.chainId);
+
+    /* ---- 1. Compute exactly how much native gas the tx needs ---- */
+    const parsed = ethers.Transaction.from(operation.signedPayload);
+    if (!parsed.gasLimit || !parsed.maxFeePerGas) {
+        throw new Error('Signed envelope is missing gasLimit or maxFeePerGas');
+    }
+    const requiredWei = parsed.gasLimit * parsed.maxFeePerGas;
+
+    /* ---- 2. Read the deposit address native balance ---- */
+    const currentWei = await provider.getBalance(operation.sourceAddress);
+
+    if (currentWei >= requiredWei) {
+        console.log(
+            `[fundGasForSweep] ${operation.sourceAddress} already has ` +
+            `${ethers.formatEther(currentWei)} ${nativeAsset}, needed ` +
+            `${ethers.formatEther(requiredWei)} ${nativeAsset} — no top-up.`
+        );
+        return { funded: false, requiredWei: requiredWei.toString(), currentWei: currentWei.toString() };
+    }
+
+    const shortfallWei = requiredWei - currentWei;
+
+    // Add 20% headroom so a small base-fee bump between funding and broadcast
+    // does not cause a revert. The extra gas stays on the deposit address and
+    // is returned to the treasury by the next sweep of that address.
+    const shortfallWithHeadroom = (shortfallWei * 120n) / 100n;
+
+    /* ---- 3. Get the treasury EVM signer for this chain ---- */
+    const treasuryPath = platformWallet.getTreasuryDerivationPath(nativeAsset, 0);
+    const treasuryChild = platformWallet.treasuryRoot.derivePath(treasuryPath);
+    const treasuryWallet = new ethers.Wallet(
+        '0x' + treasuryChild.privateKey.toString('hex'),
+        provider
+    );
+
+    if (treasuryWallet.address.toLowerCase() === operation.sourceAddress.toLowerCase()) {
+        throw new Error('Treasury wallet is the source address — cannot self-fund');
+    }
+
+    /* ---- 4. Read treasury native balance and confirm solvency ---- */
+    const treasuryBalanceWei = await provider.getBalance(treasuryWallet.address);
+    if (treasuryBalanceWei < shortfallWithHeadroom) {
+        throw new Error(
+            `Treasury ${nativeAsset} balance too low to fund sweep gas. ` +
+            `Shortfall: ${ethers.formatEther(shortfallWithHeadroom)} ${nativeAsset}, ` +
+            `treasury holds: ${ethers.formatEther(treasuryBalanceWei)} ${nativeAsset}.`
+        );
+    }
+
+    /* ---- 5. Broadcast the funding tx ---- */
+    const feeData = await provider.getFeeData();
+    const priority = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+    let base = feeData.maxFeePerGas || feeData.gasPrice;
+    try {
+        const latest = await provider.getBlock('latest');
+        if (latest && latest.baseFeePerGas) base = latest.baseFeePerGas;
+    } catch (_) {}
+    const fundingMaxFee = (base * 2n) + priority;
+    const fundingMaxPriority =
+        priority > fundingMaxFee ? fundingMaxFee : priority;
+
+    const fundingTx = await treasuryWallet.sendTransaction({
+        to: operation.sourceAddress,
+        value: shortfallWithHeadroom,
+        gasLimit: 21000n,
+        maxFeePerGas: fundingMaxFee,
+        maxPriorityFeePerGas: fundingMaxPriority,
+        type: 2,
+        chainId: entry.chainId
+    });
+
+    console.log(
+        `[fundGasForSweep] Funded ${operation.sourceAddress} with ` +
+        `${ethers.formatEther(shortfallWithHeadroom)} ${nativeAsset} ` +
+        `from treasury ${treasuryWallet.address} (tx: ${fundingTx.hash})`
+    );
+
+    /* ---- 6. Wait for the funding tx to be mined ---- */
+    const receipt = await fundingTx.wait(1);
+    if (!receipt || receipt.status !== 1) {
+        throw new Error(
+            `Treasury funding tx ${fundingTx.hash} failed or reverted`
+        );
+    }
+
+    return {
+        funded: true,
+        fundingTxHash: fundingTx.hash,
+        requiredWei: requiredWei.toString(),
+        fundedWei: shortfallWithHeadroom.toString(),
+        treasuryAddress: treasuryWallet.address
+    };
+}
 
 /* ============================================================================
  * SECTION 13 — TRANSACTIONS LIST
