@@ -35969,7 +35969,6 @@ app.get('/api/deposit/monitor', protect, async (req, res) => {
 
 
 
-
 /* ============================================================================
  * POST /api/deposits/confirm
  * ----------------------------------------------------------------------------
@@ -35977,26 +35976,169 @@ app.get('/api/deposit/monitor', protect, async (req, res) => {
  *
  * Called by the frontend after the user's wallet broadcasts a tx.
  *
- * 1. Validates the deposit address belongs to the user.
- * 2. Verifies the transaction on-chain (source of truth for amount).
- * 3. Creates a DepositAsset (status='pending') — this is what the
- *    background monitor watches.
- * 4. Creates a Transaction (status='pending', deterministic reference).
- * 5. Sends ONE "deposit detected / awaiting confirmations" email to
- *    the user AND to the admin (deduped via Redis per txHash).
- * 6. Returns 202 with monitoring=true.
+ *   1. Validates the deposit address belongs to the user.
+ *   2. Verifies the transaction on-chain (source of truth for amount).
+ *   3. Creates a DepositAsset (status='pending') — this is what the
+ *      background monitor watches.
+ *   4. Creates a Transaction (status='pending', deterministic reference).
+ *   5. Sends ONE "deposit detected / awaiting confirmations" email to
+ *      the user AND the admin (deduped via Redis per txHash).
+ *   6. Returns 202 with monitoring=true.
  *
  * DOES NOT credit. DOES NOT sweep. The background monitor does that
  * only after the required on-chain confirmations are reached.
  * ========================================================================== */
+
+const CONFIRM_LOCK_TTL_SECONDS = 120;
+const MAX_AMOUNT_DRIFT = 0.02; // 2 %
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function escapeRegex(input) {
+    return String(input).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function acquireConfirmLock(lockKey, ownerId) {
+    if (!redis || typeof redis.set !== 'function') return { acquired: true, ownerId };
+    const result = await redis.set(lockKey, ownerId, 'EX', CONFIRM_LOCK_TTL_SECONDS, 'NX');
+    return { acquired: result === 'OK', ownerId };
+}
+
+async function releaseConfirmLock(lockKey, ownerId) {
+    if (!redis || typeof redis.eval !== 'function') return;
+    // Compare-and-delete so we never release a lock taken by another request.
+    const script = `
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            return redis.call("DEL", KEYS[1])
+        else
+            return 0
+        end
+    `;
+    try { await redis.eval(script, 1, lockKey, ownerId); } catch (_) {}
+}
+
+function resolveChainId(bodyChainId, networkInfo) {
+    const parsed = Number(bodyChainId);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    const fromAsset = Number(networkInfo && networkInfo.chainId);
+    if (Number.isFinite(fromAsset) && fromAsset > 0) return fromAsset;
+    // Fail-closed: we refuse to guess a chain, because verifying on the wrong
+    // chain is how "Receipt not found" happens silently.
+    return null;
+}
+
+function extractOnChainAmount(txStatus, networkInfo) {
+    if (!txStatus) return null;
+
+    if (txStatus.amount != null) {
+        const n = Number(txStatus.amount);
+        if (Number.isFinite(n) && n > 0) return n;
+    }
+    if (txStatus.value != null) {
+        const raw = Number(txStatus.value);
+        if (Number.isFinite(raw) && raw > 0) {
+            return networkInfo.type === 'utxo' ? raw / 1e8 : raw;
+        }
+    }
+    return null;
+}
+
+function buildReference(assetUpper, depositAddress, txHash) {
+    // Collision domain: (asset, last-10 of address, last-24 of hash).
+    const shortHash = String(txHash).slice(-24);
+    const tail = String(depositAddress).slice(-10);
+    return `DEP-AUTO-${assetUpper}-${tail}-${shortHash}`;
+}
+
+async function findExistingDeposit(reference, txHash) {
+    return Transaction.findOne({
+        $or: [
+            { reference },
+            { 'details.txHash': txHash, type: 'deposit' }
+        ],
+        status: { $in: ['completed', 'pending'] }
+    }).lean();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Fire-and-forget email dispatch                                             */
+/* -------------------------------------------------------------------------- */
+
+async function dispatchDepositDetectedEmails(params) {
+    const {
+        user, assetUpper, creditedAmount, usdValue, currentPrice,
+        txHash, depositAddress, walletAddress, networkName,
+        networkInfo, txStatus, requiredConfirmations, manualReference,
+        submittedAt, req
+    } = params;
+
+    try {
+        const dedupeKey = `deposit-detected-email:${txHash}`;
+        if (redis && typeof redis.get === 'function') {
+            const already = await redis.get(dedupeKey).catch(() => null);
+            if (already === '1') return;
+        }
+        if (redis && typeof redis.setex === 'function') {
+            await redis.setex(dedupeKey, 60 * 60 * 24 * 7, '1').catch(() => {});
+        }
+
+        const explorerUrl = `${networkInfo.explorer || ''}${txHash}`;
+        const confirmations = txStatus.confirmations || 0;
+
+        await sendPendingDepositUserEmail({
+            user,
+            assetUpper,
+            cryptoAmount: creditedAmount,
+            usdValue,
+            exchangeRate: currentPrice,
+            txHash,
+            depositAddress,
+            networkName,
+            explorerUrl,
+            confirmations,
+            requiredConfirmations,
+            reference: manualReference,
+            createdAt: submittedAt
+        });
+
+        await sendPendingDepositAdminEmail({
+            user,
+            assetUpper,
+            cryptoAmount: creditedAmount,
+            usdValue,
+            exchangeRate: currentPrice,
+            txHash,
+            depositAddress,
+            walletAddress,
+            networkName,
+            explorerUrl,
+            confirmations,
+            requiredConfirmations,
+            reference: manualReference,
+            createdAt: submittedAt,
+            requestIp: getRealClientIP(req)
+        });
+    } catch (emailErr) {
+        console.error('[deposit/confirm] pending email failed:', emailErr.message);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Route                                                                      */
+/* -------------------------------------------------------------------------- */
+
 app.post('/api/deposits/confirm', protect, async (req, res) => {
     const startedAt = Date.now();
     const userId = req.user._id;
 
     let lockKey = null;
+    let lockOwner = null;
     let lockAcquired = false;
 
     try {
+        /* --- 1. Input validation --------------------------------------- */
         const {
             txHash,
             asset,
@@ -36028,23 +36170,30 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
         const assetUpper = asset.toUpperCase();
         const assetLower = asset.toLowerCase();
 
-        if (!ASSET_NETWORK_MAP[assetUpper]) {
+        const networkInfo = ASSET_NETWORK_MAP[assetUpper];
+        if (!networkInfo) {
             return res.status(400).json({ status: 'fail', message: `Unsupported asset: ${assetUpper}` });
         }
 
-        const networkInfo = ASSET_NETWORK_MAP[assetUpper];
-        const chainIdNum = Number(bodyChainId) || networkInfo.chainId || 1;
+        const chainIdNum = resolveChainId(bodyChainId, networkInfo);
+        if (chainIdNum === null) {
+            return res.status(400).json({
+                status: 'fail',
+                message: `Cannot determine a chainId for asset ${assetUpper}. Refusing to verify on an unknown chain.`
+            });
+        }
 
+        /* --- 2. User checks -------------------------------------------- */
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
         if (user.status !== 'active') {
             return res.status(403).json({ status: 'fail', message: 'Your account is not active' });
         }
 
-        /* --- Verify deposit address ownership ---------------------------- */
+        /* --- 3. Verify deposit-address ownership ----------------------- */
         const isEvm = networkInfo.type === 'evm';
         const addressQuery = isEvm
-            ? { $regex: `^${String(depositAddress).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' }
+            ? { $regex: `^${escapeRegex(depositAddress)}$`, $options: 'i' }
             : depositAddress;
 
         const depositRecord = await DepositAddress.findOne({
@@ -36058,18 +36207,10 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             return res.status(400).json({ status: 'fail', message: 'Invalid deposit address for this asset' });
         }
 
-        /* --- Deterministic idempotency key ------------------------------ */
-        const shortHash = normalizedTxHash.slice(-24);
-        const manualReference = `DEP-AUTO-${assetUpper}-${depositAddress.slice(-10)}-${shortHash}`;
+        /* --- 4. Idempotency -------------------------------------------- */
+        const manualReference = buildReference(assetUpper, depositAddress, normalizedTxHash);
 
-        const alreadyCredited = await Transaction.findOne({
-            $or: [
-                { reference: manualReference },
-                { 'details.txHash': normalizedTxHash, type: 'deposit' }
-            ],
-            status: { $in: ['completed', 'pending'] }
-        }).lean();
-
+        const alreadyCredited = await findExistingDeposit(manualReference, normalizedTxHash);
         if (alreadyCredited) {
             return res.status(409).json({
                 status: 'fail',
@@ -36082,27 +36223,23 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
 
-        /* --- Distributed lock ------------------------------------------- */
+        /* --- 5. Distributed lock --------------------------------------- */
         lockKey = `deposit:confirm:lock:${assetUpper}:${normalizedTxHash}`;
+        lockOwner = `${userId}:${startedAt}:${Math.random().toString(36).slice(2, 10)}`;
         try {
-            if (redis && typeof redis.set === 'function') {
-                const r = await redis.set(lockKey, userId.toString(), 'EX', 120, 'NX');
-                lockAcquired = r === 'OK';
-                if (!lockAcquired) {
-                    return res.status(429).json({
-                        status: 'fail',
-                        message: 'This deposit is already being processed. Please wait a moment.'
-                    });
-                }
-            } else {
-                lockAcquired = true;
-            }
+            ({ acquired: lockAcquired } = await acquireConfirmLock(lockKey, lockOwner));
         } catch (lockErr) {
             console.warn('[deposit/confirm] Redis lock failed, proceeding:', lockErr.message);
             lockAcquired = true;
         }
+        if (!lockAcquired) {
+            return res.status(429).json({
+                status: 'fail',
+                message: 'This deposit is already being processed. Please wait a moment.'
+            });
+        }
 
-        /* --- Price lookup ----------------------------------------------- */
+        /* --- 6. Price ----------------------------------------------- */
         let currentPrice = 0;
         try { currentPrice = await getCryptoPrice(assetUpper); } catch (_) {}
         if (!currentPrice || currentPrice <= 0) {
@@ -36112,7 +36249,7 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
 
-        /* --- On-chain verification -------------------------------------- */
+        /* --- 7. On-chain verification -------------------------------- */
         let txStatus;
         try {
             txStatus = await checkTransactionOnBlockchain(normalizedTxHash, assetUpper, chainIdNum);
@@ -36130,26 +36267,16 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 message: (txStatus && txStatus.error) || 'Transaction could not be verified on-chain'
             });
         }
-        if (txStatus.failed) {
+        if (txStatus.failed === true) {
             return res.status(400).json({ status: 'fail', message: 'The transaction failed on-chain' });
         }
 
-        /* --- Resolve on-chain amount ------------------------------------ */
-        let onChainAmount = null;
-        if (txStatus.value != null) {
-            const raw = Number(txStatus.value);
-            if (Number.isFinite(raw) && raw > 0) {
-                onChainAmount = networkInfo.type === 'utxo' ? raw / 1e8 : raw;
-            }
-        }
-        if (txStatus.amount != null) {
-            const raw = Number(txStatus.amount);
-            if (Number.isFinite(raw) && raw > 0) onChainAmount = raw;
-        }
+        /* --- 8. Resolve & cross-check amount ------------------------- */
+        const onChainAmount = extractOnChainAmount(txStatus, networkInfo);
 
         if (onChainAmount !== null) {
             const drift = Math.abs(onChainAmount - clientAmount) / onChainAmount;
-            if (drift > 0.02) {
+            if (drift > MAX_AMOUNT_DRIFT) {
                 return res.status(400).json({
                     status: 'fail',
                     message: `Amount mismatch: client submitted ${clientAmount}, chain reports ${onChainAmount}.`
@@ -36160,7 +36287,7 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
         const creditedAmount = onChainAmount !== null ? onChainAmount : clientAmount;
         const usdValue = creditedAmount * currentPrice;
 
-        /* --- DB-configured minimum deposit ------------------------------ */
+        /* --- 9. Minimum deposit ------------------------------------- */
         const depositSettings = await getDepositSettings();
         if (usdValue < depositSettings.minimumDepositUSD) {
             return res.status(400).json({
@@ -36170,8 +36297,12 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
             });
         }
 
-        /* --- Persist: Transaction first (unique ref) -------------------- */
-        const networkName = txStatus.network || networkInfo.network || platformWallet.getNetworkName(assetUpper);
+        /* --- 10. Persist: Transaction first (unique ref) ------------- */
+        const networkName =
+            txStatus.network ||
+            networkInfo.network ||
+            platformWallet.getNetworkName(assetUpper);
+
         const submittedAt = new Date();
         const requiredConfirmations = resolveRequiredConfirmations(assetUpper, depositSettings);
 
@@ -36202,11 +36333,13 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                     onChainAmountVerified: onChainAmount !== null,
                     clientClaimedAmount: clientAmount,
                     creditedAmount,
-                    requiresAdminApproval: false,     // ← auto-credit after confirmations
+                    requiresAdminApproval: false,
                     adminApproved: false,
                     submittedBy: 'manual_confirm',
                     contractAddress: bodyContractAddress || null,
-                    tokenDecimals: Number.isFinite(Number(bodyTokenDecimals)) ? Number(bodyTokenDecimals) : null,
+                    tokenDecimals: Number.isFinite(Number(bodyTokenDecimals))
+                        ? Number(bodyTokenDecimals)
+                        : null,
                     requestIp: getRealClientIP(req)
                 },
                 fee: 0,
@@ -36220,16 +36353,17 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 return res.status(409).json({
                     status: 'fail',
                     message: 'This transaction has already been submitted.',
-                    data: existing ? { transactionId: existing._id, reference: existing.reference, status: existing.status } : null
+                    data: existing
+                        ? { transactionId: existing._id, reference: existing.reference, status: existing.status }
+                        : null
                 });
             }
             throw createErr;
         }
 
-        /* --- Persist: DepositAsset (this is what the monitor scans) ----- */
-        let depositAssetDoc;
+        /* --- 11. Persist: DepositAsset (watched by the monitor) ------ */
         try {
-            depositAssetDoc = await DepositAsset.create({
+            const depositAssetDoc = await DepositAsset.create({
                 user: userId,
                 asset: assetLower,
                 amount: creditedAmount,
@@ -36253,89 +36387,65 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
 
             await Transaction.updateOne(
                 { _id: transactionDoc._id },
-                { $set: {
-                    'details.depositId': depositAssetDoc._id,
-                    'details.depositAssetId': depositAssetDoc._id
-                }}
+                {
+                    $set: {
+                        'details.depositId': depositAssetDoc._id,
+                        'details.depositAssetId': depositAssetDoc._id
+                    }
+                }
             );
         } catch (assetErr) {
             console.error('[deposit/confirm] DepositAsset create failed, rolling back:', assetErr.message);
             try { await Transaction.deleteOne({ _id: transactionDoc._id }); } catch (_) {}
-            return res.status(500).json({ status: 'error', message: 'Failed to record deposit. Please try again.' });
+            return res.status(500).json({
+                status: 'error',
+                message: 'Failed to record deposit. Please try again.'
+            });
         }
 
-        /* --- Audit ------------------------------------------------------ */
+        /* --- 12. Audit ---------------------------------------------- */
         try {
             await logActivity(
                 'deposit_initiated', 'Transaction', transactionDoc._id,
                 userId, 'User', req,
                 {
-                    asset: assetUpper, amount: creditedAmount, usdValue,
-                    txHash: normalizedTxHash, depositAddress,
-                    network: networkName, confirmations: txStatus.confirmations || 0,
-                    requiredConfirmations, onChainAmountVerified: onChainAmount !== null
+                    asset: assetUpper,
+                    amount: creditedAmount,
+                    usdValue,
+                    txHash: normalizedTxHash,
+                    depositAddress,
+                    network: networkName,
+                    confirmations: txStatus.confirmations || 0,
+                    requiredConfirmations,
+                    onChainAmountVerified: onChainAmount !== null
                 }
             );
-        } catch (logErr) { console.error('[deposit/confirm] audit failed:', logErr.message); }
+        } catch (logErr) {
+            console.error('[deposit/confirm] audit failed:', logErr.message);
+        }
 
-        /* --- Fire-and-forget: "awaiting confirmations" emails ----------- */
+        /* --- 13. Fire-and-forget: "awaiting confirmations" emails ---- */
         setImmediate(() => {
-            (async () => {
-                try {
-                    const dedupeKey = `deposit-detected-email:${normalizedTxHash}`;
-                    let already = false;
-                    try {
-                        if (redis && typeof redis.get === 'function') {
-                            already = (await redis.get(dedupeKey)) === '1';
-                        }
-                    } catch (_) {}
-                    if (already) return;
-                    try {
-                        if (redis && typeof redis.setex === 'function') {
-                            await redis.setex(dedupeKey, 60 * 60 * 24 * 7, '1');
-                        }
-                    } catch (_) {}
-
-                    await sendPendingDepositUserEmail({
-                        user,
-                        assetUpper,
-                        cryptoAmount: creditedAmount,
-                        usdValue,
-                        exchangeRate: currentPrice,
-                        txHash: normalizedTxHash,
-                        depositAddress,
-                        networkName,
-                        explorerUrl: `${networkInfo.explorer || ''}${normalizedTxHash}`,
-                        confirmations: txStatus.confirmations || 0,
-                        requiredConfirmations,
-                        reference: manualReference,
-                        createdAt: submittedAt
-                    });
-
-                    await sendPendingDepositAdminEmail({
-                        user,
-                        assetUpper,
-                        cryptoAmount: creditedAmount,
-                        usdValue,
-                        exchangeRate: currentPrice,
-                        txHash: normalizedTxHash,
-                        depositAddress,
-                        walletAddress: walletAddress || user.web3Wallet?.address || null,
-                        networkName,
-                        explorerUrl: `${networkInfo.explorer || ''}${normalizedTxHash}`,
-                        confirmations: txStatus.confirmations || 0,
-                        requiredConfirmations,
-                        reference: manualReference,
-                        createdAt: submittedAt,
-                        requestIp: getRealClientIP(req)
-                    });
-                } catch (emailErr) {
-                    console.error('[deposit/confirm] pending email failed:', emailErr.message);
-                }
-            })().catch((e) => console.error('[deposit/confirm] bg failed:', e));
+            dispatchDepositDetectedEmails({
+                user,
+                assetUpper,
+                creditedAmount,
+                usdValue,
+                currentPrice,
+                txHash: normalizedTxHash,
+                depositAddress,
+                walletAddress: walletAddress || user.web3Wallet?.address || null,
+                networkName,
+                networkInfo,
+                txStatus,
+                requiredConfirmations,
+                manualReference,
+                submittedAt,
+                req
+            }).catch((e) => console.error('[deposit/confirm] bg failed:', e));
         });
 
-        /* --- Respond ---------------------------------------------------- */
+        /* --- 14. Respond -------------------------------------------- */
         return res.status(202).json({
             status: 'success',
             message: 'Deposit received. Awaiting blockchain confirmations.',
@@ -36372,17 +36482,25 @@ app.post('/api/deposits/confirm', protect, async (req, res) => {
                 errorStack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
                 ip: getRealClientIP(req),
                 userAgent: req.headers['user-agent'] || 'Unknown',
-                metadata: { txHash: req.body?.txHash, asset: req.body?.asset, amount: req.body?.amount, depositAddress: req.body?.depositAddress, processingTimeMs: Date.now() - startedAt }
+                metadata: {
+                    txHash: req.body?.txHash,
+                    asset: req.body?.asset,
+                    amount: req.body?.amount,
+                    depositAddress: req.body?.depositAddress,
+                    processingTimeMs: Date.now() - startedAt
+                }
             });
         } catch (_) {}
-        return res.status(500).json({ status: 'error', message: err.message || 'Failed to confirm deposit' });
+        return res.status(500).json({
+            status: 'error',
+            message: err.message || 'Failed to confirm deposit'
+        });
     } finally {
-        if (lockAcquired && lockKey) {
-            try { if (redis && typeof redis.del === 'function') await redis.del(lockKey); } catch (_) {}
+        if (lockAcquired && lockKey && lockOwner) {
+            await releaseConfirmLock(lockKey, lockOwner);
         }
     }
 });
-
 
 
 
