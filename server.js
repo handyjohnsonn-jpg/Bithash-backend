@@ -4682,12 +4682,12 @@ const CardPaymentSchema = new mongoose.Schema({
 const CardPayment = mongoose.model('CardPayment', CardPaymentSchema);
 
 const TransactionSchema = new mongoose.Schema({
-  user: { 
-    type: mongoose.Schema.Types.ObjectId, 
-    ref: 'User', 
-    required: [true, 'User is required'],
-    index: true
-  },
+ user: { 
+  type: mongoose.Schema.Types.ObjectId, 
+  ref: 'User', 
+  required: false,   // or just remove the `required` key entirely
+  index: true
+},
   type: { 
     type: String, 
     enum: ['deposit', 'refund', 'withdrawal', 'transfer', 'investment', 'interest', 'referral', 'Promo', 'buy', 'sell'], 
